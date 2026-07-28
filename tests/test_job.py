@@ -38,6 +38,7 @@ def _config() -> AppConfig:
         cloud_run_job="health-sync",
         cloud_tasks_queue="health-tasks",
         cloud_tasks_service_account="task-caller@health-project.iam.gserviceaccount.com",
+        public_base_url="https://health.example",
         cloud_run_service_url="https://health-service.example.run.app",
         oauth_client_id="client-id",
         oauth_redirect_uri="https://health-service.example.run.app/setup/oauth/callback",

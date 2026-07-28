@@ -1,13 +1,20 @@
 resource "google_logging_project_exclusion" "oauth_callback_request" {
   project     = var.project_id
   name        = "${var.name_prefix}-oauth-callback-request"
-  description = "Exclude Cloud Run OAuth callback request URLs containing code and state from the _Default sink."
+  description = "Exclude OAuth callback request URLs containing code and state from Cloud Run and API Gateway logs in the _Default sink."
   disabled    = false
 
   filter = <<-EOT
-    resource.type="cloud_run_revision"
-    log_id("run.googleapis.com/requests")
-    httpRequest.requestUrl=~"/setup/oauth/callback([?].*)?$"
+    (
+      resource.type="cloud_run_revision"
+      log_id("run.googleapis.com/requests")
+      httpRequest.requestUrl=~"/setup/oauth/callback([?].*)?$"
+    )
+    OR
+    (
+      resource.type="apigateway.googleapis.com/Gateway"
+      httpRequest.requestUrl=~"/setup/oauth/callback([?].*)?$"
+    )
   EOT
 
   depends_on = [google_project_service.required["logging.googleapis.com"]]

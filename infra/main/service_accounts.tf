@@ -38,6 +38,14 @@ resource "google_service_account" "cloud_build" {
   depends_on = [google_project_service.required["iam.googleapis.com"]]
 }
 
+resource "google_service_account" "api_gateway" {
+  project      = var.project_id
+  account_id   = "hdp-api-gateway"
+  display_name = "Health data pipeline API Gateway backend"
+
+  depends_on = [google_project_service.required["iam.googleapis.com"]]
+}
+
 resource "google_project_iam_member" "runtime_monitoring" {
   for_each = {
     service = google_service_account.service_runtime.email
@@ -62,6 +70,7 @@ resource "google_project_iam_member" "runtime_logging" {
 
 locals {
   cloud_build_project_roles = toset([
+    "roles/apigateway.admin",
     "roles/artifactregistry.admin",
     "roles/cloudscheduler.admin",
     "roles/cloudtasks.admin",
@@ -87,6 +96,7 @@ resource "google_project_iam_member" "cloud_build" {
 
 resource "google_service_account_iam_member" "cloud_build_runtime_act_as" {
   for_each = {
+    gateway   = google_service_account.api_gateway.name
     service   = google_service_account.service_runtime.name
     job       = google_service_account.job_runtime.name
     tasks     = google_service_account.task_caller.name

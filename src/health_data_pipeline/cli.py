@@ -34,7 +34,7 @@ def _parser() -> argparse.ArgumentParser:
     subscriber.add_argument("--project-id", default=os.environ.get("PROJECT_ID"))
     subscriber.add_argument(
         "--service-url",
-        default=os.environ.get("CLOUD_RUN_SERVICE_URL"),
+        default=os.environ.get("PUBLIC_BASE_URL", os.environ.get("CLOUD_RUN_SERVICE_URL")),
     )
     subscriber.add_argument(
         "--authorization-secret-id",
@@ -83,7 +83,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "subscriber-upsert":
         service_url = _required(
             args.service_url,
-            "--service-url or CLOUD_RUN_SERVICE_URL",
+            "--service-url, PUBLIC_BASE_URL, or CLOUD_RUN_SERVICE_URL",
         ).rstrip("/")
         secret_id = _required(
             args.authorization_secret_id,

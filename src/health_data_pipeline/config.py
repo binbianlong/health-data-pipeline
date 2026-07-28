@@ -55,6 +55,7 @@ class AppConfig:
     cloud_run_job: str
     cloud_tasks_queue: str
     cloud_tasks_service_account: str
+    public_base_url: str
     cloud_run_service_url: str
     oauth_client_id: str
     oauth_redirect_uri: str
@@ -83,10 +84,19 @@ class AppConfig:
         region = source.get("REGION", source.get("GOOGLE_CLOUD_REGION", "us-central1")).strip()
         if not region:
             raise ConfigurationError("GOOGLE_CLOUD_REGION must not be empty")
-        service_url = _required_one_of(source, "PUBLIC_BASE_URL", "CLOUD_RUN_SERVICE_URL").rstrip(
-            "/"
-        )
-        if not service_url.startswith("https://"):
+        public_base_url = _required_one_of(
+            source,
+            "PUBLIC_BASE_URL",
+            "CLOUD_RUN_SERVICE_URL",
+        ).rstrip("/")
+        cloud_run_service_url = _required_one_of(
+            source,
+            "CLOUD_RUN_SERVICE_URL",
+            "PUBLIC_BASE_URL",
+        ).rstrip("/")
+        if not public_base_url.startswith("https://"):
+            raise ConfigurationError("PUBLIC_BASE_URL must use https")
+        if not cloud_run_service_url.startswith("https://"):
             raise ConfigurationError("CLOUD_RUN_SERVICE_URL must use https")
 
         return cls(
@@ -100,11 +110,12 @@ class AppConfig:
                 "TASK_CALLER_SERVICE_ACCOUNT",
                 "CLOUD_TASKS_SERVICE_ACCOUNT",
             ),
-            cloud_run_service_url=service_url,
+            public_base_url=public_base_url,
+            cloud_run_service_url=cloud_run_service_url,
             oauth_client_id=source.get("GOOGLE_OAUTH_CLIENT_ID", ""),
             oauth_redirect_uri=source.get(
                 "GOOGLE_OAUTH_REDIRECT_URI",
-                f"{service_url}/setup/oauth/callback",
+                f"{public_base_url}/setup/oauth/callback",
             ),
             notion_data_source_id=_required(source, "NOTION_DATA_SOURCE_ID"),
             health_api_base_url=source.get(

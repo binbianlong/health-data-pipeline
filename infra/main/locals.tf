@@ -1,15 +1,20 @@
 locals {
-  service_name       = "${var.name_prefix}-service"
-  job_name           = "${var.name_prefix}-sync"
-  queue_name         = "${var.name_prefix}-dispatch"
-  repository_name    = var.name_prefix
-  scheduler_name     = "${var.name_prefix}-hourly"
-  job_run_uri        = "https://run.googleapis.com/v2/projects/${var.project_id}/locations/${var.region}/jobs/${local.job_name}:run"
-  project_number     = data.google_project.current.number
-  service_url        = "https://${local.service_name}-${local.project_number}.${var.region}.run.app"
+  service_name    = "${var.name_prefix}-service"
+  job_name        = "${var.name_prefix}-sync"
+  queue_name      = "${var.name_prefix}-dispatch"
+  repository_name = var.name_prefix
+  scheduler_name  = "${var.name_prefix}-hourly"
+  gateway_id      = "${var.name_prefix}-public"
+  job_run_uri     = "https://run.googleapis.com/v2/projects/${var.project_id}/locations/${var.region}/jobs/${local.job_name}:run"
+  project_number  = data.google_project.current.number
+  service_url     = "https://${local.service_name}-${local.project_number}.${var.region}.run.app"
+  public_base_url = var.deploy_workloads ? (
+    "https://${google_api_gateway_gateway.public[0].default_hostname}"
+  ) : local.service_url
   cloud_build_member = "serviceAccount:${google_service_account.cloud_build.email}"
 
   required_services = toset([
+    "apigateway.googleapis.com",
     "artifactregistry.googleapis.com",
     "billingbudgets.googleapis.com",
     "cloudbuild.googleapis.com",
@@ -23,6 +28,8 @@ locals {
     "monitoring.googleapis.com",
     "run.googleapis.com",
     "secretmanager.googleapis.com",
+    "servicecontrol.googleapis.com",
+    "servicemanagement.googleapis.com",
     "serviceusage.googleapis.com",
     "storage.googleapis.com",
     "sts.googleapis.com",
@@ -47,7 +54,7 @@ locals {
     SYNC_JOB_NAME         = local.job_name
     SYNC_JOB_RUN_URI      = local.job_run_uri
     CLOUD_RUN_SERVICE_URL = local.service_url
-    PUBLIC_BASE_URL       = local.service_url
+    PUBLIC_BASE_URL       = local.public_base_url
     NOTION_DATA_SOURCE_ID = var.notion_data_source_id
     OWNER_TIME_ZONE       = "Asia/Tokyo"
   }

@@ -66,6 +66,9 @@ def test_google_providers_override_the_user_adc_quota_project() -> None:
         assert "billing_project       = var.project_id" in provider
         assert "user_project_override = true" in provider
 
+    main_provider = (_PROJECT_ROOT / "infra/main/providers.tf").read_text(encoding="utf-8")
+    assert 'provider "google-beta"' in main_provider
+
 
 def test_budget_currency_and_amount_flow_through_cloud_build() -> None:
     variables = (_PROJECT_ROOT / "infra/main/variables.tf").read_text(encoding="utf-8")
@@ -118,3 +121,76 @@ def test_cloud_build_source_staging_is_explicit_and_least_privilege() -> None:
     assert "roles/storage." not in workload_identity
 
     assert '--gcs-source-staging-dir="gs://${GCP_PROJECT_ID}-cloud-build-source/source"' in workflow
+
+
+def test_api_gateway_is_the_only_anonymous_public_entrypoint() -> None:
+    gateway = (_PROJECT_ROOT / "infra/main/api_gateway.tf").read_text(encoding="utf-8")
+    cloud_run = (_PROJECT_ROOT / "infra/main/cloud_run.tf").read_text(encoding="utf-8")
+    service_accounts = (_PROJECT_ROOT / "infra/main/service_accounts.tf").read_text(
+        encoding="utf-8"
+    )
+    locals_tf = (_PROJECT_ROOT / "infra/main/locals.tf").read_text(encoding="utf-8")
+    outputs = (_PROJECT_ROOT / "infra/main/outputs.tf").read_text(encoding="utf-8")
+
+    for service in (
+        "apigateway.googleapis.com",
+        "servicecontrol.googleapis.com",
+        "servicemanagement.googleapis.com",
+    ):
+        assert f'"{service}"' in locals_tf
+
+    assert 'resource "google_api_gateway_api" "public"' in gateway
+    assert 'resource "google_api_gateway_api_config" "public"' in gateway
+    assert 'resource "google_api_gateway_gateway" "public"' in gateway
+    assert "provider = google-beta" in gateway
+    assert "google_service_account.api_gateway.email" in gateway
+    assert "create_before_destroy = true" in gateway
+    assert 'google_project_iam_member.cloud_build["roles/apigateway.admin"]' in gateway
+    assert 'google_service_account_iam_member.cloud_build_runtime_act_as["gateway"]' in gateway
+
+    assert 'resource "google_service_account" "api_gateway"' in service_accounts
+    assert '"roles/apigateway.admin"' in service_accounts
+    assert "gateway   = google_service_account.api_gateway.name" in service_accounts
+
+    assert 'resource "google_cloud_run_v2_service_iam_member" "api_gateway"' in cloud_run
+    assert 'role     = "roles/run.invoker"' in cloud_run
+    assert "serviceAccount:${google_service_account.api_gateway.email}" in cloud_run
+    assert '"allUsers"' not in cloud_run
+
+    assert "PUBLIC_BASE_URL       = local.public_base_url" in locals_tf
+    assert "CLOUD_RUN_SERVICE_URL = local.service_url" in locals_tf
+    assert "google_api_gateway_gateway.public[0].default_hostname" in locals_tf
+    assert 'output "public_base_url"' in outputs
+    assert 'output "cloud_run_service_url"' in outputs
+
+
+def test_api_gateway_openapi_exposes_only_the_required_routes() -> None:
+    openapi = (_PROJECT_ROOT / "infra/main/openapi.yaml.tftpl").read_text(encoding="utf-8")
+    expected_routes = {
+        "/healthz": "get",
+        "/webhooks/google-health": "post",
+        "/public/steps.svg": "get",
+        "/setup": "get",
+        "/setup/session": "post",
+        "/setup/oauth/start": "get",
+        "/setup/oauth/callback": "get",
+    }
+
+    declared_routes = dict(
+        re.findall(r"^  (/[^:]+):\n    (get|post):$", openapi, flags=re.MULTILINE)
+    )
+    assert declared_routes == expected_routes
+    assert "security:" not in openapi
+    assert "address: ${backend_url}" in openapi
+    assert "jwt_audience: ${backend_url}" in openapi
+    assert "path_translation: APPEND_PATH_TO_ADDRESS" in openapi
+    assert "/internal/" not in openapi
+
+
+def test_oauth_callback_request_logging_exclusion_covers_gateway_and_cloud_run() -> None:
+    logging = (_PROJECT_ROOT / "infra/main/logging.tf").read_text(encoding="utf-8")
+
+    assert 'resource.type="cloud_run_revision"' in logging
+    assert 'log_id("run.googleapis.com/requests")' in logging
+    assert 'resource.type="apigateway.googleapis.com/Gateway"' in logging
+    assert logging.count('httpRequest.requestUrl=~"/setup/oauth/callback([?].*)?$"') == 2
