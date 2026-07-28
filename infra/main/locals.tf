@@ -4,23 +4,23 @@ locals {
   queue_name      = "${var.name_prefix}-dispatch"
   repository_name = var.name_prefix
   scheduler_name  = "${var.name_prefix}-hourly"
-  gateway_id      = "${var.name_prefix}-public"
   job_run_uri     = "https://run.googleapis.com/v2/projects/${var.project_id}/locations/${var.region}/jobs/${local.job_name}:run"
   project_number  = data.google_project.current.number
   service_url     = "https://${local.service_name}-${local.project_number}.${var.region}.run.app"
   public_base_url = var.deploy_workloads ? (
-    "https://${google_api_gateway_gateway.public[0].default_hostname}"
+    google_firebase_hosting_site.public[0].default_url
   ) : local.service_url
   cloud_build_member = "serviceAccount:${google_service_account.cloud_build.email}"
 
   required_services = toset([
-    "apigateway.googleapis.com",
     "artifactregistry.googleapis.com",
     "billingbudgets.googleapis.com",
     "cloudbuild.googleapis.com",
     "cloudresourcemanager.googleapis.com",
     "cloudscheduler.googleapis.com",
     "cloudtasks.googleapis.com",
+    "firebase.googleapis.com",
+    "firebasehosting.googleapis.com",
     "health.googleapis.com",
     "iam.googleapis.com",
     "iamcredentials.googleapis.com",
@@ -28,8 +28,6 @@ locals {
     "monitoring.googleapis.com",
     "run.googleapis.com",
     "secretmanager.googleapis.com",
-    "servicecontrol.googleapis.com",
-    "servicemanagement.googleapis.com",
     "serviceusage.googleapis.com",
     "storage.googleapis.com",
     "sts.googleapis.com",

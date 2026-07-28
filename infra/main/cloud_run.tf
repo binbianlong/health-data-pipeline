@@ -1,11 +1,12 @@
 resource "google_cloud_run_v2_service" "api" {
   count = var.deploy_workloads ? 1 : 0
 
-  project             = var.project_id
-  name                = local.service_name
-  location            = var.region
-  ingress             = "INGRESS_TRAFFIC_ALL"
-  deletion_protection = var.deletion_protection
+  project              = var.project_id
+  name                 = local.service_name
+  location             = var.region
+  ingress              = "INGRESS_TRAFFIC_ALL"
+  invoker_iam_disabled = true
+  deletion_protection  = var.deletion_protection
 
   template {
     service_account = google_service_account.service_runtime.email
@@ -159,16 +160,6 @@ resource "google_cloud_run_v2_job" "sync" {
     google_storage_bucket_iam_member.job_objects,
     google_secret_manager_secret_iam_member.accessors,
   ]
-}
-
-resource "google_cloud_run_v2_service_iam_member" "api_gateway" {
-  count = var.deploy_workloads ? 1 : 0
-
-  project  = var.project_id
-  location = google_cloud_run_v2_service.api[0].location
-  name     = google_cloud_run_v2_service.api[0].name
-  role     = "roles/run.invoker"
-  member   = "serviceAccount:${google_service_account.api_gateway.email}"
 }
 
 resource "google_cloud_run_v2_service_iam_member" "task_caller" {

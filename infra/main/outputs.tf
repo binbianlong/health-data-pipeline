@@ -29,9 +29,9 @@ output "cloud_run_service_url" {
 }
 
 output "public_base_url" {
-  description = "Public API Gateway URL after deploy_workloads is enabled."
+  description = "Public Firebase Hosting URL after deploy_workloads is enabled."
   value = try(
-    "https://${google_api_gateway_gateway.public[0].default_hostname}",
+    google_firebase_hosting_site.public[0].default_url,
     null,
   )
 }

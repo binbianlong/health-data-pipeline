@@ -7,19 +7,25 @@ BigQueryは使用しません。HEAD、Root Snapshot、年単位Shard、content-
 ## 構成
 
 ```text
-Google Health webhook → API Gateway → Cloud Run Service → GCS event → Cloud Tasks
-                                                                    ↓ OAuth
-Cloud Scheduler ─────────────────────────────→ Cloud Run Jobs API
-                                                      ↓
-                                           Cloud Run Job → Google Health API
-                                                      ↓
-                                             GCS HEAD CAS
-                                                      ↓
-                              Cloud Tasks → Notion / steps.svg
+Google Health webhook / Browser / GitHub
+                  ↓
+Firebase Hosting（<PROJECT_ID>.web.app、完全一致の7 route）
+                  ↓
+Cloud Run Service（Invoker IAM check無効、内部routeはアプリでOIDC保護）
+                  ↓ GCS event
+             Cloud Tasks ───────────────→ Cloud Run Jobs API
+                  ↓ OIDC                           ↑
+             View更新                       Cloud Scheduler
+                                                   ↓
+                                      Cloud Run Job → Google Health API
+                                                   ↓
+                                          GCS HEAD CAS
+                                                   ↓
+                                      Notion / steps.svg
 ```
 
 - Python 3.13、FastAPI、Pydantic v2、uv
-- 公開入口のAPI Gateway 1個（Cloud Run公開URL障害の影響を分離）
+- 公開入口のFirebase Hosting default site 1個（完全一致の7 routeだけをCloud Runへrewrite）
 - Cloud Run Service 1個、Cloud Run Job 1個
 - Cloud Tasks Queue 1個、Cloud Scheduler 1個
 - GCSを正式な永続基盤として使用
@@ -93,7 +99,7 @@ terraform -chdir=infra/main apply
 #### Google OAuth
 
 1. Terraformを適用したものと同じprojectを選び、[Google Health APIのOAuth設定](https://developers.google.com/health/setup)からOAuth clientを`Web application`として作成する。
-2. 初回imageのdeploy前でAPI Gateway URLがまだない場合は、Authorized redirect URIへ一時的に`https://www.google.com`を設定する。client作成後、credentials JSONをダウンロードする。
+2. 初回imageのdeploy前でFirebase Hosting siteがまだない場合は、Authorized redirect URIへ一時的に`https://www.google.com`を設定する。client作成後、credentials JSONをダウンロードする。
 3. Google Auth Platformの`Data Access`で次のscopeだけを追加する。
 
    ```text
@@ -107,7 +113,7 @@ terraform -chdir=infra/main apply
 4. `Audience`を`External`にする。所有者のGoogleアカウントをtest userへ追加してから`Publish app`を実行し、`Publishing status`が`In production`になったことを確認する。`Testing`のまま発行されたrefresh tokenは7日で失効する。
 5. Restricted scopeについてGoogle Cloud ConsoleがOAuth verificationまたはsecurity assessmentを要求した場合は、表示された要件を完了する。要求を回避するためにscopeを減らしたり、`Testing`へ戻したりしない。
 
-実際のOAuth同意はAPI Gatewayのredirect URIを登録してから行います。redirect URIの変更でclient IDとclient secretは変わらないため、credentials JSONを再登録する必要はありません。
+実際のOAuth同意はFirebase Hostingのredirect URIを登録してから行います。redirect URIの変更でclient IDとclient secretは変わらないため、credentials JSONを再登録する必要はありません。
 
 #### Notion
 
@@ -246,6 +252,9 @@ export NOTION_DATA_SOURCE_ID
 curl --fail --silent --show-error "$PUBLIC_BASE_URL/healthz"
 ```
 
+`PUBLIC_BASE_URL`は`https://<PROJECT_ID>.web.app`です。Webhook、OAuth、GitHub SVGには
+このURLだけを使用し、Cloud Runの`run.app` URLは公開URLとして登録しません。
+
 project Ownerとして初期構築している場合、以下の追加IAM設定は不要です。権限を分離する場合、コマンド実行者には必要なものだけを付与します。
 
 | コマンド | 必要な権限の目安 |
@@ -314,17 +323,41 @@ ADCのquota project設定には`serviceusage.services.use`も必要です。権�
 `notion-configure`と`subscriber-upsert`はSecret Managerの値を読み、後者はGoogle Health APIとCloud Resource Manager APIを呼びます。対応data type、Webhook URL、認証secretを変更した場合は`make subscriber-upsert`を再実行します。
 
 setup code、OAuth callback query、token、健康値、Webhook本文はログへ出しません。
-callbackのAPI Gateway request logとCloud Run request logはTerraformの`_Default`
-exclusionで保存対象から外します。
+callbackのCloud Run request logと、将来Firebase Hostingのログ連携を有効にした場合の
+web request logは、Terraformの`_Default` exclusionで保存対象から外します。
 
 ## 主要な実行契約
 
 - Service: `health-data-pipeline-service`
 - Job: `health-data-pipeline-job`
+- Public base URL: `https://<PROJECT_ID>.web.app`
 - Webhook: `POST /webhooks/google-health`
 - View更新: `POST /internal/tasks/apply-views`
 - 歩数SVG: `GET /public/steps.svg`
 - Health check: `GET /healthz`
+
+Firebase HostingからCloud Runへrewriteするのは次の7 routeだけです。
+
+```text
+GET  /healthz
+GET  /public/steps.svg
+GET  /setup
+POST /setup/session
+GET  /setup/oauth/start
+GET  /setup/oauth/callback
+POST /webhooks/google-health
+```
+
+Firebase Hostingの動的rewriteは60秒でtimeoutするため、これらのhandlerは60秒未満で
+応答します。HostingがCloud Runへ転送するcookieは`__session`だけです。アプリは
+`GET /setup`ではこのcookieをCSRF tokenとして発行し、`POST /setup/session`成功時に
+不透明なOAuth session IDへ上書きします。cookie名を分けたり変更したりしません。
+
+Firebase HostingからのrewriteにはCloud Runの未認証呼出し許可が必要なため、Serviceは
+公式推奨の`invoker_iam_disabled = true`を設定します。Cloud Run IAMはpath単位で制御できないため、
+`POST /internal/tasks/apply-views`はHostingへ公開せず、Cloud TasksのGoogle署名付きOIDC
+token、audience、service accountをアプリ側で必ず検証します。その他の未定義routeは
+404とし、Webhook、setup session、OAuth stateにも各route固有の検証を適用します。
 
 Cloud TasksとSchedulerはCloud Run Admin APIの次のendpointをOAuth tokenで直接呼びます。
 
