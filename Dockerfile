@@ -31,6 +31,7 @@ COPY src ./src
 COPY tests ./tests
 COPY schemas ./schemas
 COPY infra ./infra
+COPY cloudbuild.yaml ./cloudbuild.yaml
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --all-groups
 RUN uv run ruff format --check . \
