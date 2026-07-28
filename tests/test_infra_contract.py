@@ -143,7 +143,7 @@ def test_firebase_hosting_exposes_only_the_required_routes() -> None:
     assert 'google_project_iam_member.cloud_build["roles/firebase.admin"]' in hosting
 
     expected_routes = {
-        "/healthz",
+        "/health",
         "/public/steps.svg",
         "/setup",
         "/setup/oauth/callback",

@@ -175,8 +175,8 @@ def create_app(dependencies: WebDependencies | None = None) -> FastAPI:
     )
     app.state.dependencies = dependencies
 
-    @app.get("/healthz")
-    def healthz() -> Mapping[str, str]:
+    @app.get("/health")
+    def health() -> Mapping[str, str]:
         return {"status": "ok"}
 
     @app.post("/webhooks/google-health", status_code=204)

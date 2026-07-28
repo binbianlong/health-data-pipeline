@@ -251,7 +251,7 @@ Firebase Hostingは次の7 routeだけを完全一致でCloud Runへrewriteす�
 設定しない。
 
 ```text
-GET  /healthz
+GET  /health
 GET  /public/steps.svg
 GET  /setup
 POST /setup/session
@@ -274,7 +274,7 @@ Notion更新はJobまたは内部View更新Taskへ分離する。
 | `POST /webhooks/google-health` | Webhook secret + Tink署名 | Webhook保存、Job起動Task |
 | `POST /internal/tasks/apply-views` | Google OIDC + service account照合 | Notion、SVG更新 |
 | `GET /public/steps.svg` | 公開 | 現行7日歩数SVG |
-| `GET /healthz` | 公開 | 秘密を含まない死活応答 |
+| `GET /health` | 公開 | 秘密を含まない死活応答 |
 | `GET /setup` | 公開 | setup code入力フォーム |
 | `POST /setup/session` | CSRF + setup code | 一時OAuth session発行 |
 | `GET /setup/oauth/start` | 一時session | OAuth開始 |

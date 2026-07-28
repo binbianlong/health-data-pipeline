@@ -150,6 +150,15 @@ def _client(
     )
 
 
+def test_health_endpoint_avoids_cloud_run_reserved_paths() -> None:
+    client, _, _, _, _ = _client()
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
 def test_webhook_persists_before_enqueuing_job() -> None:
     times = iter(
         (

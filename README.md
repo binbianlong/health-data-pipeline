@@ -249,7 +249,7 @@ printf 'Notion data source ID: ' >&2
 IFS= read -r NOTION_DATA_SOURCE_ID
 export NOTION_DATA_SOURCE_ID
 
-curl --fail --silent --show-error "$PUBLIC_BASE_URL/healthz"
+curl --fail --silent --show-error "$PUBLIC_BASE_URL/health"
 ```
 
 `PUBLIC_BASE_URL`は`https://<PROJECT_ID>.web.app`です。Webhook、OAuth、GitHub SVGには
@@ -334,12 +334,12 @@ web request logは、Terraformの`_Default` exclusionで保存対象から外し
 - Webhook: `POST /webhooks/google-health`
 - View更新: `POST /internal/tasks/apply-views`
 - 歩数SVG: `GET /public/steps.svg`
-- Health check: `GET /healthz`
+- Health check: `GET /health`
 
 Firebase HostingからCloud Runへrewriteするのは次の7 routeだけです。
 
 ```text
-GET  /healthz
+GET  /health
 GET  /public/steps.svg
 GET  /setup
 POST /setup/session
