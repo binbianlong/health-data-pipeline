@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -19,10 +20,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.13"
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v9.0.0
         with:
           version: "0.8.14"
           enable-cache: true
@@ -35,7 +36,7 @@ jobs:
         run: |
           uv export --frozen --no-dev --no-emit-project --format requirements-txt --output-file /tmp/runtime-requirements.txt
           uv run pip-audit --requirement /tmp/runtime-requirements.txt --disable-pip
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7.0.1
         if: always()
         with:
           name: coverage
@@ -47,10 +48,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4.0.1
         with:
           terraform_version: 1.12.2
-      - uses: terraform-linters/setup-tflint@v5
+      - uses: terraform-linters/setup-tflint@v6.3.0
         with:
           tflint_version: v0.58.1
       - name: Terraform format
@@ -97,6 +98,6 @@ jobs:
         with:
           dockerfile: Dockerfile
           failure-threshold: warning
-      - uses: gitleaks/gitleaks-action@v2
+      - uses: gitleaks/gitleaks-action@v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
