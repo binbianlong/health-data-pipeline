@@ -1527,10 +1527,14 @@ Terraform bootstrap、main基盤、secret version、Cloud Run初回deployの完�
 `make subscriber-upsert`は次を冪等に実行する。
 
 - Application Default CredentialsのCloud Platform tokenでproject IDをproject numberへ解決する。
+- Google Health APIの全REST requestへ`x-goog-user-project`としてproject IDを指定する。
 - `projects/<project-number>/subscribers/health-data-pipeline`をlistし、存在しなければcreate、存在すればpatchする。
+- createでは`CreateSubscriberPayload`だけを送り、patchでだけSubscriberの`name`を送る。
 - endpointを`<CLOUD_RUN_SERVICE_URL>/webhooks/google-health`とする。
 - `subscriptionCreatePolicy`を`AUTOMATIC`とし、実装の`WEBHOOK_SUPPORTED_DATA_TYPES`（`oxygen-saturation`を除外）を登録する。
 - `endpointAuthorization.secret`にはSecret ManagerのWebhook authorization secretを使用する。
+- mutation responseのOperation errorを拒否し、再listでSubscriberが`ACTIVE`になったことを確認してから成功とする。
+- 認証ありのendpoint verificationへ`201 Created`、認証なしへ`401 Unauthorized`を返す。
 
 Cloud Run ServiceとWebhook authorization secret versionが存在してから実行する。対応data type、endpoint URL、authorization secretを変更した場合は再実行する。Subscriber登録に失敗しても毎時Schedulerによる照合は動くが、20分SLOを満たすためには登録成功が必要である。
 

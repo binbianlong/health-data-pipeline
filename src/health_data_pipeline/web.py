@@ -204,7 +204,7 @@ def create_app(dependencies: WebDependencies | None = None) -> FastAPI:
         except WebhookPayloadError as exc:
             raise HTTPException(status_code=400, detail="invalid webhook") from exc
         if isinstance(event, WebhookVerification):
-            return Response(status_code=200)
+            return Response(status_code=201)
 
         received_at = deps.clock()
         deps.webhook_events.persist(event, received_at=received_at)

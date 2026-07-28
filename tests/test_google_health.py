@@ -100,7 +100,18 @@ def test_sleep_uses_end_time_filter_and_small_page_size() -> None:
     assert transport.requests[1]["params"]["pageToken"] == "next"
 
 
-def test_daily_filter_uses_camel_case_date_field() -> None:
+@pytest.mark.parametrize(
+    ("data_type", "filter_field"),
+    [
+        ("daily-resting-heart-rate", "daily_resting_heart_rate.date"),
+        ("daily-heart-rate-variability", "daily_heart_rate_variability.date"),
+        ("daily-oxygen-saturation", "daily_oxygen_saturation.date"),
+    ],
+)
+def test_daily_filter_uses_snake_case_date_field(
+    data_type: str,
+    filter_field: str,
+) -> None:
     transport = FakeTransport([FakeResponse(200, {"dataPoints": []})])
     client = GoogleHealthClient(
         transport=transport,
@@ -108,10 +119,10 @@ def test_daily_filter_uses_camel_case_date_field() -> None:
         sleeper=lambda _: None,
     )
 
-    client.list_data_points("daily-resting-heart-rate", _window(2))
+    client.list_data_points(data_type, _window(2))
 
     expression = transport.requests[0]["params"]["filter"]
-    assert 'dailyRestingHeartRate.date >= "2026-01-01"' in expression
+    assert f'{filter_field} >= "2026-01-01"' in expression
     assert data_type_spec("active-minutes").max_window == timedelta(days=14)
     assert data_type_spec("active-zone-minutes").max_window == timedelta(days=90)
 

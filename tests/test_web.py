@@ -227,6 +227,28 @@ def test_subscriber_verification_succeeds_before_owner_oauth_setup() -> None:
         )
 
 
+def test_subscriber_verification_http_status_contract() -> None:
+    client, _, _, _, _ = _client()
+    verification_body = b'{"type":"verification"}'
+
+    authorized = client.post(
+        "/webhooks/google-health",
+        content=verification_body,
+        headers={
+            "Authorization": "Bearer secret",
+            "Content-Type": "application/json",
+        },
+    )
+    unauthorized = client.post(
+        "/webhooks/google-health",
+        content=verification_body,
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert authorized.status_code == 201
+    assert unauthorized.status_code == 401
+
+
 def test_apply_views_requires_expected_service_account() -> None:
     client, _, _, _, views = _client()
 

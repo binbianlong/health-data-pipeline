@@ -18,6 +18,7 @@ def _provisioner(client: httpx.Client) -> GoogleHealthSubscriberProvisioner:
         endpoint_uri="https://service.example/webhooks/google-health",
         endpoint_authorization="endpoint-secret",
         client=client,
+        sleeper=lambda _: None,
     )
 
 
@@ -28,17 +29,25 @@ def test_upsert_creates_or_updates_subscriber_offline(
 ) -> None:
     calls: list[httpx.Request] = []
     name = "projects/123456/subscribers/health-data-pipeline"
+    health_list_count = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal health_list_count
         calls.append(request)
         if request.url.host == "cloudresourcemanager.googleapis.com":
             return httpx.Response(200, json={"name": "projects/123456"})
         if request.method == "GET":
+            health_list_count += 1
+            if health_list_count > 1:
+                return httpx.Response(
+                    200,
+                    json={"subscribers": [{"name": name, "state": "ACTIVE"}]},
+                )
             return httpx.Response(
                 200,
-                json={"subscribers": [{"name": name}] if exists else []},
+                json={"subscribers": [{"name": name, "state": "ACTIVE"}] if exists else []},
             )
-        return httpx.Response(200, json={"name": name})
+        return httpx.Response(200, json={"name": "operations/subscriber", "done": True})
 
     monkeypatch.setattr("health_data_pipeline.subscriber._access_token", lambda: "token")
     client = httpx.Client(transport=httpx.MockTransport(handler))
@@ -46,7 +55,7 @@ def test_upsert_creates_or_updates_subscriber_offline(
     result = _provisioner(client).upsert()
 
     assert result == name
-    mutation = calls[-1]
+    mutation = next(request for request in calls if request.method in {"POST", "PATCH"})
     assert mutation.method == ("PATCH" if exists else "POST")
     body = json.loads(mutation.content)
     assert body["endpointAuthorization"]["secret"] == "endpoint-secret"
@@ -55,6 +64,58 @@ def test_upsert_creates_or_updates_subscriber_offline(
     assert "oxygen-saturation" not in WEBHOOK_SUPPORTED_DATA_TYPES
     assert "daily-oxygen-saturation" in WEBHOOK_SUPPORTED_DATA_TYPES
     assert mutation.headers["authorization"] == "Bearer token"
+    assert mutation.headers["x-goog-user-project"] == "project-id"
+    assert ("name" in body) is exists
+    for request in calls:
+        if request.url.host == "health.googleapis.com":
+            assert request.headers["x-goog-user-project"] == "project-id"
+
+
+def test_upsert_rejects_operation_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "cloudresourcemanager.googleapis.com":
+            return httpx.Response(200, json={"name": "projects/123456"})
+        if request.method == "GET":
+            return httpx.Response(200, json={"subscribers": []})
+        return httpx.Response(
+            200,
+            json={"name": "operations/subscriber", "done": True, "error": {"code": 9}},
+        )
+
+    monkeypatch.setattr("health_data_pipeline.subscriber._access_token", lambda: "token")
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    with pytest.raises(SubscriberProvisioningError, match="operation failed"):
+        _provisioner(client).upsert()
+
+
+def test_upsert_requires_active_subscriber(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "cloudresourcemanager.googleapis.com":
+            return httpx.Response(200, json={"name": "projects/123456"})
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "subscribers": [
+                        {
+                            "name": "projects/123456/subscribers/health-data-pipeline",
+                            "state": "UNVERIFIED",
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(200, json={"name": "operations/subscriber", "done": False})
+
+    monkeypatch.setattr("health_data_pipeline.subscriber._access_token", lambda: "token")
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    with pytest.raises(SubscriberProvisioningError, match="did not become ACTIVE"):
+        _provisioner(client).upsert()
 
 
 def test_upsert_rejects_invalid_project_and_subscriber_shapes(
