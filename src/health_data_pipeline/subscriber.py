@@ -102,16 +102,32 @@ class GoogleHealthSubscriberProvisioner:
         self,
         parent: str,
         headers: Mapping[str, str],
-    ) -> Any:
-        response = self._client.get(
-            f"https://health.googleapis.com/v4/{parent}/subscribers",
-            headers=headers,
-        )
-        _require_success(response, "list subscribers")
-        payload = response.json()
-        if not isinstance(payload, Mapping):
-            raise SubscriberProvisioningError("subscriber list is not a JSON object")
-        return payload.get("subscribers", ())
+    ) -> tuple[Mapping[str, Any], ...]:
+        subscribers: list[Mapping[str, Any]] = []
+        page_token: str | None = None
+        seen_tokens: set[str] = set()
+        while True:
+            params: dict[str, str | int] = {"pageSize": 1000}
+            if page_token is not None:
+                params["pageToken"] = page_token
+            response = self._client.get(
+                f"https://health.googleapis.com/v4/{parent}/subscribers",
+                headers=headers,
+                params=params,
+            )
+            _require_success(response, "list subscribers")
+            payload = response.json()
+            if not isinstance(payload, Mapping):
+                raise SubscriberProvisioningError("subscriber list is not a JSON object")
+            subscribers.extend(_validated_subscribers(payload.get("subscribers", ())))
+
+            next_page_token = payload.get("nextPageToken")
+            if next_page_token in (None, ""):
+                return tuple(subscribers)
+            if not isinstance(next_page_token, str) or next_page_token in seen_tokens:
+                raise SubscriberProvisioningError("subscriber list has invalid pagination")
+            seen_tokens.add(next_page_token)
+            page_token = next_page_token
 
     def _wait_until_active(
         self,
@@ -155,13 +171,22 @@ def _access_token() -> str:
     return token
 
 
-def _find_subscriber(value: Any, expected_name: str) -> Mapping[str, Any] | None:
+def _validated_subscribers(value: Any) -> tuple[Mapping[str, Any], ...]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
         raise SubscriberProvisioningError("subscriber list has invalid subscribers")
+    subscribers: list[Mapping[str, Any]] = []
     for item in value:
         if not isinstance(item, Mapping):
             raise SubscriberProvisioningError("subscriber list has invalid subscribers")
-        subscriber = cast(Mapping[str, Any], item)
+        subscribers.append(cast(Mapping[str, Any], item))
+    return tuple(subscribers)
+
+
+def _find_subscriber(
+    value: Sequence[Mapping[str, Any]],
+    expected_name: str,
+) -> Mapping[str, Any] | None:
+    for subscriber in value:
         if subscriber.get("name") == expected_name:
             return subscriber
     return None
@@ -186,3 +211,7 @@ def _require_mutation_accepted(response: httpx.Response, operation: str) -> None
         raise SubscriberProvisioningError(f"Google Health {operation} returned invalid JSON")
     if payload.get("error") is not None:
         raise SubscriberProvisioningError(f"Google Health {operation} operation failed")
+    if payload.get("done") is not True:
+        raise SubscriberProvisioningError(
+            f"Google Health {operation} operation is still in progress"
+        )
