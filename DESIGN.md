@@ -632,6 +632,7 @@ GCS上のAPI blobとnormalized `SAMPLE`、`INTERVAL`、`SESSION`、`DAILY`は期
 - 複数区間は捨てず、closed-open`[start,end)`としてunionする。
 - 隣接区間は結合できる。
 - 無関係な区間まで最小開始・最大終了へ広げない。
+- HRVとSpO2は詳細と日次summaryが同じ日次metricへ統合されるため、片方のWebhookでも同日の両data typeを再取得する。片側だけを処理するbackfillでは、日次summaryを詳細値で上書きしない。
 
 ### 14.5 Backfill
 

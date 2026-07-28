@@ -14,6 +14,7 @@ from health_data_pipeline.models import CommitKind, ContentReference
 from health_data_pipeline.pipeline import (
     SUPPORTED_DATA_TYPES,
     IncrementalSyncPipeline,
+    IngestedQuery,
     _advance_backfill_cursors,
     _interval_dates,
     _reconciliation_fetch_start,
@@ -58,10 +59,16 @@ class FakeHealth:
         self,
         *,
         values: Mapping[date, int],
+        data_points: Mapping[
+            tuple[str, date],
+            Sequence[Mapping[str, Any]],
+        ]
+        | None = None,
         sync_time: datetime | None = SYNC_TIME,
         fail_after: int | None = None,
     ) -> None:
         self.values = dict(values)
+        self.data_points = {key: tuple(points) for key, points in (data_points or {}).items()}
         self.sync_time = sync_time
         self.fail_after = fail_after
         self.requests: list[tuple[str, FetchWindow]] = []
@@ -89,6 +96,8 @@ class FakeHealth:
                     self.values[window.civil_start],
                 ),
             )
+        if window.civil_start is not None:
+            points += self.data_points.get((data_type, window.civil_start), ())
         return (
             DataPointPage(
                 data_type=data_type,
@@ -312,6 +321,133 @@ def test_pending_webhook_is_processed_before_backfill() -> None:
     }
 
 
+def test_hrv_webhook_refetches_daily_summary_before_shared_metric_replacement() -> None:
+    store = InMemoryObjectStore(clock=lambda: NOW)
+    metric_date = date(2026, 7, 28)
+    detail_key = ("heart-rate-variability", metric_date)
+    daily_key = ("daily-heart-rate-variability", metric_date)
+    health = FakeHealth(
+        values={},
+        data_points={
+            detail_key: (_hrv_detail_point(metric_date, 30),),
+            daily_key: (_daily_hrv_point(metric_date, 42),),
+        },
+    )
+    pipeline, heads, snapshots = _pipeline(store, health)
+    assert pipeline.run().committed
+    initial_request_count = len(health.requests)
+    health.data_points[detail_key] = (_hrv_detail_point(metric_date, 35),)
+    _store_webhook_event(
+        store,
+        data_type="heart-rate-variability",
+        metric_date=metric_date,
+    )
+
+    outcome = pipeline.run()
+
+    assert outcome.committed
+    requests = health.requests[initial_request_count:]
+    assert [(data_type, window.civil_start) for data_type, window in requests] == [
+        ("heart-rate-variability", metric_date),
+        ("daily-heart-rate-variability", metric_date),
+    ]
+    rows = _daily_rows(heads, snapshots, metric_date)
+    day = next(
+        row for row in rows if row["metric_name"] == "hrv_rmssd" and row["period_kind"] == "DAY"
+    )
+    weekly = next(
+        row
+        for row in rows
+        if row["metric_name"] == "hrv_rmssd" and row["period_kind"] == "CALENDAR_WEEK"
+    )
+    monthly = next(
+        row
+        for row in rows
+        if row["metric_name"] == "hrv_rmssd" and row["period_kind"] == "CALENDAR_MONTH"
+    )
+    assert day["value_num"] == 42
+    assert day["source_data_types"] == ["daily-heart-rate-variability"]
+    assert weekly["value_num"] == 42
+    assert weekly["period_start"] == "2026-07-27"
+    assert monthly["value_num"] == 42
+    assert monthly["period_start"] == "2026-07-01"
+
+
+def test_partial_detail_ingestion_cannot_replace_existing_daily_summary() -> None:
+    store = InMemoryObjectStore(clock=lambda: NOW)
+    metric_date = date(2026, 7, 28)
+    health = FakeHealth(
+        values={},
+        data_points={
+            ("heart-rate-variability", metric_date): (_hrv_detail_point(metric_date, 30),),
+            ("daily-heart-rate-variability", metric_date): (_daily_hrv_point(metric_date, 42),),
+        },
+    )
+    pipeline, heads, snapshots = _pipeline(store, health)
+    assert pipeline.run().committed
+    head = heads.read().head
+    assert head is not None
+    root = snapshots.load_root_snapshot(head.root_snapshot)
+
+    merged = pipeline._merge_changed_observations(
+        root,
+        (
+            IngestedQuery(
+                data_type="heart-rate-variability",
+                metric_date=metric_date,
+                data_points=(_hrv_detail_point(metric_date, 35),),
+                manifest=ContentReference(
+                    uri="manifests/ingestion/detail-only.json.gz",
+                    canonical_sha256="a" * 64,
+                    object_sha256="b" * 64,
+                ),
+            ),
+        ),
+    )
+
+    hrv = next(
+        observation for observation in merged[metric_date] if observation.metric_name == "hrv_rmssd"
+    )
+    assert hrv.value == 42
+    assert hrv.source_data_types == ("daily-heart-rate-variability",)
+
+
+def test_daily_spo2_deletion_refetches_detail_before_shared_metric_replacement() -> None:
+    store = InMemoryObjectStore(clock=lambda: NOW)
+    metric_date = date(2026, 7, 28)
+    detail_key = ("oxygen-saturation", metric_date)
+    daily_key = ("daily-oxygen-saturation", metric_date)
+    health = FakeHealth(
+        values={},
+        data_points={
+            detail_key: (_spo2_detail_point(metric_date, 95),),
+            daily_key: (_daily_spo2_point(metric_date, 97),),
+        },
+    )
+    pipeline, heads, snapshots = _pipeline(store, health)
+    assert pipeline.run().committed
+    initial_request_count = len(health.requests)
+    health.data_points[daily_key] = ()
+    _store_webhook_event(
+        store,
+        data_type="daily-oxygen-saturation",
+        metric_date=metric_date,
+    )
+
+    outcome = pipeline.run()
+
+    assert outcome.committed
+    requests = health.requests[initial_request_count:]
+    assert [(data_type, window.civil_start) for data_type, window in requests] == [
+        ("oxygen-saturation", metric_date),
+        ("daily-oxygen-saturation", metric_date),
+    ]
+    rows = _daily_rows(heads, snapshots, metric_date)
+    day = next(row for row in rows if row["metric_name"] == "spo2" and row["period_kind"] == "DAY")
+    assert day["value_num"] == 95
+    assert day["source_data_types"] == ["oxygen-saturation"]
+
+
 def test_high_frequency_backfill_is_clamped_to_recent_90_days() -> None:
     today = date(2026, 7, 28)
     cursors: dict[str, Any] = {
@@ -412,3 +548,66 @@ def test_physical_and_civil_webhook_ranges_keep_every_changed_date() -> None:
         date(2026, 7, 29),
         date(2026, 7, 30),
     }
+
+
+def _hrv_detail_point(metric_date: date, value: int) -> Mapping[str, Any]:
+    return {
+        "heartRateVariability": {
+            "rootMeanSquareOfSuccessiveDifferencesMilliseconds": value,
+            "sampleTime": {"civilTime": {"date": _civil_date(metric_date)}},
+        }
+    }
+
+
+def _daily_hrv_point(metric_date: date, value: int) -> Mapping[str, Any]:
+    return {
+        "dailyHeartRateVariability": {
+            "averageHeartRateVariabilityMilliseconds": value,
+            "date": _civil_date(metric_date),
+        }
+    }
+
+
+def _spo2_detail_point(metric_date: date, value: int) -> Mapping[str, Any]:
+    return {
+        "oxygenSaturation": {
+            "percentage": value,
+            "sampleTime": {"civilTime": {"date": _civil_date(metric_date)}},
+        }
+    }
+
+
+def _daily_spo2_point(metric_date: date, value: int) -> Mapping[str, Any]:
+    return {
+        "dailyOxygenSaturation": {
+            "averagePercentage": value,
+            "date": _civil_date(metric_date),
+        }
+    }
+
+
+def _store_webhook_event(
+    store: InMemoryObjectStore,
+    *,
+    data_type: str,
+    metric_date: date,
+) -> None:
+    event = {
+        "dataType": data_type,
+        "intervals": [
+            {
+                "civilDateTimeInterval": {
+                    "startDateTime": {"date": _civil_date(metric_date)},
+                    "endDateTime": {"date": _civil_date(metric_date)},
+                }
+            }
+        ],
+    }
+    store.put(
+        f"webhook-events/{data_type}.json",
+        json.dumps(event).encode(),
+        if_generation_match=0,
+        metadata={},
+        content_type="application/json",
+        cache_control="no-store",
+    )

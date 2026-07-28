@@ -492,7 +492,9 @@ class IncrementalSyncPipeline:
             }
             for item in (query for query in ingested if query.metric_date == metric_date):
                 for metric_name in _METRICS_BY_DATA_TYPE[item.data_type]:
-                    existing.pop(metric_name, None)
+                    current = existing.get(metric_name)
+                    if current is not None and item.data_type in current.source_data_types:
+                        existing.pop(metric_name)
             candidates = [
                 observation
                 for (day, _), observations in by_date_and_type.items()
@@ -500,7 +502,11 @@ class IncrementalSyncPipeline:
                 for observation in observations
             ]
             for observation in sorted(candidates, key=_observation_priority):
-                existing[observation.metric_name] = observation
+                current = existing.get(observation.metric_name)
+                if current is None or _observation_priority(observation) >= _observation_priority(
+                    current
+                ):
+                    existing[observation.metric_name] = observation
             result[metric_date] = tuple(existing[name] for name in sorted(existing))
         return result
 
@@ -732,7 +738,9 @@ def _plan_fetch_dates(
     fetch_dates: dict[str, set[date]] = defaultdict(set)
     for event in pending:
         if event.data_type in _METRICS_BY_DATA_TYPE:
-            fetch_dates[event.data_type].update(event.dates or (today,))
+            event_dates = event.dates or (today,)
+            for data_type in _webhook_replacement_data_types(event.data_type):
+                fetch_dates[data_type].update(event_dates)
     reconciled_data_types: set[str] = set()
     truncated: dict[str, date] = {}
     if sync_advanced or root is None:
@@ -755,6 +763,23 @@ def _plan_fetch_dates(
     elif backfill_chunk is not None:
         fetch_dates[backfill_chunk.data_type].update(backfill_chunk.dates)
     return fetch_dates, reconciled_data_types, truncated
+
+
+def _webhook_replacement_data_types(data_type: str) -> tuple[str, ...]:
+    """Return every API representation needed to replace webhook metrics safely.
+
+    HRV and SpO2 each have detail and daily-summary data types which normalize to
+    one metric. Re-fetching only the notified representation could discard the
+    still-current sibling value, so both representations share one replacement
+    set for the affected civil dates.
+    """
+
+    metrics = _METRICS_BY_DATA_TYPE.get(data_type, frozenset())
+    return tuple(
+        candidate
+        for candidate in SUPPORTED_DATA_TYPES
+        if metrics & _METRICS_BY_DATA_TYPE[candidate]
+    )
 
 
 def _reconciliation_start_date(
