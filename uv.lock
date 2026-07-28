@@ -507,7 +507,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.11,<3" },
     { name = "structlog", specifier = ">=25.4,<26" },
     { name = "tink", specifier = ">=1.13,<2" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.35,<1" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.51.0,<1" },
 ]
 
 [package.metadata.requires-dev]
