@@ -1,0 +1,261 @@
+from __future__ import annotations
+
+import base64
+import json
+from datetime import UTC, datetime
+from typing import Any
+from urllib.parse import parse_qs
+
+import pytest
+from fastapi.testclient import TestClient
+
+from health_data_pipeline.config import AppConfig
+from health_data_pipeline.google_health import (
+    GoogleHealthWebhookAuthenticator,
+    WebhookAuthenticationError,
+    WebhookPayloadError,
+    WebhookVerification,
+    identifier_hmac,
+)
+from health_data_pipeline.oauth import AuthorizationStart, IssuedSession, OAuthGrant
+from health_data_pipeline.runtime import DynamicOwnerWebhookAuthenticator
+from health_data_pipeline.storage import InMemoryObjectStore
+from health_data_pipeline.web import WebDependencies, create_app
+
+
+class SignatureVerifier:
+    def verify(self, signature: bytes, payload: bytes) -> bool:
+        return signature == b"valid"
+
+
+class EventSink:
+    def __init__(self) -> None:
+        self.events: list[Any] = []
+
+    def persist(self, event: Any, *, received_at: datetime) -> str:
+        self.events.append((event, received_at))
+        return "webhook-events/event.json"
+
+
+class Tasks:
+    def __init__(self) -> None:
+        self.syncs: list[str] = []
+
+    def enqueue_sync_job(self, *, owner_hmac: str, received_at: datetime) -> None:
+        self.syncs.append(owner_hmac)
+
+
+class OAuth:
+    def __init__(self) -> None:
+        self.created: list[str] = []
+        self.completed: list[str] = []
+
+    def create_session(self, *, setup_code: str, csrf_token: str) -> IssuedSession:
+        self.created.append(setup_code)
+        return IssuedSession(
+            session_id="session-id",
+            expires_at=datetime(2026, 7, 28, tzinfo=UTC),
+        )
+
+    def start_authorization(self, *, session_id: str) -> AuthorizationStart:
+        assert session_id == "session-id"
+        return AuthorizationStart(
+            authorization_url="https://accounts.example/authorize?state=oauth-state",
+            expires_at=datetime(2026, 7, 28, tzinfo=UTC),
+        )
+
+    def complete_callback(self, *, session_id: str, state: str, code: str) -> OAuthGrant:
+        assert session_id == "session-id"
+        assert state == "oauth-state"
+        self.completed.append(code)
+        return OAuthGrant("sub", "health-user", "refresh")
+
+
+class Oidc:
+    def __init__(self, email: str = "tasks@example.iam.gserviceaccount.com") -> None:
+        self.email = email
+
+    def verify(self, token: str, *, audience: str) -> dict[str, Any]:
+        assert token == "id-token"
+        return {"email": self.email, "email_verified": True, "aud": audience}
+
+
+class Views:
+    def __init__(self) -> None:
+        self.generations: list[int] = []
+
+    def apply_latest(self, requested_generation: int) -> int:
+        self.generations.append(requested_generation)
+        return requested_generation
+
+
+class Steps:
+    def read_current(self) -> tuple[bytes, int]:
+        return b"<svg></svg>", 12
+
+
+def _config() -> AppConfig:
+    return AppConfig(
+        project_id="project",
+        region="us-central1",
+        health_bucket="bucket",
+        cloud_run_job="sync",
+        cloud_tasks_queue="queue",
+        cloud_tasks_service_account="tasks@example.iam.gserviceaccount.com",
+        cloud_run_service_url="https://service.example",
+        oauth_client_id="client",
+        oauth_redirect_uri="https://service.example/setup/oauth/callback",
+        notion_data_source_id="data-source",
+    )
+
+
+def _client() -> tuple[TestClient, EventSink, Tasks, OAuth, Views]:
+    key = b"owner-key"
+    sink = EventSink()
+    tasks = Tasks()
+    oauth = OAuth()
+    views = Views()
+    dependencies = WebDependencies(
+        config=_config(),
+        webhook_authenticator=GoogleHealthWebhookAuthenticator(
+            expected_authorization="Bearer secret",
+            signature_verifier=SignatureVerifier(),
+            application_hmac_key=key,
+            expected_owner_hmac=identifier_hmac(key, "health-user"),
+        ),
+        webhook_events=sink,
+        tasks=tasks,  # type: ignore[arg-type]
+        oauth_sessions=oauth,  # type: ignore[arg-type]
+        oidc_verifier=Oidc(),
+        expected_task_service_account="tasks@example.iam.gserviceaccount.com",
+        views=views,  # type: ignore[arg-type]
+        steps=Steps(),  # type: ignore[arg-type]
+    )
+    return (
+        TestClient(create_app(dependencies), base_url="https://service.example"),
+        sink,
+        tasks,
+        oauth,
+        views,
+    )
+
+
+def test_webhook_persists_before_enqueuing_job() -> None:
+    client, sink, tasks, _, _ = _client()
+    body = json.dumps(
+        {
+            "data": {
+                "healthUserId": "health-user",
+                "dataType": "steps",
+                "operation": "UPSERT",
+                "intervals": [],
+            }
+        }
+    ).encode()
+
+    response = client.post(
+        "/webhooks/google-health",
+        content=body,
+        headers={
+            "Authorization": "Bearer secret",
+            "Content-Type": "application/json",
+            "GOOGLE-HEALTH-API-SIGNATURE": base64.b64encode(b"valid").decode(),
+        },
+    )
+
+    assert response.status_code == 204
+    assert len(sink.events) == 1
+    assert tasks.syncs == [identifier_hmac(b"owner-key", "health-user")]
+
+
+def test_subscriber_verification_succeeds_before_owner_oauth_setup() -> None:
+    authenticator = DynamicOwnerWebhookAuthenticator(
+        store=InMemoryObjectStore(clock=lambda: datetime(2026, 7, 28, tzinfo=UTC)),
+        expected_authorization="Bearer secret",
+        signature_verifier=SignatureVerifier(),
+        application_hmac_key=b"owner-key",
+    )
+    verification_body = b'{"type":"verification"}'
+
+    verified = authenticator.authenticate(
+        authorization="Bearer secret",
+        signature_header=None,
+        content_type="application/json",
+        raw_body=verification_body,
+    )
+
+    assert isinstance(verified, WebhookVerification)
+    with pytest.raises(WebhookAuthenticationError):
+        authenticator.authenticate(
+            authorization=None,
+            signature_header=None,
+            content_type="application/json",
+            raw_body=verification_body,
+        )
+
+    notification_body = json.dumps(
+        {
+            "data": {
+                "healthUserId": "health-user",
+                "dataType": "steps",
+                "intervals": [],
+            }
+        }
+    ).encode()
+    with pytest.raises(WebhookPayloadError):
+        authenticator.authenticate(
+            authorization="Bearer secret",
+            signature_header=base64.b64encode(b"valid").decode(),
+            content_type="application/json",
+            raw_body=notification_body,
+        )
+
+
+def test_apply_views_requires_expected_service_account() -> None:
+    client, _, _, _, views = _client()
+
+    response = client.post(
+        "/internal/tasks/apply-views",
+        json={"requested_generation": 12},
+        headers={"Authorization": "Bearer id-token"},
+    )
+
+    assert response.status_code == 204
+    assert views.generations == [12]
+
+
+def test_setup_code_is_posted_then_oauth_redirects() -> None:
+    client, _, _, oauth, _ = _client()
+    form = client.get("/setup")
+    assert form.status_code == 200
+    csrf = parse_qs(form.text.split('name="csrf_token" value="', 1)[1].split('"', 1)[0])
+    # parse_qs intentionally returns empty for a bare token, so use the source value.
+    assert csrf == {}
+    csrf_value = form.text.split('name="csrf_token" value="', 1)[1].split('"', 1)[0]
+
+    created = client.post(
+        "/setup/session",
+        data={"csrf_token": csrf_value, "setup_code": "one-time-code"},
+        headers={"Origin": "https://service.example"},
+        follow_redirects=False,
+    )
+    started = client.get("/setup/oauth/start", follow_redirects=False)
+    callback = client.get("/setup/oauth/callback?code=authorization-code&state=oauth-state")
+
+    assert created.status_code == 303
+    assert created.headers["location"] == "/setup/oauth/start"
+    assert started.status_code == 303
+    assert started.headers["location"].startswith("https://accounts.example/")
+    assert callback.status_code == 200
+    assert oauth.created == ["one-time-code"]
+    assert oauth.completed == ["authorization-code"]
+
+
+def test_public_svg_has_short_cache_policy() -> None:
+    client, _, _, _, _ = _client()
+
+    response = client.get("/public/steps.svg")
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "public, max-age=300"
+    assert response.headers["etag"] == '"head-12"'
