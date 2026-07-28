@@ -18,6 +18,7 @@ resource "google_monitoring_alert_policy" "job_not_completed" {
   project      = var.project_id
   display_name = "Health pipeline job has not completed"
   combiner     = "OR"
+  enabled      = !var.scheduler_paused
 
   conditions {
     display_name = "No completed execution for two hours"

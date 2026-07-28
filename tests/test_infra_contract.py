@@ -78,6 +78,7 @@ def test_budget_currency_and_amount_flow_through_cloud_build() -> None:
     assert "units         = tostring(var.monthly_budget_amount)" in monitoring
     assert '-var="billing_currency_code=${_BILLING_CURRENCY_CODE}"' in cloud_build
     assert '-var="monthly_budget_amount=${_MONTHLY_BUDGET_AMOUNT}"' in cloud_build
+    assert cloud_build.count("- DOCKER_BUILDKIT=1") == 2
 
 
 def test_deploy_identity_and_scheduler_start_are_fail_closed() -> None:
@@ -92,6 +93,9 @@ def test_deploy_identity_and_scheduler_start_are_fail_closed() -> None:
     assert "assertion.repository_id == '${var.github_repository_id}'" in workload_identity
     assert '"attribute.repository_id" = "assertion.repository_id"' in workload_identity
     assert "paused           = var.scheduler_paused" in scheduler
+    assert "enabled      = !var.scheduler_paused" in (
+        _PROJECT_ROOT / "infra/main/monitoring.tf"
+    ).read_text(encoding="utf-8")
 
 
 def test_cloud_build_source_staging_is_explicit_and_least_privilege() -> None:

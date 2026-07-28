@@ -17,6 +17,8 @@ substitutions:
 steps:
   - id: docker-test-stage
     name: gcr.io/cloud-builders/docker
+    env:
+      - DOCKER_BUILDKIT=1
     args:
       - build
       - --target
@@ -27,6 +29,8 @@ steps:
 
   - id: docker-runtime-stage
     name: gcr.io/cloud-builders/docker
+    env:
+      - DOCKER_BUILDKIT=1
     args:
       - build
       - --target
