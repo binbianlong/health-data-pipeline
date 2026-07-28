@@ -21,6 +21,7 @@ def test_config_loads_primary_names_and_derived_urls() -> None:
     config = AppConfig.from_env(_required_env())
 
     assert config.region == "us-central1"
+    assert config.public_base_url == "https://service.example"
     assert config.cloud_run_service_url == "https://service.example"
     assert config.oauth_redirect_uri == ("https://service.example/setup/oauth/callback")
     assert config.jobs_run_url.endswith("/projects/project/locations/us-central1/jobs/sync-job:run")
@@ -36,6 +37,7 @@ def test_config_accepts_legacy_aliases_and_explicit_overrides() -> None:
             "CLOUD_RUN_JOB_NAME": "legacy-job",
             "CLOUD_TASKS_QUEUE": "legacy-queue",
             "CLOUD_TASKS_SERVICE_ACCOUNT": "legacy@example.iam.gserviceaccount.com",
+            "PUBLIC_BASE_URL": "https://public.example/",
             "CLOUD_RUN_SERVICE_URL": "https://legacy.example",
             "NOTION_DATA_SOURCE_ID": "source",
             "GOOGLE_OAUTH_REDIRECT_URI": "https://custom.example/callback",
@@ -45,6 +47,8 @@ def test_config_accepts_legacy_aliases_and_explicit_overrides() -> None:
 
     assert config.project_id == "legacy-project"
     assert config.region == "asia-northeast1"
+    assert config.public_base_url == "https://public.example"
+    assert config.cloud_run_service_url == "https://legacy.example"
     assert config.oauth_redirect_uri == "https://custom.example/callback"
     assert config.webhook_max_body_bytes == 2048
 
@@ -54,6 +58,10 @@ def test_config_accepts_legacy_aliases_and_explicit_overrides() -> None:
     [
         ({"PROJECT_ID": ""}, "PROJECT_ID"),
         ({"PUBLIC_BASE_URL": "http://service.example"}, "https"),
+        (
+            {"CLOUD_RUN_SERVICE_URL": "http://internal.example"},
+            "CLOUD_RUN_SERVICE_URL",
+        ),
         ({"WEBHOOK_MAX_BODY_BYTES": "not-an-int"}, "integer"),
         ({"SETUP_SESSION_TTL_SECONDS": "0"}, "positive"),
     ],

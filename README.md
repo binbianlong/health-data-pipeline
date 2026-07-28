@@ -7,8 +7,8 @@ BigQueryは使用しません。HEAD、Root Snapshot、年単位Shard、content-
 ## 構成
 
 ```text
-Google Health webhook → Cloud Run Service → GCS event → Cloud Tasks
-                                                      ↓ OAuth
+Google Health webhook → API Gateway → Cloud Run Service → GCS event → Cloud Tasks
+                                                                    ↓ OAuth
 Cloud Scheduler ─────────────────────────────→ Cloud Run Jobs API
                                                       ↓
                                            Cloud Run Job → Google Health API
@@ -19,6 +19,7 @@ Cloud Scheduler ─────────────────────�
 ```
 
 - Python 3.13、FastAPI、Pydantic v2、uv
+- 公開入口のAPI Gateway 1個（Cloud Run公開URL障害の影響を分離）
 - Cloud Run Service 1個、Cloud Run Job 1個
 - Cloud Tasks Queue 1個、Cloud Scheduler 1個
 - GCSを正式な永続基盤として使用
@@ -92,7 +93,7 @@ terraform -chdir=infra/main apply
 #### Google OAuth
 
 1. Terraformを適用したものと同じprojectを選び、[Google Health APIのOAuth設定](https://developers.google.com/health/setup)からOAuth clientを`Web application`として作成する。
-2. 初回imageのdeploy前でCloud Run URLがまだない場合は、Authorized redirect URIへ一時的に`https://www.google.com`を設定する。client作成後、credentials JSONをダウンロードする。
+2. 初回imageのdeploy前でAPI Gateway URLがまだない場合は、Authorized redirect URIへ一時的に`https://www.google.com`を設定する。client作成後、credentials JSONをダウンロードする。
 3. Google Auth Platformの`Data Access`で次のscopeだけを追加する。
 
    ```text
@@ -106,7 +107,7 @@ terraform -chdir=infra/main apply
 4. `Audience`を`External`にする。所有者のGoogleアカウントをtest userへ追加してから`Publish app`を実行し、`Publishing status`が`In production`になったことを確認する。`Testing`のまま発行されたrefresh tokenは7日で失効する。
 5. Restricted scopeについてGoogle Cloud ConsoleがOAuth verificationまたはsecurity assessmentを要求した場合は、表示された要件を完了する。要求を回避するためにscopeを減らしたり、`Testing`へ戻したりしない。
 
-実際のOAuth同意はCloud Runのredirect URIを登録してから行います。redirect URIの変更でclient IDとclient secretは変わらないため、credentials JSONを再登録する必要はありません。
+実際のOAuth同意はAPI Gatewayのredirect URIを登録してから行います。redirect URIの変更でclient IDとclient secretは変わらないため、credentials JSONを再登録する必要はありません。
 
 #### Notion
 
@@ -236,12 +237,13 @@ gcloud auth application-default set-quota-project "$PROJECT_ID"
 
 export REGION="$(terraform -chdir=infra/main output -raw region)"
 export HEALTH_BUCKET="$(terraform -chdir=infra/main output -raw health_bucket_name)"
+export PUBLIC_BASE_URL="$(terraform -chdir=infra/main output -raw public_base_url)"
 export CLOUD_RUN_SERVICE_URL="$(terraform -chdir=infra/main output -raw cloud_run_service_url)"
 printf 'Notion data source ID: ' >&2
 IFS= read -r NOTION_DATA_SOURCE_ID
 export NOTION_DATA_SOURCE_ID
 
-curl --fail --silent --show-error "$CLOUD_RUN_SERVICE_URL/healthz"
+curl --fail --silent --show-error "$PUBLIC_BASE_URL/healthz"
 ```
 
 project Ownerとして初期構築している場合、以下の追加IAM設定は不要です。権限を分離する場合、コマンド実行者には必要なものだけを付与します。
@@ -259,7 +261,7 @@ ADCのquota project設定には`serviceusage.services.use`も必要です。権�
 1. Web application OAuth clientのAuthorized redirect URIへ、次のコマンドが表示するURIを完全一致で登録する。登録後、一時的な`https://www.google.com`は削除する。
 
    ```bash
-   printf '%s/setup/oauth/callback\n' "$CLOUD_RUN_SERVICE_URL"
+   printf '%s/setup/oauth/callback\n' "$PUBLIC_BASE_URL"
    ```
 
    Google Auth Platformが`External / In production`で、前節の5 scopeがすべて登録済みであり、要求されたverificationが完了していることも再確認する。
@@ -288,11 +290,11 @@ ADCのquota project設定には`serviceusage.services.use`も必要です。権�
 
    成功時に`Subscriber ready: projects/<PROJECT_NUMBER>/subscribers/health-data-pipeline`と表示される。endpoint未deploy、Webhook secret未登録、または`roles/health.editor`相当の権限がない場合はここで失敗するため、OAuthへ進む前に解消する。
 
-4. `make setup-code`で10分有効・1回限りのcodeを発行し、表示されたcodeをブラウザで`$CLOUD_RUN_SERVICE_URL/setup`へ入力する。Fitbit Sense 2を利用しているGoogleアカウントでログインし、表示されたGoogle Health権限をすべて許可する。別アカウントを使うと所有者照合で拒否される。
+4. `make setup-code`で10分有効・1回限りのcodeを発行し、表示されたcodeをブラウザで`$PUBLIC_BASE_URL/setup`へ入力する。Fitbit Sense 2を利用しているGoogleアカウントでログインし、表示されたGoogle Health権限をすべて許可する。別アカウントを使うと所有者照合で拒否される。
 
    ```bash
    make setup-code
-   printf '%s/setup\n' "$CLOUD_RUN_SERVICE_URL"
+   printf '%s/setup\n' "$PUBLIC_BASE_URL"
    ```
 
 5. OAuth完了後、アプリがrefresh tokenの最初のversionを作成したことを確認する。値自体は表示しない。
@@ -306,12 +308,14 @@ ADCのquota project設定には`serviceusage.services.use`も必要です。権�
      --format='value(name,state)'
    ```
 
-6. GitHubプロフィールREADMEへ`$CLOUD_RUN_SERVICE_URL/public/steps.svg`を追加する。
+6. GitHubプロフィールREADMEへ`$PUBLIC_BASE_URL/public/steps.svg`を追加する。
 7. ChatGPTからNotion connectorを接続し、定期分析タスクを作成する。
 
 `notion-configure`と`subscriber-upsert`はSecret Managerの値を読み、後者はGoogle Health APIとCloud Resource Manager APIを呼びます。対応data type、Webhook URL、認証secretを変更した場合は`make subscriber-upsert`を再実行します。
 
-setup code、OAuth callback query、token、健康値、Webhook本文はログへ出しません。callbackのCloud Run request logはTerraformの`_Default` exclusionで保存対象から外します。
+setup code、OAuth callback query、token、健康値、Webhook本文はログへ出しません。
+callbackのAPI Gateway request logとCloud Run request logはTerraformの`_Default`
+exclusionで保存対象から外します。
 
 ## 主要な実行契約
 

@@ -20,7 +20,12 @@ from health_data_pipeline.google_health import (
 from health_data_pipeline.oauth import AuthorizationStart, IssuedSession, OAuthGrant
 from health_data_pipeline.runtime import DynamicOwnerWebhookAuthenticator
 from health_data_pipeline.storage import InMemoryObjectStore
-from health_data_pipeline.web import WebDependencies, create_app
+from health_data_pipeline.web import (
+    OAUTH_SESSION_COOKIE,
+    SETUP_CSRF_COOKIE,
+    WebDependencies,
+    create_app,
+)
 
 
 class SignatureVerifier:
@@ -102,6 +107,7 @@ def _config() -> AppConfig:
         cloud_run_job="sync",
         cloud_tasks_queue="queue",
         cloud_tasks_service_account="tasks@example.iam.gserviceaccount.com",
+        public_base_url="https://public.example",
         cloud_run_service_url="https://service.example",
         oauth_client_id="client",
         oauth_redirect_uri="https://service.example/setup/oauth/callback",
@@ -136,7 +142,7 @@ def _client(
         clock=clock or (lambda: datetime(2026, 7, 28, 12, 7, tzinfo=UTC)),
     )
     return (
-        TestClient(create_app(dependencies), base_url="https://service.example"),
+        TestClient(create_app(dependencies), base_url="https://public.example"),
         sink,
         tasks,
         oauth,
@@ -235,7 +241,8 @@ def test_subscriber_verification_http_status_contract() -> None:
         "/webhooks/google-health",
         content=verification_body,
         headers={
-            "Authorization": "Bearer secret",
+            "Authorization": "Bearer gateway-backend-token",
+            "X-Forwarded-Authorization": "Bearer secret",
             "Content-Type": "application/json",
         },
     )
@@ -274,7 +281,7 @@ def test_setup_code_is_posted_then_oauth_redirects() -> None:
     created = client.post(
         "/setup/session",
         data={"csrf_token": csrf_value, "setup_code": "one-time-code"},
-        headers={"Origin": "https://service.example"},
+        headers={"Origin": "https://public.example"},
         follow_redirects=False,
     )
     started = client.get("/setup/oauth/start", follow_redirects=False)
@@ -287,6 +294,23 @@ def test_setup_code_is_posted_then_oauth_redirects() -> None:
     assert callback.status_code == 200
     assert oauth.created == ["one-time-code"]
     assert oauth.completed == ["authorization-code"]
+    for response, cookie_name in (
+        (form, SETUP_CSRF_COOKIE),
+        (created, SETUP_CSRF_COOKIE),
+        (created, OAUTH_SESSION_COOKIE),
+        (callback, OAUTH_SESSION_COOKIE),
+    ):
+        cookie_headers = [
+            value
+            for value in response.headers.get_list("set-cookie")
+            if value.startswith(f"{cookie_name}=")
+        ]
+        assert len(cookie_headers) == 1
+        cookie_header = cookie_headers[0]
+        assert "Path=/" in cookie_header
+        assert "Secure" in cookie_header
+        assert "HttpOnly" in cookie_header
+        assert "Domain=" not in cookie_header
 
 
 def test_public_svg_has_short_cache_policy() -> None:

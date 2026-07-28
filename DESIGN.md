@@ -2,7 +2,7 @@
 
 | 項目 | 内容 |
 |---|---|
-| 文書バージョン | 3.0 |
+| 文書バージョン | 3.1 |
 | 更新日 | 2026-07-28 |
 | 対象 | Fitbit Sense 2を使う単一所有者 |
 | 実行基盤 | Google Cloud |
@@ -75,7 +75,8 @@ flowchart LR
     Fitbit["Fitbit Sense 2"]
     iPhone["iPhone / Fitbitアプリ"]
     Health["Google Health API v4"]
-    Service["Cloud Run Service<br/>Webhook / OAuth / View / SVG"]
+    Gateway["API Gateway<br/>公開HTTPS入口"]
+    Service["非公開Cloud Run Service<br/>Webhook / OAuth / View / SVG"]
     Tasks["Cloud Tasks<br/>HTTP target 1 queue"]
     RunAPI["Cloud Run Jobs API<br/>jobs.run"]
     Scheduler["Cloud Scheduler<br/>1時間ごと"]
@@ -87,7 +88,7 @@ flowchart LR
     Monitoring["Cloud Monitoring<br/>同期・費用通知"]
 
     Fitbit --> iPhone --> Health
-    Health -- "Webhook" --> Service
+    Health -- "Webhook" --> Gateway --> Service
     Service -- "イベント保存" --> GCS
     Service -- "Job起動Task" --> Tasks
     Tasks -- "OAuth POST" --> RunAPI --> Job
@@ -99,7 +100,7 @@ flowchart LR
     Service --> Notion
     Service --> GCS
     Notion --> ChatGPT
-    GitHub --> Service
+    GitHub --> Gateway
     Job --> Monitoring
 ```
 
@@ -107,6 +108,7 @@ flowchart LR
 
 | リソース | 数 | 用途 |
 |---|---:|---|
+| API Gateway | 1 | Webhook、OAuth setup、歩数SVGの公開HTTPS入口 |
 | Cloud Run Service | 1 | Webhook、OAuth setup、View更新、歩数SVG |
 | Cloud Run Job | 1 | 同期、回収、日次計算、バックフィル、Class A集計 |
 | Cloud Tasks Queue | 1 | Job起動とView更新のHTTP task |
@@ -125,6 +127,7 @@ BigQuery、Firestore、Cloud SQLは使用しない。
 | リソース | ロケーション |
 |---|---|
 | Cloud Run Service / Job | `us-central1` |
+| API Gateway | `us-central1` |
 | Cloud Tasks | `us-central1` |
 | Cloud Scheduler | `us-central1`、timezoneは`Asia/Tokyo` |
 | 健康データGCS | `us-central1` |
@@ -138,7 +141,7 @@ BigQuery、Firestore、Cloud SQLは使用しない。
 
 ### 6.1 Webhook受信
 
-Cloud Run Serviceの公開endpoint：
+API Gatewayが公開し、認証付きで非公開Cloud Run Serviceへ転送するendpoint：
 
 ```text
 POST /webhooks/google-health
@@ -147,7 +150,9 @@ POST /webhooks/google-health
 処理：
 
 1. body sizeとContent-Typeを検証する。
-2. `Authorization`をSecret Managerの値とconstant-time比較する。
+2. API Gatewayが保存した元の`Authorization`を
+   `X-Forwarded-Authorization`から取り出し、Secret Managerの値と
+   constant-time比較する。
 3. `GOOGLE-HEALTH-API-SIGNATURE`をTinkでraw bodyに対して検証する。
 4. JSON schemaを検証する。
 5. `healthUserId`をHMAC化して所有者と照合する。
@@ -228,13 +233,17 @@ POST /internal/tasks/apply-views
 - body: `{"requested_generation": <generation>}`
 - handlerはpayloadだけを信頼せず、必ず最新HEADを読む
 
-Cloud Run Serviceは公開endpointも持つため、内部endpointでGoogle署名付きID token、audience、Task専用service accountをアプリ側でも検証する。
+Cloud Run Serviceは公開IAMを持たない。内部endpointではさらにGoogle署名付きID
+token、audience、Task専用service accountをアプリ側でも検証する。
 
 Queueの`max_concurrent_dispatches`は1とする。Job起動APIの応答は短いため、個人利用ではこの直列化を許容する。
 
 ## 7. Cloud Runの役割
 
 ### 7.1 Cloud Run Service
+
+公開endpointはAPI Gatewayだけから到達させる。Cloud Run ServiceにはAPI Gateway専用
+service accountとCloud Tasks専用service accountだけが`roles/run.invoker`を持つ。
 
 | Endpoint | 認証 | 処理 |
 |---|---|---|
@@ -1152,16 +1161,29 @@ active versionは各secret 5以内とする。古いversionはrotation確認後�
 - session ID、cookie
 - callback query string
 
-### 24.3 Cloud Run callback request log
+### 24.3 OAuth callback request log
 
-Cloud Run Serviceはrequest logを自動生成するため、Terraformで`_Default` sinkへproject-level exclusionを設定する。
+API GatewayとCloud Run Serviceはrequest logを自動生成するため、Terraformで
+`_Default` sinkへproject-level exclusionを設定する。
 
 対象：
 
 ```text
-resource.type="cloud_run_revision"
-log_id("run.googleapis.com/requests")
-httpRequest.requestUrl=~"/setup/oauth/callback([?].*)?$"
+(
+  resource.type="cloud_run_revision"
+  log_id("run.googleapis.com/requests")
+  httpRequest.requestUrl=~"/setup/oauth/callback([?].*)?$"
+)
+OR
+(
+  resource.type="apigateway.googleapis.com/Gateway"
+  httpRequest.requestUrl=~"/setup/oauth/callback([?].*)?$"
+)
+OR
+(
+  resource.type="api"
+  httpRequest.requestUrl=~"/setup/oauth/callback([?].*)?$"
+)
 ```
 
 - request logの生成自体は止められない。
@@ -1508,7 +1530,7 @@ BigQuery API、dataset、table、IAMは作らない。
 2. OAuth consentをExternal / In productionへ変更する。
 3. Googleから要求されたOAuth verificationを完了する。
 4. Notionに専用database/data sourceを作り、integrationへ共有してdata source IDを取得する。
-5. Web application OAuth clientへCloud Runの`/setup/oauth/callback`を登録する。
+5. Web application OAuth clientへAPI Gatewayの`/setup/oauth/callback`を登録する。
 6. Fitbitと同じGoogleアカウントでOAuth同意する。
 7. Cloud MonitoringとBillingの通知メールを確認する。
 8. GitHubプロフィールREADMEへSVG URLを追加する。
@@ -1518,7 +1540,8 @@ BigQuery API、dataset、table、IAMは作らない。
 
 Terraform bootstrap、main基盤、secret version、Cloud Run初回deployの完了後に、ローカル端末でApplication Default Credentialsを設定する。以降のCLIは平文secretを引数に取らず、Secret Managerから読む。
 
-1. `PROJECT_ID`、`HEALTH_BUCKET`、`CLOUD_RUN_SERVICE_URL`、`NOTION_DATA_SOURCE_ID`を設定する。
+1. `PROJECT_ID`、`HEALTH_BUCKET`、`PUBLIC_BASE_URL`、
+   `CLOUD_RUN_SERVICE_URL`、`NOTION_DATA_SOURCE_ID`を設定する。
 2. `make notion-configure`を実行し、19.1のNotion schemaを作成または修復する。
 3. `make subscriber-upsert`を実行する。所有者未登録でもGoogleのendpoint verificationには応答するが、通常のWebhook通知はOAuth完了まで拒否する。
 4. `make setup-code`を実行し、10分有効のcodeを`GET /setup`で表示されるformへ入力してOAuthを完了する。
@@ -1530,7 +1553,7 @@ Terraform bootstrap、main基盤、secret version、Cloud Run初回deployの完�
 - Google Health APIの全REST requestへ`x-goog-user-project`としてproject IDを指定する。
 - `projects/<project-number>/subscribers/health-data-pipeline`をlistし、存在しなければcreate、存在すればpatchする。
 - createでは`CreateSubscriberPayload`だけを送り、patchでだけSubscriberの`name`を送る。
-- endpointを`<CLOUD_RUN_SERVICE_URL>/webhooks/google-health`とする。
+- endpointを`<PUBLIC_BASE_URL>/webhooks/google-health`とする。
 - `subscriptionCreatePolicy`を`AUTOMATIC`とし、実装の`WEBHOOK_SUPPORTED_DATA_TYPES`（`oxygen-saturation`を除外）を登録する。
 - `endpointAuthorization.secret`にはSecret ManagerのWebhook authorization secretを使用する。
 - mutation responseのOperation errorを拒否し、再listでSubscriberが`ACTIVE`になったことを確認してから成功とする。

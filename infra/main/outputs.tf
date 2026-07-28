@@ -24,8 +24,16 @@ output "container_repository" {
 }
 
 output "cloud_run_service_url" {
-  description = "Public service URL after deploy_workloads is enabled."
+  description = "Private Cloud Run backend URL after deploy_workloads is enabled."
   value       = try(google_cloud_run_v2_service.api[0].uri, null)
+}
+
+output "public_base_url" {
+  description = "Public API Gateway URL after deploy_workloads is enabled."
+  value = try(
+    "https://${google_api_gateway_gateway.public[0].default_hostname}",
+    null,
+  )
 }
 
 output "cloud_run_job_run_uri" {

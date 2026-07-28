@@ -161,14 +161,14 @@ resource "google_cloud_run_v2_job" "sync" {
   ]
 }
 
-resource "google_cloud_run_v2_service_iam_member" "public" {
+resource "google_cloud_run_v2_service_iam_member" "api_gateway" {
   count = var.deploy_workloads ? 1 : 0
 
   project  = var.project_id
   location = google_cloud_run_v2_service.api[0].location
   name     = google_cloud_run_v2_service.api[0].name
   role     = "roles/run.invoker"
-  member   = "allUsers"
+  member   = "serviceAccount:${google_service_account.api_gateway.email}"
 }
 
 resource "google_cloud_run_v2_service_iam_member" "task_caller" {

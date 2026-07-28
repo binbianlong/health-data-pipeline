@@ -194,7 +194,10 @@ def create_app(dependencies: WebDependencies | None = None) -> FastAPI:
             raise HTTPException(status_code=413, detail="request is too large")
         try:
             event = deps.webhook_authenticator.authenticate(
-                authorization=request.headers.get("authorization"),
+                authorization=(
+                    request.headers.get("x-forwarded-authorization")
+                    or request.headers.get("authorization")
+                ),
                 signature_header=request.headers.get("google-health-api-signature"),
                 content_type=request.headers.get("content-type"),
                 raw_body=body,
@@ -268,7 +271,7 @@ def create_app(dependencies: WebDependencies | None = None) -> FastAPI:
             secure=True,
             httponly=True,
             samesite="strict",
-            path="/setup",
+            path="/",
         )
         _secure_html_headers(response)
         return response
@@ -276,7 +279,7 @@ def create_app(dependencies: WebDependencies | None = None) -> FastAPI:
     @app.post("/setup/session")
     async def setup_session(request: Request) -> Response:
         deps = _dependencies(request)
-        expected_origin = deps.config.cloud_run_service_url
+        expected_origin = deps.config.public_base_url
         origin = request.headers.get("origin")
         if origin is None or not secrets.compare_digest(origin.rstrip("/"), expected_origin):
             raise HTTPException(status_code=403, detail="origin rejected")
@@ -310,9 +313,15 @@ def create_app(dependencies: WebDependencies | None = None) -> FastAPI:
             secure=True,
             httponly=True,
             samesite="lax",
-            path="/setup/oauth",
+            path="/",
         )
-        response.delete_cookie(SETUP_CSRF_COOKIE, path="/setup")
+        response.delete_cookie(
+            SETUP_CSRF_COOKIE,
+            path="/",
+            secure=True,
+            httponly=True,
+            samesite="strict",
+        )
         _secure_html_headers(response)
         return response
 
@@ -354,7 +363,13 @@ def create_app(dependencies: WebDependencies | None = None) -> FastAPI:
             "<title>接続完了</title><p>Google Healthとの接続が完了しました。</p>"
             "</html>"
         )
-        response.delete_cookie(OAUTH_SESSION_COOKIE, path="/setup/oauth")
+        response.delete_cookie(
+            OAUTH_SESSION_COOKIE,
+            path="/",
+            secure=True,
+            httponly=True,
+            samesite="lax",
+        )
         _secure_html_headers(response)
         return response
 
