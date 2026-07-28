@@ -3,8 +3,10 @@
 ARG PYTHON_IMAGE=python:3.13-slim@sha256:6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.8.14@sha256:f3660c56d5b08d6c516360981bedc439f499b9bf37f46a216018da3777a74011
 
+# hadolint ignore=DL3006
 FROM ${UV_IMAGE} AS uv
 
+# hadolint ignore=DL3006
 FROM ${PYTHON_IMAGE} AS base
 
 ENV PYTHONUNBUFFERED=1 \
@@ -41,6 +43,7 @@ COPY src ./src
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-editable
 
+# hadolint ignore=DL3006
 FROM ${PYTHON_IMAGE} AS runtime
 
 ENV PATH=/app/.venv/bin:$PATH \
