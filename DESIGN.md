@@ -1179,6 +1179,11 @@ OR
   resource.type="apigateway.googleapis.com/Gateway"
   httpRequest.requestUrl=~"/setup/oauth/callback([?].*)?$"
 )
+OR
+(
+  resource.type="api"
+  httpRequest.requestUrl=~"/setup/oauth/callback([?].*)?$"
+)
 ```
 
 - request logの生成自体は止められない。

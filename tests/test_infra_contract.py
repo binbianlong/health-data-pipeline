@@ -193,4 +193,5 @@ def test_oauth_callback_request_logging_exclusion_covers_gateway_and_cloud_run()
     assert 'resource.type="cloud_run_revision"' in logging
     assert 'log_id("run.googleapis.com/requests")' in logging
     assert 'resource.type="apigateway.googleapis.com/Gateway"' in logging
-    assert logging.count('httpRequest.requestUrl=~"/setup/oauth/callback([?].*)?$"') == 2
+    assert 'resource.type="api"' in logging
+    assert logging.count('httpRequest.requestUrl=~"/setup/oauth/callback([?].*)?$"') == 3

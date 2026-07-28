@@ -20,7 +20,12 @@ from health_data_pipeline.google_health import (
 from health_data_pipeline.oauth import AuthorizationStart, IssuedSession, OAuthGrant
 from health_data_pipeline.runtime import DynamicOwnerWebhookAuthenticator
 from health_data_pipeline.storage import InMemoryObjectStore
-from health_data_pipeline.web import WebDependencies, create_app
+from health_data_pipeline.web import (
+    OAUTH_SESSION_COOKIE,
+    SETUP_CSRF_COOKIE,
+    WebDependencies,
+    create_app,
+)
 
 
 class SignatureVerifier:
@@ -289,6 +294,23 @@ def test_setup_code_is_posted_then_oauth_redirects() -> None:
     assert callback.status_code == 200
     assert oauth.created == ["one-time-code"]
     assert oauth.completed == ["authorization-code"]
+    for response, cookie_name in (
+        (form, SETUP_CSRF_COOKIE),
+        (created, SETUP_CSRF_COOKIE),
+        (created, OAUTH_SESSION_COOKIE),
+        (callback, OAUTH_SESSION_COOKIE),
+    ):
+        cookie_headers = [
+            value
+            for value in response.headers.get_list("set-cookie")
+            if value.startswith(f"{cookie_name}=")
+        ]
+        assert len(cookie_headers) == 1
+        cookie_header = cookie_headers[0]
+        assert "Path=/" in cookie_header
+        assert "Secure" in cookie_header
+        assert "HttpOnly" in cookie_header
+        assert "Domain=" not in cookie_header
 
 
 def test_public_svg_has_short_cache_policy() -> None:

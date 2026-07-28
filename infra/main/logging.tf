@@ -15,6 +15,11 @@ resource "google_logging_project_exclusion" "oauth_callback_request" {
       resource.type="apigateway.googleapis.com/Gateway"
       httpRequest.requestUrl=~"/setup/oauth/callback([?].*)?$"
     )
+    OR
+    (
+      resource.type="api"
+      httpRequest.requestUrl=~"/setup/oauth/callback([?].*)?$"
+    )
   EOT
 
   depends_on = [google_project_service.required["logging.googleapis.com"]]

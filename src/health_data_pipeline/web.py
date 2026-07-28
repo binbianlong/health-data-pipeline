@@ -271,7 +271,7 @@ def create_app(dependencies: WebDependencies | None = None) -> FastAPI:
             secure=True,
             httponly=True,
             samesite="strict",
-            path="/setup",
+            path="/",
         )
         _secure_html_headers(response)
         return response
@@ -313,9 +313,15 @@ def create_app(dependencies: WebDependencies | None = None) -> FastAPI:
             secure=True,
             httponly=True,
             samesite="lax",
-            path="/setup/oauth",
+            path="/",
         )
-        response.delete_cookie(SETUP_CSRF_COOKIE, path="/setup")
+        response.delete_cookie(
+            SETUP_CSRF_COOKIE,
+            path="/",
+            secure=True,
+            httponly=True,
+            samesite="strict",
+        )
         _secure_html_headers(response)
         return response
 
@@ -357,7 +363,13 @@ def create_app(dependencies: WebDependencies | None = None) -> FastAPI:
             "<title>接続完了</title><p>Google Healthとの接続が完了しました。</p>"
             "</html>"
         )
-        response.delete_cookie(OAUTH_SESSION_COOKIE, path="/setup/oauth")
+        response.delete_cookie(
+            OAUTH_SESSION_COOKIE,
+            path="/",
+            secure=True,
+            httponly=True,
+            samesite="lax",
+        )
         _secure_html_headers(response)
         return response
 
