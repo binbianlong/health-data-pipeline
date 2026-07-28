@@ -1,5 +1,10 @@
 .git
 .github
+!.github/
+.github/*
+!.github/workflows/
+.github/workflows/*
+!.github/workflows/deploy.yml
 .venv
 .cache
 .coverage
