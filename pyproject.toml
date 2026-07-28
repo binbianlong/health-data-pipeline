@@ -1,0 +1,138 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "health-data-pipeline"
+version = "0.1.0"
+description = "Personal Fitbit health data pipeline on Google Cloud"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+license = { text = "UNLICENSED" }
+authors = [{ name = "health-data-pipeline owner" }]
+dependencies = [
+  "cryptography>=48.0.1,<49",
+  "fastapi>=0.116,<1",
+  "google-auth>=2.40,<3",
+  "google-cloud-secret-manager>=2.24,<3",
+  "google-cloud-storage>=3.2,<4",
+  "google-cloud-tasks>=2.19,<3",
+  "google-crc32c>=1.7,<2",
+  "httpx>=0.28,<1",
+  "pydantic>=2.11,<3",
+  "structlog>=25.4,<26",
+  "tink>=1.13,<2",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[project.scripts]
+health-data-pipeline = "health_data_pipeline.cli:main"
+health-data-pipeline-service = "health_data_pipeline.web:run_service"
+health-data-pipeline-job = "health_data_pipeline.job:main"
+
+[dependency-groups]
+dev = [
+  "hypothesis>=6.136,<7",
+  "mypy>=1.17,<2",
+  "pip-audit>=2.9,<3",
+  "pytest>=8.4,<9",
+  "pytest-asyncio>=1.1,<2",
+  "pytest-cov>=6.2,<7",
+  "ruff>=0.12,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/health_data_pipeline"]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+  "A",
+  "ASYNC",
+  "B",
+  "C4",
+  "DTZ",
+  "E",
+  "F",
+  "FA",
+  "FAST",
+  "FLY",
+  "FURB",
+  "I",
+  "LOG",
+  "N",
+  "PERF",
+  "PIE",
+  "PL",
+  "PT",
+  "PTH",
+  "RET",
+  "RUF",
+  "S",
+  "SIM",
+  "T20",
+  "TRY",
+  "UP",
+  "W",
+]
+ignore = [
+  "PLR0913",
+  "TRY003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["DTZ001", "PLR2004", "S101", "S105", "S106"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+pretty = true
+show_error_codes = true
+show_error_context = true
+warn_unreachable = true
+plugins = ["pydantic.mypy"]
+mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = ["notion_client.*", "tink.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+addopts = [
+  "--strict-config",
+  "--strict-markers",
+  "--cov=health_data_pipeline",
+  "--cov-report=term-missing:skip-covered",
+  "--cov-report=xml",
+  "--cov-fail-under=80",
+]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["health_data_pipeline"]
+omit = [
+  "src/health_data_pipeline/cli.py",
+  "src/health_data_pipeline/runtime.py",
+]
+
+[tool.coverage.report]
+exclude_also = [
+  "if TYPE_CHECKING:",
+  "if __name__ == .__main__.:",
+  "raise NotImplementedError",
+]
+skip_empty = true

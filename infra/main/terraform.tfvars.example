@@ -1,0 +1,19 @@
+project_id                  = "replace-with-project-id"
+region                      = "us-central1"
+name_prefix                 = "health-data-pipeline"
+health_bucket_name          = "replace-with-globally-unique-health-bucket"
+terraform_state_bucket_name = "replace-with-bootstrap-state-bucket"
+
+# First apply: leave false and container_image empty.
+# After Cloud Build pushes an image, CD supplies both values.
+deploy_workloads = false
+container_image  = ""
+
+github_repository    = "replace-owner/health-data-pipeline"
+github_deploy_branch = "main"
+notification_email = "replace-with-alert-email@example.com"
+notion_data_source_id = ""
+
+# Optional. Budget notifications do not stop resources or guarantee zero cost.
+billing_account_id = ""
+monthly_budget_usd = 5

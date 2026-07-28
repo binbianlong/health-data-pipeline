@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          version: "0.8.14"
+          enable-cache: true
+      - run: uv sync --frozen --all-groups
+      - run: uv run ruff format --check .
+      - run: uv run ruff check .
+      - run: uv run mypy src tests
+      - run: uv run pytest
+      - name: Audit locked runtime dependencies
+        run: |
+          uv export --frozen --no-dev --no-emit-project --format requirements-txt --output-file /tmp/runtime-requirements.txt
+          uv run pip-audit --requirement /tmp/runtime-requirements.txt --disable-pip
+      - uses: actions/upload-artifact@v7.0.1
+        if: always()
+        with:
+          name: coverage
+          path: coverage.xml
+          if-no-files-found: ignore
+
+  terraform:
+    name: Terraform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4.0.1
+        with:
+          terraform_version: 1.12.2
+      - uses: terraform-linters/setup-tflint@v6.3.0
+        with:
+          tflint_version: v0.58.1
+      - name: Terraform format
+        run: terraform fmt -check -recursive infra
+      - name: Validate bootstrap
+        run: |
+          terraform -chdir=infra/bootstrap init -backend=false -input=false
+          terraform -chdir=infra/bootstrap validate
+      - name: Validate main
+        run: |
+          terraform -chdir=infra/main init -backend=false -input=false
+          terraform -chdir=infra/main validate
+      - name: TFLint
+        run: |
+          tflint --init --config=infra/.tflint.hcl
+          tflint --chdir=infra/bootstrap --config=../.tflint.hcl
+          tflint --chdir=infra/main --config=../.tflint.hcl
+
+  container:
+    name: Container
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build explicit test stage
+        run: docker build --target test --tag health-data-pipeline:test .
+      - name: Build runtime stage
+        run: docker build --target runtime --tag health-data-pipeline:ci .
+      - uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: health-data-pipeline:ci
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+
+  source-security:
+    name: Source security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: hadolint/hadolint-action@v3.3.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: warning
+      - uses: gitleaks/gitleaks-action@v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

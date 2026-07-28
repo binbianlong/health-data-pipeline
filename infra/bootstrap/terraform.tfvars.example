@@ -1,0 +1,3 @@
+project_id        = "replace-with-project-id"
+region            = "us-central1"
+state_bucket_name = "replace-with-globally-unique-tf-state-bucket"
