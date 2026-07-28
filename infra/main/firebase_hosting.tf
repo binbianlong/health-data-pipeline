@@ -33,7 +33,7 @@ resource "google_firebase_hosting_version" "public" {
   config {
     dynamic "rewrites" {
       for_each = toset([
-        "/healthz",
+        "/health",
         "/public/steps.svg",
         "/setup",
         "/setup/oauth/callback",
