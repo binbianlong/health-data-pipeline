@@ -34,8 +34,9 @@ from health_data_pipeline.oauth import (
 from health_data_pipeline.storage import ObjectNotFound, ObjectStore, PreconditionFailed
 from health_data_pipeline.views import StepsSvgService, ViewApplicationService
 
-SETUP_CSRF_COOKIE = "__Host-setup-csrf"
-OAUTH_SESSION_COOKIE = "__Host-oauth-session"
+# Firebase Hosting forwards only this specially named cookie to Cloud Run.
+# Its value changes from the setup CSRF token to the opaque OAuth session ID.
+SESSION_COOKIE = "__session"
 
 
 class OidcVerifier(Protocol):
@@ -194,10 +195,7 @@ def create_app(dependencies: WebDependencies | None = None) -> FastAPI:
             raise HTTPException(status_code=413, detail="request is too large")
         try:
             event = deps.webhook_authenticator.authenticate(
-                authorization=(
-                    request.headers.get("x-forwarded-authorization")
-                    or request.headers.get("authorization")
-                ),
+                authorization=request.headers.get("authorization"),
                 signature_header=request.headers.get("google-health-api-signature"),
                 content_type=request.headers.get("content-type"),
                 raw_body=body,
@@ -265,7 +263,7 @@ def create_app(dependencies: WebDependencies | None = None) -> FastAPI:
         csrf_token = secrets.token_urlsafe(32)
         response = HTMLResponse(_setup_form(csrf_token))
         response.set_cookie(
-            SETUP_CSRF_COOKIE,
+            SESSION_COOKIE,
             csrf_token,
             max_age=600,
             secure=True,
@@ -295,7 +293,7 @@ def create_app(dependencies: WebDependencies | None = None) -> FastAPI:
             form_csrf = fields["csrf_token"][0]
         except (KeyError, UnicodeDecodeError, ValueError) as exc:
             raise HTTPException(status_code=400, detail="invalid setup form") from exc
-        cookie_csrf = request.cookies.get(SETUP_CSRF_COOKIE, "")
+        cookie_csrf = request.cookies.get(SESSION_COOKIE, "")
         if not cookie_csrf or not secrets.compare_digest(cookie_csrf, form_csrf):
             raise HTTPException(status_code=403, detail="CSRF validation failed")
         try:
@@ -307,7 +305,7 @@ def create_app(dependencies: WebDependencies | None = None) -> FastAPI:
             raise HTTPException(status_code=403, detail="setup code rejected") from exc
         response = RedirectResponse("/setup/oauth/start", status_code=303)
         response.set_cookie(
-            OAUTH_SESSION_COOKIE,
+            SESSION_COOKIE,
             session.session_id,
             max_age=deps.config.setup_session_ttl_seconds,
             secure=True,
@@ -315,20 +313,13 @@ def create_app(dependencies: WebDependencies | None = None) -> FastAPI:
             samesite="lax",
             path="/",
         )
-        response.delete_cookie(
-            SETUP_CSRF_COOKIE,
-            path="/",
-            secure=True,
-            httponly=True,
-            samesite="strict",
-        )
         _secure_html_headers(response)
         return response
 
     @app.get("/setup/oauth/start")
     def oauth_start(request: Request) -> Response:
         deps = _dependencies(request)
-        session_id = request.cookies.get(OAUTH_SESSION_COOKIE)
+        session_id = request.cookies.get(SESSION_COOKIE)
         if not session_id:
             raise HTTPException(status_code=401, detail="setup session is missing")
         try:
@@ -347,7 +338,7 @@ def create_app(dependencies: WebDependencies | None = None) -> FastAPI:
         error: str | None = None,
     ) -> Response:
         deps = _dependencies(request)
-        session_id = request.cookies.get(OAUTH_SESSION_COOKIE)
+        session_id = request.cookies.get(SESSION_COOKIE)
         if error is not None or code is None or state is None or session_id is None:
             raise HTTPException(status_code=400, detail="OAuth callback rejected")
         try:
@@ -364,7 +355,7 @@ def create_app(dependencies: WebDependencies | None = None) -> FastAPI:
             "</html>"
         )
         response.delete_cookie(
-            OAUTH_SESSION_COOKIE,
+            SESSION_COOKIE,
             path="/",
             secure=True,
             httponly=True,

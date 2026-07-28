@@ -2,8 +2,8 @@
 
 | 項目 | 内容 |
 |---|---|
-| 文書バージョン | 3.1 |
-| 更新日 | 2026-07-28 |
+| 文書バージョン | 3.2 |
+| 更新日 | 2026-07-29 |
 | 対象 | Fitbit Sense 2を使う単一所有者 |
 | 実行基盤 | Google Cloud |
 | 実装言語 | Python 3.13 |
@@ -75,8 +75,8 @@ flowchart LR
     Fitbit["Fitbit Sense 2"]
     iPhone["iPhone / Fitbitアプリ"]
     Health["Google Health API v4"]
-    Gateway["API Gateway<br/>公開HTTPS入口"]
-    Service["非公開Cloud Run Service<br/>Webhook / OAuth / View / SVG"]
+    Hosting["Firebase Hosting<br/>完全一致の公開7 route"]
+    Service["Cloud Run Service（Invoker IAM check無効）<br/>Webhook / OAuth / View / SVG"]
     Tasks["Cloud Tasks<br/>HTTP target 1 queue"]
     RunAPI["Cloud Run Jobs API<br/>jobs.run"]
     Scheduler["Cloud Scheduler<br/>1時間ごと"]
@@ -88,7 +88,7 @@ flowchart LR
     Monitoring["Cloud Monitoring<br/>同期・費用通知"]
 
     Fitbit --> iPhone --> Health
-    Health -- "Webhook" --> Gateway --> Service
+    Health -- "Webhook" --> Hosting --> Service
     Service -- "イベント保存" --> GCS
     Service -- "Job起動Task" --> Tasks
     Tasks -- "OAuth POST" --> RunAPI --> Job
@@ -100,7 +100,7 @@ flowchart LR
     Service --> Notion
     Service --> GCS
     Notion --> ChatGPT
-    GitHub --> Gateway
+    GitHub --> Hosting
     Job --> Monitoring
 ```
 
@@ -108,7 +108,7 @@ flowchart LR
 
 | リソース | 数 | 用途 |
 |---|---:|---|
-| API Gateway | 1 | Webhook、OAuth setup、歩数SVGの公開HTTPS入口 |
+| Firebase Hosting default site | 1 | `<PROJECT_ID>.web.app`で公開7 routeだけをCloud Runへrewrite |
 | Cloud Run Service | 1 | Webhook、OAuth setup、View更新、歩数SVG |
 | Cloud Run Job | 1 | 同期、回収、日次計算、バックフィル、Class A集計 |
 | Cloud Tasks Queue | 1 | Job起動とView更新のHTTP task |
@@ -127,7 +127,7 @@ BigQuery、Firestore、Cloud SQLは使用しない。
 | リソース | ロケーション |
 |---|---|
 | Cloud Run Service / Job | `us-central1` |
-| API Gateway | `us-central1` |
+| Firebase Hosting | グローバル。default siteは`<PROJECT_ID>.web.app` |
 | Cloud Tasks | `us-central1` |
 | Cloud Scheduler | `us-central1`、timezoneは`Asia/Tokyo` |
 | 健康データGCS | `us-central1` |
@@ -141,18 +141,20 @@ BigQuery、Firestore、Cloud SQLは使用しない。
 
 ### 6.1 Webhook受信
 
-API Gatewayが公開し、認証付きで非公開Cloud Run Serviceへ転送するendpoint：
+Firebase Hostingが完全一致rewriteでCloud Run Serviceへ転送するendpoint：
 
 ```text
 POST /webhooks/google-health
 ```
 
+外部連携に使う`PUBLIC_BASE_URL`はdefault siteの
+`https://<PROJECT_ID>.web.app`とする。Cloud Runの`run.app` URLをWebhook、
+OAuth redirect URI、GitHub SVGへ登録しない。
+
 処理：
 
 1. body sizeとContent-Typeを検証する。
-2. API Gatewayが保存した元の`Authorization`を
-   `X-Forwarded-Authorization`から取り出し、Secret Managerの値と
-   constant-time比較する。
+2. `Authorization` headerをSecret Managerの値とconstant-time比較する。
 3. `GOOGLE-HEALTH-API-SIGNATURE`をTinkでraw bodyに対して検証する。
 4. JSON schemaを検証する。
 5. `healthUserId`をHMAC化して所有者と照合する。
@@ -233,8 +235,11 @@ POST /internal/tasks/apply-views
 - body: `{"requested_generation": <generation>}`
 - handlerはpayloadだけを信頼せず、必ず最新HEADを読む
 
-Cloud Run Serviceは公開IAMを持たない。内部endpointではさらにGoogle署名付きID
-token、audience、Task専用service accountをアプリ側でも検証する。
+Cloud Run ServiceはFirebase Hostingの動的rewriteに必要なため、公式推奨の
+`invoker_iam_disabled = true`を設定する。ただし`/internal/tasks/apply-views`はHostingの
+rewrite対象に含めず、Google署名付きID token、audience、Task専用service accountを
+アプリ側で検証する。Cloud Run IAMはpath単位で制御できないため、直接`run.app`へ
+到達した場合も同じ検証を必須とする。
 
 Queueの`max_concurrent_dispatches`は1とする。Job起動APIの応答は短いため、個人利用ではこの直列化を許容する。
 
@@ -242,8 +247,27 @@ Queueの`max_concurrent_dispatches`は1とする。Job起動APIの応答は短�
 
 ### 7.1 Cloud Run Service
 
-公開endpointはAPI Gatewayだけから到達させる。Cloud Run ServiceにはAPI Gateway専用
-service accountとCloud Tasks専用service accountだけが`roles/run.invoker`を持つ。
+Firebase Hostingは次の7 routeだけを完全一致でCloud Runへrewriteする。catch-all rewriteは
+設定しない。
+
+```text
+GET  /healthz
+GET  /public/steps.svg
+GET  /setup
+POST /setup/session
+GET  /setup/oauth/start
+GET  /setup/oauth/callback
+POST /webhooks/google-health
+```
+
+Firebase Hostingからの動的rewriteには未認証呼出しが必要なため、Cloud Run Serviceは
+`invoker_iam_disabled = true`とする。これはService全体の`run.app` URLも直接呼出し
+可能にするため、内部routeの保護をHostingのroute制限だけへ依存させない。公開7 routeは
+それぞれWebhook secret・署名、CSRF、setup code、一時session、OAuth stateをアプリで検証し、
+未定義routeは404を返す。`POST /internal/tasks/apply-views`はCloud Tasks専用OIDCを検証する。
+
+Hostingの動的rewriteは60秒でtimeoutする。公開7 routeは60秒未満で応答し、長い収集・再計算・
+Notion更新はJobまたは内部View更新Taskへ分離する。
 
 | Endpoint | 認証 | 処理 |
 |---|---|---|
@@ -1030,6 +1054,7 @@ OpenAI API keyやモデル呼出しをGoogle Cloud側へ追加しない。
 ### 22.1 OAuth方針
 
 - OAuth client type: Web Server
+- redirect URI: `https://<PROJECT_ID>.web.app/setup/oauth/callback`
 - User type: External
 - Publishing status: In production
 - Authorization Code Flow
@@ -1100,7 +1125,12 @@ Session record：
 
 - 全状態遷移をGCS generation precondition付きで行う。
 - `POST /setup/session`でcodeをCAS消費し、sessionを発行する。
-- cookieは`HttpOnly`、`Secure`、`SameSite=Lax`とする。
+- Firebase HostingがCloud Runへ転送するcookieは`__session`だけなので、OAuth setupでは
+  この名前以外のcookieを使用しない。
+- `GET /setup`は`__session`へCSRF tokenを`HttpOnly`、`Secure`、
+  `SameSite=Strict`、有効期限10分で設定する。
+- `POST /setup/session`はCSRFとsetup codeの検証成功後、同じ`__session`を
+  不透明なsession IDへ上書きし、`SameSite=Lax`とする。
 - PKCE verifierは専用AEAD keyで暗号化する。
 - callback開始時に`CALLBACK_CLAIMED`へCAS遷移して再送を拒否する。
 - token交換とowner照合成功後だけ`COMPLETED`にする。
@@ -1163,8 +1193,9 @@ active versionは各secret 5以内とする。古いversionはrotation確認後�
 
 ### 24.3 OAuth callback request log
 
-API GatewayとCloud Run Serviceはrequest logを自動生成するため、Terraformで
-`_Default` sinkへproject-level exclusionを設定する。
+Cloud Run Serviceはrequest logを自動生成するため、Terraformで`_Default` sinkへ
+project-level exclusionを設定する。Firebase HostingのCloud Logging連携は有効にしないが、
+将来誤って有効化されても同じcallbackを保存しない条件を含める。
 
 対象：
 
@@ -1176,12 +1207,8 @@ API GatewayとCloud Run Serviceはrequest logを自動生成するため、Terra
 )
 OR
 (
-  resource.type="apigateway.googleapis.com/Gateway"
-  httpRequest.requestUrl=~"/setup/oauth/callback([?].*)?$"
-)
-OR
-(
-  resource.type="api"
+  resource.type="firebase_domain"
+  log_id("webrequests")
   httpRequest.requestUrl=~"/setup/oauth/callback([?].*)?$"
 )
 ```
@@ -1406,6 +1433,7 @@ infra/
 - lifecycle
 - Secret containers
 - Cloud Run Service / Job
+- Firebase project / Hosting default site / Version / live Release
 - Cloud Tasks Queue
 - Cloud Scheduler
 - Artifact Registry
@@ -1460,6 +1488,7 @@ BigQuery API、dataset、table、IAMは作らない。
 - HEAD CAS
 - lease非依存CAS
 - OAuth session状態遷移
+- Firebase Hosting用`__session` cookie遷移
 - retention参照とaudit参照
 - Notion generation比較
 - SVG pointer CAS
@@ -1469,6 +1498,7 @@ BigQuery API、dataset、table、IAMは作らない。
 
 - Cloud Tasks OAuthによるJobs API起動
 - Cloud Tasks OIDCによるView handler起動
+- Firebase Hostingの公開7 pathだけがCloud Runへrewriteされること
 - immutable content-addressed object
 - API原本からingestion Manifest
 - Year ShardからRoot Snapshot
@@ -1500,6 +1530,9 @@ BigQuery API、dataset、table、IAMは作らない。
 - callback code、state、queryが`_Default` log bucketへ残らない。
 - Class A 4,000回警告後も現在データ収集が継続する。
 - GitHub endpointから歩数以外を取得できない。
+- Firebase Hosting経由のOAuth setupで`__session`がcallbackまで維持される。
+- Firebase Hostingに未定義のpathがCloud Runへrewriteされない。
+- `run.app`へ直接送った内部View更新requestも正しいCloud Tasks OIDCなしでは拒否される。
 - 5日未同期メールが1回だけ届く。
 - daily NDJSON fixtureを将来BigQuery schemaへloadできる。
 
@@ -1530,7 +1563,8 @@ BigQuery API、dataset、table、IAMは作らない。
 2. OAuth consentをExternal / In productionへ変更する。
 3. Googleから要求されたOAuth verificationを完了する。
 4. Notionに専用database/data sourceを作り、integrationへ共有してdata source IDを取得する。
-5. Web application OAuth clientへAPI Gatewayの`/setup/oauth/callback`を登録する。
+5. Web application OAuth clientへ
+   `https://<PROJECT_ID>.web.app/setup/oauth/callback`を完全一致で登録する。
 6. Fitbitと同じGoogleアカウントでOAuth同意する。
 7. Cloud MonitoringとBillingの通知メールを確認する。
 8. GitHubプロフィールREADMEへSVG URLを追加する。
@@ -1578,6 +1612,9 @@ Cloud Run ServiceとWebhook authorization secret versionが存在してから実
 - [Google Health settings](https://developers.google.com/health/reference/rest/v4/Settings)
 - [Google Health OAuth setup](https://developers.google.com/health/setup)
 - [Google OAuth 2.0](https://developers.google.com/identity/protocols/oauth2)
+- [Firebase HostingとCloud Run](https://firebase.google.com/docs/hosting/cloud-run)
+- [Firebase Hostingのcacheと`__session` cookie](https://firebase.google.com/docs/hosting/manage-cache)
+- [FirebaseをTerraformで管理する](https://firebase.google.com/docs/projects/terraform/get-started)
 - [Cloud Run Jobs execution](https://docs.cloud.google.com/run/docs/execute/jobs)
 - [Cloud Run Jobs API](https://docs.cloud.google.com/run/docs/reference/rest/v2/projects.locations.jobs/run)
 - [Cloud Tasks HTTP targets](https://docs.cloud.google.com/tasks/docs/creating-http-target-tasks)

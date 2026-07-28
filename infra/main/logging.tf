@@ -1,7 +1,7 @@
 resource "google_logging_project_exclusion" "oauth_callback_request" {
   project     = var.project_id
   name        = "${var.name_prefix}-oauth-callback-request"
-  description = "Exclude OAuth callback request URLs containing code and state from Cloud Run and API Gateway logs in the _Default sink."
+  description = "Exclude OAuth callback request URLs containing code and state from Cloud Run and optional Firebase Hosting request logs in the _Default sink."
   disabled    = false
 
   filter = <<-EOT
@@ -12,12 +12,8 @@ resource "google_logging_project_exclusion" "oauth_callback_request" {
     )
     OR
     (
-      resource.type="apigateway.googleapis.com/Gateway"
-      httpRequest.requestUrl=~"/setup/oauth/callback([?].*)?$"
-    )
-    OR
-    (
-      resource.type="api"
+      resource.type="firebase_domain"
+      log_id("webrequests")
       httpRequest.requestUrl=~"/setup/oauth/callback([?].*)?$"
     )
   EOT

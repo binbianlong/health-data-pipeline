@@ -21,8 +21,7 @@ from health_data_pipeline.oauth import AuthorizationStart, IssuedSession, OAuthG
 from health_data_pipeline.runtime import DynamicOwnerWebhookAuthenticator
 from health_data_pipeline.storage import InMemoryObjectStore
 from health_data_pipeline.web import (
-    OAUTH_SESSION_COOKIE,
-    SETUP_CSRF_COOKIE,
+    SESSION_COOKIE,
     WebDependencies,
     create_app,
 )
@@ -118,6 +117,7 @@ def _config() -> AppConfig:
 def _client(
     *,
     clock: Any | None = None,
+    oidc: Any | None = None,
 ) -> tuple[TestClient, EventSink, Tasks, OAuth, Views]:
     key = b"owner-key"
     sink = EventSink()
@@ -135,7 +135,7 @@ def _client(
         webhook_events=sink,
         tasks=tasks,  # type: ignore[arg-type]
         oauth_sessions=oauth,  # type: ignore[arg-type]
-        oidc_verifier=Oidc(),
+        oidc_verifier=oidc or Oidc(),
         expected_task_service_account="tasks@example.iam.gserviceaccount.com",
         views=views,  # type: ignore[arg-type]
         steps=Steps(),  # type: ignore[arg-type]
@@ -241,8 +241,7 @@ def test_subscriber_verification_http_status_contract() -> None:
         "/webhooks/google-health",
         content=verification_body,
         headers={
-            "Authorization": "Bearer gateway-backend-token",
-            "X-Forwarded-Authorization": "Bearer secret",
+            "Authorization": "Bearer secret",
             "Content-Type": "application/json",
         },
     )
@@ -256,7 +255,7 @@ def test_subscriber_verification_http_status_contract() -> None:
     assert unauthorized.status_code == 401
 
 
-def test_apply_views_requires_expected_service_account() -> None:
+def test_apply_views_accepts_expected_service_account() -> None:
     client, _, _, _, views = _client()
 
     response = client.post(
@@ -269,7 +268,28 @@ def test_apply_views_requires_expected_service_account() -> None:
     assert views.generations == [12]
 
 
+def test_apply_views_rejects_anonymous_and_wrong_service_account() -> None:
+    anonymous_client, _, _, _, anonymous_views = _client()
+    wrong_client, _, _, _, wrong_views = _client(oidc=Oidc("other@example.com"))
+
+    anonymous = anonymous_client.post(
+        "/internal/tasks/apply-views",
+        json={"requested_generation": 12},
+    )
+    wrong_identity = wrong_client.post(
+        "/internal/tasks/apply-views",
+        json={"requested_generation": 12},
+        headers={"Authorization": "Bearer id-token"},
+    )
+
+    assert anonymous.status_code == 401
+    assert wrong_identity.status_code == 403
+    assert anonymous_views.generations == []
+    assert wrong_views.generations == []
+
+
 def test_setup_code_is_posted_then_oauth_redirects() -> None:
+    assert SESSION_COOKIE == "__session"
     client, _, _, oauth, _ = _client()
     form = client.get("/setup")
     assert form.status_code == 200
@@ -294,19 +314,11 @@ def test_setup_code_is_posted_then_oauth_redirects() -> None:
     assert callback.status_code == 200
     assert oauth.created == ["one-time-code"]
     assert oauth.completed == ["authorization-code"]
-    for response, cookie_name in (
-        (form, SETUP_CSRF_COOKIE),
-        (created, SETUP_CSRF_COOKIE),
-        (created, OAUTH_SESSION_COOKIE),
-        (callback, OAUTH_SESSION_COOKIE),
-    ):
-        cookie_headers = [
-            value
-            for value in response.headers.get_list("set-cookie")
-            if value.startswith(f"{cookie_name}=")
-        ]
+    for response in (form, created, callback):
+        cookie_headers = response.headers.get_list("set-cookie")
         assert len(cookie_headers) == 1
         cookie_header = cookie_headers[0]
+        assert cookie_header.startswith(f"{SESSION_COOKIE}=")
         assert "Path=/" in cookie_header
         assert "Secure" in cookie_header
         assert "HttpOnly" in cookie_header
