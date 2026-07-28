@@ -34,7 +34,7 @@
 - 距離、Active Zone Minutes、安静時心拍、睡眠時呼吸数、運動時間も取得する。
 - Webhook通知後、通常時は20分以内を目標にHEADへ反映する。
 - API原本を変換処理より先にGCSへ保存する。
-- 当日値、過去7日平均、過去30日平均をNotionへ反映する。
+- 当日値、月曜始まりの暦週平均、暦月平均をNotionへ反映する。
 - ChatGPTの定期タスクがNotionを読み、睡眠状態、疲労傾向、普段との差、注意変化、当日の活動・休養案を生成できるようにする。
 - GitHubプロフィールには直近7日分の歩数だけを表示する。
 - Fitbitの最終同期時刻を保存し、5日間同期されていない場合はメール通知する。
@@ -81,7 +81,7 @@ flowchart LR
     Scheduler["Cloud Scheduler<br/>1時間ごと"]
     Job["Cloud Run Job<br/>同期・回収・バックフィル"]
     GCS["Cloud Storage<br/>Blob / Snapshot / HEAD"]
-    Notion["Notion<br/>日次・7日・30日"]
+    Notion["Notion<br/>日次・暦週・暦月"]
     ChatGPT["ChatGPT定期タスク<br/>健康分析"]
     GitHub["GitHubプロフィール<br/>7日歩数SVG"]
     Monitoring["Cloud Monitoring<br/>同期・費用通知"]
@@ -108,7 +108,7 @@ flowchart LR
 | リソース | 数 | 用途 |
 |---|---:|---|
 | Cloud Run Service | 1 | Webhook、OAuth setup、View更新、歩数SVG |
-| Cloud Run Job | 1 | 同期、回収、日次計算、バックフィル、GC |
+| Cloud Run Job | 1 | 同期、回収、日次計算、バックフィル、Class A集計 |
 | Cloud Tasks Queue | 1 | Job起動とView更新のHTTP task |
 | Cloud Scheduler Job | 1 | Cloud Run Jobを毎時起動 |
 | 健康データGCS Bucket | 1 | 原本、日次、Snapshot、state |
@@ -239,17 +239,26 @@ Queueの`max_concurrent_dispatches`は1とする。Job起動APIの応答は短�
 2. HEAD、Root Snapshot、必要なYear Shardを読む。
 3. Sense 2の最終同期時刻とGoogle Health settingsを取得する。
 4. HEAD cursor以降のWebhookイベントを回収する。
-5. data type cursorへoverlapを付けて現在状態を照合する。
+5. data type cursorを含むcivil dateから現在日までを、最大直近90日に制限して日単位で再照合する。
 6. API原本、normalized blob、ingestion Manifestを保存する。
-7. 影響日とD〜D+30の日次値を再計算する。
+7. 影響日、同じ暦週と暦月の途中平均を再計算する。
 8. 影響年のYear Shardを作成する。
 9. Root Snapshotを作成する。
 10. HEADをCAS更新する。
 11. 成功時だけView更新Taskを作成する。
 12. 同期状態とClass A推定metricを出力する。
-13. 時間と操作予算に余裕があればバックフィルまたはGCを進める。
+13. 現在処理がなく、Asia/Tokyoで当日未実行なら14日分のバックフィルを進める。
 
 Notion障害はデータcommitを失敗させない。
+
+現在照合の開始日はdata typeごとの成功済み`reconciled_through_date`を優先し、このfieldがない旧Snapshotだけ前回のFitbit最終同期時刻を現在のcivil time zoneへ変換して使用する。開始日を再取得することで少なくとも1 civil日のoverlapを持たせる。
+
+- 初回は昨日と今日を取得する。
+- Fitbit最終同期時刻が進んだ場合、全data typeをcursor日から今日まで再取得する。
+- 1回の現在照合は各data typeとも直近90日までとし、API取得と置換は1 civil日単位で行う。
+- 高頻度詳細はこの現在照合で直近90日を保証し、それより古い詳細は保証しない。
+- 90日より古い未照合区間がある非高頻度data typeは、その区間末尾へbackfill cursorを戻し、通常の低優先度backfillで回収する。
+- 正常な全範囲照合とHEAD CASが成功したdata typeだけ、`reconciled_through_date`を今日へ進める。Webhookの個別区間取得だけでは進めない。
 
 ## 8. GCS object構成
 
@@ -388,7 +397,8 @@ CAS失敗時：
   "generation": 1842,
   "parent_snapshot": {
     "uri": "...",
-    "canonical_sha256": "..."
+    "canonical_sha256": "...",
+    "object_sha256": "..."
   },
   "state": {
     "daily_year_shards": {
@@ -405,7 +415,12 @@ CAS失敗時：
         "date_count": 209
       }
     },
-    "data_type_cursors": {},
+    "data_type_cursors": {
+      "steps": {
+        "reconciled_through_date": "2026-07-28",
+        "reconciled_at": "2026-07-28T00:05:00Z"
+      }
+    },
     "webhook_cursor": {},
     "backfill_cursors": {},
     "fitbit_last_sync_time": "2026-07-28T00:00:00Z",
@@ -484,7 +499,7 @@ manifests/snapshot-shards/
 - 更新された年のShardだけを再生成する。
 - 同じ日次contentを再計算した場合は既存revisionを再利用する。
 - revision hashが変わらなければ`source_generation`も変更しない。
-- 年末をまたぐD〜D+30再計算では複数Year Shardを作り、1つのRoot Snapshotで同時commitする。
+- 年末をまたぐ暦週再計算では複数Year Shardを作り、1つのRoot Snapshotで同時commitする。
 
 Root Snapshotと全Year Shardを合わせて日次の完全状態と定義する。
 
@@ -620,13 +635,16 @@ GCS上のAPI blob、normalized DETAIL、SESSION、DAILY_SOURCEは期限付き非
 ### 14.5 Backfill
 
 - 高頻度詳細: 直近90日だけ
-- 日次rollup: `2009-01-01`から設定chunkで前方処理
-- 睡眠・運動session: `2009-01-01`から設定chunkで前方処理
+- 日次rollup: `2009-01-01`まで14 civil日単位で後方処理
+- 睡眠・運動session: `2009-01-01`まで14 civil日単位で後方処理
+- 現在照合が90日で切り詰められた場合、非高頻度data typeの未照合部分をbackfill cursorへ戻す
+- Asia/Tokyoのcivil dateごとに1回、1 data typeだけ処理する
 - ページ単位checkpointは持たない
 - chunk完了時だけRoot Snapshotのbackfill cursorを進める
+- API途中失敗またはHEAD CAS失敗時はcursorを進めない
 - 現在データを常に優先する
 - 20分SLOの対象外とする
-- Class A警告中は新しいbackfill chunkを開始しない
+- Class A 4,000回は警告であり停止条件にはしない
 
 ## 15. civil timeと日次処理
 
@@ -657,25 +675,26 @@ Cloud RunのUTC日付を健康データの日付として使わない。
 
 `CANONICAL_STALE`も既知データの正式なrevisionとして保存し、同期後に新revisionへ置換する。
 
-### 15.3 7日・30日平均
+### 15.3 暦週・暦月平均
 
 日`D`に対して：
 
-- 7日平均: `D-7`から`D-1`
-- 30日平均: `D-30`から`D-1`
-- 当日値はbaselineへ含めない
+- 暦週平均: `D`が属する週の月曜日から`D`まで
+- 暦月平均: `D`が属する月の1日から`D`まで
+- 暦週平均には当日値を含め、週の途中はweek-to-dateとして扱う
+- 週は月曜日に始まり、日曜日のrowをその週の確定平均とする
+- 暦月平均には当日値を含め、当月中はmonth-to-dateとして扱う
+- 終了月は月末日のrowをその月の確定平均とする
 - 欠損を0にしない
 - true zero対応data typeかつ同期済みの場合だけ0とする
-- 7日平均は有効5日未満なら`INSUFFICIENT_DATA`
-- 30日平均は有効20日未満なら`INSUFFICIENT_DATA`
+- 暦週平均は1日以上の有効値があれば計算し、coverageで有効日数を示す
+- 暦月平均は1日以上の有効値があれば計算し、coverageで有効日数を示す
 
 過去日`D`が修正された場合：
 
-```text
-D から min(D+30, 現在日)
-```
-
-を再計算する。
+- `D`から`min(Dが属する週の日曜日, 現在日)`までの暦週week-to-dateを再計算する。
+- `D`から`min(Dの月末, 現在日)`までの暦月month-to-dateを再計算する。
+- 日付集合をunionし、重複する日を1回だけ再計算する。
 
 ## 16. Daily canonical schema
 
@@ -698,14 +717,14 @@ daily-canonical/
 {
   "metric_name": "steps",
   "statistic": "observed",
-  "window_days": 0,
+  "period_kind": "DAY",
   "dimension_key": null,
   "value_num": 8432.0,
   "value_text": null,
   "unit": "count",
   "aggregation": "daily_sum",
-  "baseline_start": null,
-  "baseline_end": null,
+  "period_start": "2026-07-28",
+  "period_end": "2026-07-28",
   "sample_count": 1,
   "expected_count": 1,
   "coverage_ratio": 1.0,
@@ -733,7 +752,7 @@ Daily rowには次を入れない。
 ```text
 metric_name
 + statistic
-+ window_days
++ period_kind
 + dimension_key
 ```
 
@@ -747,11 +766,11 @@ metric_name
 - `max`
 - `coverage`
 
-`window_days`：
+`period_kind`：
 
-- 0: 当日値
-- 7: 過去7日
-- 30: 過去30日
+- `DAY`: 当日値
+- `CALENDAR_WEEK`: 月曜日から対象日までの暦週平均。日曜日rowが確定値
+- `CALENDAR_MONTH`: 月初から対象日までの暦月平均
 
 ### 16.3 Schema version
 
@@ -774,7 +793,7 @@ leases/<owner-hmac>.json
 ```
 
 - TTL: 15分
-- heartbeat: 5分
+- heartbeat: v1では行わない
 - create: `ifGenerationMatch=0`
 - update/delete: 対象object generationを指定
 - Cloud Run Job timeout: 50分
@@ -785,7 +804,7 @@ leaseはAPI取得とGCS操作の重複を減らす最適化である。
 - lease取得失敗時はJobを正常終了する。
 - leaseなしでもHEADが変わっていなければCASは成功し得る。
 - leaseを持っていてもHEADが変わればCASは失敗する。
-- heartbeat喪失時は費用節約のため中断してよい。
+- 15分を超えたJobは後続Jobと重複し得るが、古いJobは最初に読んだHEAD generationへのCASだけを試し、HEADが進んでいれば失敗終了する。
 - 整合性は常にHEAD CASが保証する。
 
 ## 18. RetentionとGC
@@ -803,29 +822,31 @@ leaseはAPI取得とGCS操作の重複を減らす最適化である。
 | OAuth一時session | 失効後24時間 |
 | 一時処理履歴 | 90日 |
 
-### 18.2 明示GC
+### 18.2 v1の長期保持と将来GC
 
 Snapshot、Year Shard、daily revisionには単純なprefix lifecycleを設定しない。
 
 - 現行HEAD: 無期限
 - 現行HEADが指すRoot Snapshot: 無期限
-- 過去Root Snapshot: 90日
-- 保持中Root Snapshotが指すYear Shard: 保持
-- 保持中Year Shardが指すdaily revision: 保持
+- 過去Root Snapshot: v1では無期限
+- Year Shard: v1では無期限
+- daily revision: v1では無期限
 - 各日付の現行daily revision: 無期限
-- 未commit orphan: 作成から30日後にGC候補
+- 未commit orphan: v1では自動削除しない
 
-CAS失敗直後には削除しない。
+高容量になり得るAPI原本とnormalized cacheは18.1の固定lifecycleで削除する。content-addressedなcanonical、Snapshot、Year Shardは同じ内容を重複保存せず、個人利用では小容量のため、v1は誤削除を避けて保持する。CAS失敗直後にもobjectを削除しない。
 
-GCはmark-and-sweepで実行する。
+`gc.py`は将来の到達可能性GCに使う純粋な判定器であり、v1のJobは列挙・削除を実行しない。健康データbucketが1 GiBを超えたら警告し、実測に基づいてactive GCの導入を判断する。
 
-1. 現行HEADをrootとしてmarkする。
-2. 過去90日のRoot Snapshotをmarkする。
-3. RootからYear Shardをmarkする。
-4. Year Shardからdaily revisionをmarkする。
-5. `references.retention`をmarkする。
-6. `references.audit`はmarkしない。
-7. grace periodを超えたunmarked objectだけ削除する。
+将来active GCを導入する場合は、次の安全条件をすべて実装する。
+
+1. 月次dry-runで削除候補と削減見込みを記録する。
+2. 現行HEADと過去90日のRoot Snapshotをrootとしてmarkする。
+3. RootからYear Shard、Year Shardからdaily revisionをmarkする。
+4. `references.retention`をmarkし、`references.audit`はmarkしない。
+5. 30日のgrace periodを超えたunmarked objectだけを候補にする。
+6. 削除直前にHEAD generationを再確認する。
+7. GCS object generationを指定して削除し、同名の新しいobjectを巻き込まない。
 
 ### 18.3 Retention参照とaudit参照
 
@@ -854,12 +875,13 @@ GCはmark-and-sweepで実行する。
 - audit参照は取得条件、hash、件数の証跡だけを残す。
 - audit参照先は保持期限後に存在しなくてもよい。
 - 期限切れpayloadの欠落は破損ではなく`RETENTION_EXPIRED`と判定する。
+- v1ではretention参照を固定lifecycle対象prefixへ向けない。将来active GCを有効化した場合だけpin用途に使う。
 
 ## 19. Notion
 
 ### 19.1 表示内容
 
-非公開Notion databaseへ日付ごとに1ページ作る。
+非公開Notion databaseの専用data sourceへ日付ごとに1ページ作る。
 
 - Date
 - Data status
@@ -874,11 +896,25 @@ GCはmark-and-sweepで実行する。
 - Active Zone Minutes
 - 呼吸数
 - 運動時間
-- 各指標の7日平均
-- 各指標の30日平均
+- 各指標の暦週平均（月曜〜対象日、日曜確定）
+- 各指標の暦月平均
 - coverageとquality flag
 
 Notion本文にはChatGPTが読みやすい固定順の短い表を生成する。API原本や高頻度sampleは書かない。
+
+初回はtitleプロパティを1つ持つ空のdata sourceを作成し、integrationへ共有する。`make notion-configure`はNotion API `2026-03-11`を使い、次のschemaを冪等に作成または修復する。
+
+| Property | Notion type | 用途 |
+|---|---|---|
+| `Date` | Title | civil dateとページ回収key |
+| `Source HEAD generation` | Number | generation逆行防止 |
+| `Content SHA-256` | Rich text | 内容一致時の更新省略 |
+| `Data status` | Select | 日次データ状態 |
+| `Fitbit last sync time` | Date | 同期鮮度 |
+
+`Data status`の選択肢は`PROVISIONAL`、`CANONICAL_SYNCED`、`CANONICAL_STALE`、`MISSING`、`MIXED`、`INSUFFICIENT_DATA`とする。
+
+data sourceはtitleプロパティをちょうど1つ持つ必要がある。CLIはそのtitleを`Date`へrenameし、他の必須プロパティを追加する。健康指標はプロパティを大量作成せず、固定順のページ本文へ書く。
 
 ### 19.2 Generation逆行防止
 
@@ -945,7 +981,7 @@ ChatGPTの定期タスクはNotion connectorを通して最新ページを読む
 
 - 睡眠状態
 - 疲労傾向
-- 7日・30日平均との差
+- 暦週・暦月平均との差
 - 普段との差
 - 注意すべき変化
 - 当日の活動案
@@ -1136,9 +1172,9 @@ Root Snapshotへ`fitbit_last_sync_time`を保存する。
 
 健康データGCSはStandard storage、soft delete無効、object versioning無効、Autoclass無効とする。
 
-Class A操作は実行ごとにアプリ内で推定し、1回のstructured metricへ集約する。GCS上のcounterを毎操作更新しない。
+Cloud Run Job内のGCS `put` / `list`試行を数え、Job終了時にUTC月単位のstateへCAS加算する。`get` / `delete`、WebhookやView handlerなどService側の操作はv1の推定対象外とし、bucket全体の容量警告とCloud Billing Budgetを併用する。月次state自身の書込試行とCAS競合時の再試行も推定値へ含めるが、推定stateの更新失敗によって、すでに成功した健康データのcommitを失敗扱いにはしない。
 
-| 直近30日推定 | 動作 |
+| 当月推定 | 動作 |
 |---:|---|
 | 3,000未満 | 通常 |
 | 3,000以上 | 予告通知 |
@@ -1154,7 +1190,7 @@ Class A操作は実行ごとにアプリ内で推定し、1回のstructured metr
 
 は継続する。
 
-backfill、GC、rebuildは延期できる。Cloud Billing Budgetも別に設定する。Budget通知は課金を自動停止しないため、完全無料を保証するものではない。
+backfillとrebuildは延期できる。Cloud Billing Budgetも別に設定する。Budget通知は課金を自動停止しないため、完全無料を保証するものではない。
 
 ## 27. 障害時の動作
 
@@ -1172,9 +1208,9 @@ backfill、GC、rebuildは延期できる。Cloud Billing Budgetも別に設定�
 | Notion失敗 | GCS commitを維持しNotionだけretry |
 | SVG生成失敗 | 旧pointerを維持し次回retry |
 | lease取得失敗 | Job正常終了 |
-| lease heartbeat喪失 | 費用節約のため中断可能 |
+| lease期限切れ後の並行実行 | 最初に読んだHEADへのCASが失敗した古いJobを終了 |
 | OAuth失効 | 収集停止、メール、setup code再発行 |
-| Webhook長期停止 | data type cursorからAPI再照合 |
+| Webhook長期停止・Fitbit再同期 | 成功済みdata type civil cursorから最大直近90日を再照合し、古い非高頻度区間はbackfillへ戻す |
 
 ## 28. 運用SLO
 
@@ -1372,7 +1408,7 @@ BigQuery API、dataset、table、IAMは作らない。
 - replacement membership
 - duplicate conflict
 - civil time / DST
-- D〜D+30再計算
+- 暦週・暦月再計算
 - long row schema
 - daily rowへのgeneration混入禁止
 - Year Shard生成
@@ -1402,7 +1438,7 @@ BigQuery API、dataset、table、IAMは作らない。
 - OAuth code POST
 - OAuth callback replay拒否
 - callback request log exclusion
-- reachability GC
+- 将来GC plannerのretention／audit／grace判定
 
 ### 33.3 Acceptance
 
@@ -1413,7 +1449,7 @@ BigQuery API、dataset、table、IAMは作らない。
 - CAS敗者が勝者と共有するobjectを削除しない。
 - Root SnapshotとYear Shardから全日付の現行revisionを1件ずつ解決できる。
 - 同じ日次内容は同じcanonical hashになる。
-- 過去修正でD〜D+30と必要なYear Shardが更新される。
+- 過去修正で同じ暦週、同じ暦月、必要なYear Shardが更新される。
 - NotionとSVGが古いgenerationへ逆行しない。
 - Notion障害中もHEAD commitが進む。
 - raw cache期限切れ後もdaily-canonicalを読める。
@@ -1433,12 +1469,12 @@ BigQuery API、dataset、table、IAMは作らない。
 5. OAuth setup code、session状態機械、owner識別
 6. Google Health adapter、paging、replacement strategy
 7. API blob、normalized cache、ingestion Manifest
-8. Daily long schema、civil time、7日・30日平均
+8. Daily long schema、civil time、暦週・暦月平均
 9. Year Shard、Root Snapshot、HEAD CAS
 10. Webhook保存、Cloud TasksからJobs API起動
 11. Scheduler回収、lease、backfill
 12. Notion単一writer、SVG pointer
-13. Retention、reachability GC、Class A警告
+13. Retention lifecycle、将来GC planner、Class A・容量警告
 14. 5日未同期メール
 15. 障害試験、rebuild試験
 16. 将来BigQuery loader fixture
@@ -1450,19 +1486,38 @@ BigQuery API、dataset、table、IAMは作らない。
 1. Google Cloud billingを有効化する。
 2. OAuth consentをExternal / In productionへ変更する。
 3. Googleから要求されたOAuth verificationを完了する。
-4. Fitbitと同じGoogleアカウントでOAuth同意する。
-5. Notion parent pageをintegrationへ共有する。
-6. Cloud MonitoringとBillingの通知メールを確認する。
-7. GitHubプロフィールREADMEへSVG URLを追加する。
-8. ChatGPTでNotion connectorを接続し、定期タスクを有効化する。
+4. Notionに専用database/data sourceを作り、integrationへ共有してdata source IDを取得する。
+5. Web application OAuth clientへCloud Runの`/setup/oauth/callback`を登録する。
+6. Fitbitと同じGoogleアカウントでOAuth同意する。
+7. Cloud MonitoringとBillingの通知メールを確認する。
+8. GitHubプロフィールREADMEへSVG URLを追加する。
+9. ChatGPTでNotion connectorを接続し、定期タスクを有効化する。
 
-実装時はComputer Useで対象画面を開き、必要操作を1画面ずつ案内する。
+### 35.1 初回セットアップ実行順
+
+Terraform bootstrap、main基盤、secret version、Cloud Run初回deployの完了後に、ローカル端末でApplication Default Credentialsを設定する。以降のCLIは平文secretを引数に取らず、Secret Managerから読む。
+
+1. `PROJECT_ID`、`HEALTH_BUCKET`、`CLOUD_RUN_SERVICE_URL`、`NOTION_DATA_SOURCE_ID`を設定する。
+2. `make notion-configure`を実行し、19.1のNotion schemaを作成または修復する。
+3. `make subscriber-upsert`を実行する。所有者未登録でもGoogleのendpoint verificationには応答するが、通常のWebhook通知はOAuth完了まで拒否する。
+4. `make setup-code`を実行し、10分有効のcodeを`GET /setup`で表示されるformへ入力してOAuthを完了する。
+5. 毎時SchedulerまたはWebhookで最初のHEAD commitが作られ、NotionとSVGへ反映されることを確認する。
+
+`make subscriber-upsert`は次を冪等に実行する。
+
+- Application Default CredentialsのCloud Platform tokenでproject IDをproject numberへ解決する。
+- `projects/<project-number>/subscribers/health-data-pipeline`をlistし、存在しなければcreate、存在すればpatchする。
+- endpointを`<CLOUD_RUN_SERVICE_URL>/webhooks/google-health`とする。
+- `subscriptionCreatePolicy`を`AUTOMATIC`とし、実装の`WEBHOOK_SUPPORTED_DATA_TYPES`（`oxygen-saturation`を除外）を登録する。
+- `endpointAuthorization.secret`にはSecret ManagerのWebhook authorization secretを使用する。
+
+Cloud Run ServiceとWebhook authorization secret versionが存在してから実行する。対応data type、endpoint URL、authorization secretを変更した場合は再実行する。Subscriber登録に失敗しても毎時Schedulerによる照合は動くが、20分SLOを満たすためには登録成功が必要である。
 
 事前に必要な情報：
 
 - Google Cloud project、または新規project作成への同意
 - Fitbitに紐づくGoogleアカウント
-- Notion parent page
+- Notion data source ID
 - GitHub username
 - 通知先メールアドレス
 
