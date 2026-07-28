@@ -105,17 +105,12 @@ _SAMPLE_TYPES = frozenset(
 )
 
 
-def _lower_camel(kebab: str) -> str:
-    head, *tail = kebab.split("-")
-    return head + "".join(word[:1].upper() + word[1:] for word in tail)
-
-
 def data_type_spec(data_type: str) -> DataTypeSpec:
     """Return conservative API limits for a Google Health data type."""
 
     if data_type in _DAILY_TYPES:
         record_kind = "daily"
-        filter_field = f"{_lower_camel(data_type)}.date"
+        filter_field = f"{data_type.replace('-', '_')}.date"
     elif data_type in _SAMPLE_TYPES:
         record_kind = "sample"
         filter_field = f"{data_type.replace('-', '_')}.sample_time.physical_time"
