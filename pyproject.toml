@@ -11,7 +11,7 @@ requires-python = ">=3.13,<3.14"
 license = { text = "UNLICENSED" }
 authors = [{ name = "health-data-pipeline owner" }]
 dependencies = [
-  "cryptography>=48.0.1,<49",
+  "cryptography>=49.0.0,<50",
   "fastapi>=0.116,<1",
   "google-auth>=2.40,<3",
   "google-cloud-secret-manager>=2.24,<3",
