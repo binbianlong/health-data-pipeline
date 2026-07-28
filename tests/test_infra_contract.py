@@ -8,6 +8,7 @@ from health_data_pipeline.pipeline import SUPPORTED_DATA_TYPES
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _STORAGE_TERRAFORM = _PROJECT_ROOT / "infra" / "main" / "storage.tf"
+_GITHUB_WIF_TERRAFORM = _PROJECT_ROOT / "infra" / "main" / "github_wif.tf"
 _NORMALIZED_PREFIX = "blobs/normalized/record_kind="
 
 
@@ -91,3 +92,25 @@ def test_deploy_identity_and_scheduler_start_are_fail_closed() -> None:
     assert "assertion.repository_id == '${var.github_repository_id}'" in workload_identity
     assert '"attribute.repository_id" = "assertion.repository_id"' in workload_identity
     assert "paused           = var.scheduler_paused" in scheduler
+
+
+def test_cloud_build_source_staging_is_explicit_and_least_privilege() -> None:
+    storage = _STORAGE_TERRAFORM.read_text(encoding="utf-8")
+    workflow = (_PROJECT_ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")
+    workload_identity = _GITHUB_WIF_TERRAFORM.read_text(encoding="utf-8")
+
+    assert 'resource "google_storage_bucket" "cloud_build_source"' in storage
+    assert 'name                        = "${var.project_id}-cloud-build-source"' in storage
+    assert "uniform_bucket_level_access = true" in storage
+    assert 'public_access_prevention    = "enforced"' in storage
+    assert 'matches_prefix = ["source/"]' in storage
+    assert "age            = 7" in storage
+
+    assert 'role   = "roles/storage.legacyBucketReader"' in storage
+    assert 'role   = "roles/storage.objectCreator"' in storage
+    assert 'role   = "roles/storage.objectViewer"' in storage
+    assert "google_service_account.github_actions[0].email" in storage
+    assert "member = local.cloud_build_member" in storage
+    assert "roles/storage." not in workload_identity
+
+    assert '--gcs-source-staging-dir="gs://${GCP_PROJECT_ID}-cloud-build-source/source"' in workflow

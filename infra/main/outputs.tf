@@ -8,6 +8,11 @@ output "health_bucket_name" {
   value       = google_storage_bucket.health.name
 }
 
+output "cloud_build_source_bucket_name" {
+  description = "Private staging bucket used only for Cloud Build source archives."
+  value       = google_storage_bucket.cloud_build_source.name
+}
+
 output "artifact_registry_repository" {
   description = "Artifact Registry repository resource name."
   value       = google_artifact_registry_repository.containers.name

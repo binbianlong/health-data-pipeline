@@ -83,7 +83,7 @@ terraform -chdir=infra/main plan
 terraform -chdir=infra/main apply
 ```
 
-この段階でAPI、private health bucket、Secret Managerの空container、Artifact Registry、IAM、Queue、CI用Workload Identity Federationを作成します。Terraformはsecret値をstateへ保存しません。
+この段階でAPI、private health bucket、7日で自動削除される専用Cloud Build source bucket、Secret Managerの空container、Artifact Registry、IAM、Queue、CI用Workload Identity Federationを作成します。Terraformはsecret値をstateへ保存しません。
 
 ### 3. Google OAuthとNotionを用意
 
@@ -216,7 +216,7 @@ Terraform outputをGitHub ActionsのRepository Variablesへ設定します。
 | `REPOSITORY_ID` | GitHub repositoryの変更されない数値ID |
 | `SCHEDULER_PAUSED` | OAuth完了前は`true`、完了後は`false` |
 
-GitHubの`production` Environmentに`main`だけのdeployment branch ruleを設定します。プランが対応している場合はrequired reviewerも追加します。WIF側も`main`以外のtoken交換を拒否します。`Deploy` workflowを`main`から手動実行すると、Cloud Buildがtest/runtime build、scan、push、Terraform plan/applyを行います。初回deploy以降は`deploy_workloads=true`になり、Cloud RunとSchedulerが作成されます。
+GitHubの`production` Environmentに`main`だけのdeployment branch ruleを設定します。プランが対応している場合はrequired reviewerも追加します。WIF側も`main`以外のtoken交換を拒否します。`Deploy` workflowを`main`から手動実行すると、Terraformで先に作成した専用source bucketへarchiveを置き、Cloud Buildがtest/runtime build、scan、push、Terraform plan/applyを行います。GitHub Actionsの権限はこのbucketの参照と新規object作成だけに限定されます。初回deploy以降は`deploy_workloads=true`になり、Cloud RunとSchedulerが作成されます。
 
 BudgetをCDで管理する場合は、Cloud Build service accountへ請求先アカウント上の`roles/billing.costsManager`を一度付与します。SchedulerはOAuth refresh tokenが作成されるまで停止し、初回連携完了後に`SCHEDULER_PAUSED=false`として再deployします。
 

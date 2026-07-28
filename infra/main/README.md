@@ -8,7 +8,7 @@ terraform plan
 terraform apply
 ```
 
-The first apply uses `deploy_workloads=false`. It creates APIs, storage, secrets, service accounts, Artifact Registry, Cloud Tasks, monitoring primitives, and optional GitHub Workload Identity Federation. After an image is pushed, set `container_image` to an immutable Artifact Registry reference and `deploy_workloads=true`.
+The first apply uses `deploy_workloads=false`. It creates APIs, the health data bucket, a dedicated seven-day Cloud Build source staging bucket, secrets, service accounts, Artifact Registry, Cloud Tasks, monitoring primitives, and optional GitHub Workload Identity Federation. The GitHub Actions identity can only inspect and create source objects in that staging bucket; the custom Cloud Build account reads them. After an image is pushed, set `container_image` to an immutable Artifact Registry reference and `deploy_workloads=true`.
 
 Secret values are deliberately absent from Terraform. Add versions with `gcloud secrets versions add` or through the OAuth setup flow.
 
