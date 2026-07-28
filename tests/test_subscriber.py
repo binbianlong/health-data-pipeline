@@ -91,6 +91,52 @@ def test_upsert_rejects_operation_error(
         _provisioner(client).upsert()
 
 
+def test_upsert_accepts_verified_subscriber_when_list_omits_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "projects/123456/subscribers/health-data-pipeline"
+    mutated = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal mutated
+        if request.url.host == "cloudresourcemanager.googleapis.com":
+            return httpx.Response(200, json={"name": "projects/123456"})
+        if request.method == "POST":
+            mutated = True
+            return httpx.Response(200, json={"name": "operations/subscriber", "done": True})
+        return httpx.Response(
+            200,
+            json={"subscribers": [{"name": name}]} if mutated else {"subscribers": []},
+        )
+
+    monkeypatch.setattr("health_data_pipeline.subscriber._access_token", lambda: "token")
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    assert _provisioner(client).upsert() == name
+
+
+def test_upsert_rejects_explicitly_unverified_subscriber(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "projects/123456/subscribers/health-data-pipeline"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "cloudresourcemanager.googleapis.com":
+            return httpx.Response(200, json={"name": "projects/123456"})
+        if request.method == "PATCH":
+            return httpx.Response(200, json={"name": "operations/subscriber", "done": True})
+        return httpx.Response(
+            200,
+            json={"subscribers": [{"name": name, "state": "UNVERIFIED"}]},
+        )
+
+    monkeypatch.setattr("health_data_pipeline.subscriber._access_token", lambda: "token")
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    with pytest.raises(SubscriberProvisioningError, match="did not become ACTIVE"):
+        _provisioner(client).upsert()
+
+
 def test_upsert_rejects_nonterminal_operation_for_existing_active_subscriber(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
