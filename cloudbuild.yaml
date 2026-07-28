@@ -1,0 +1,100 @@
+substitutions:
+  _REGION: us-central1
+  _REPOSITORY: health-data-pipeline
+  _IMAGE: health-data-pipeline
+  _TF_STATE_BUCKET: ""
+  _HEALTH_BUCKET_NAME: ""
+  _NOTIFICATION_EMAIL: ""
+  _NOTION_DATA_SOURCE_ID: ""
+  _BILLING_ACCOUNT_ID: ""
+  _GITHUB_REPOSITORY: ""
+  _DEPLOY: "false"
+
+steps:
+  - id: docker-test-stage
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --target
+      - test
+      - --tag
+      - health-data-pipeline:test-${BUILD_ID}
+      - .
+
+  - id: docker-runtime-stage
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --target
+      - runtime
+      - --tag
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_IMAGE}:${BUILD_ID}
+      - .
+    waitFor:
+      - docker-test-stage
+
+  - id: trivy-runtime-image
+    name: aquasec/trivy:0.64.1
+    entrypoint: trivy
+    args:
+      - image
+      - --exit-code
+      - "1"
+      - --ignore-unfixed
+      - --severity
+      - CRITICAL,HIGH
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_IMAGE}:${BUILD_ID}
+    waitFor:
+      - docker-runtime-stage
+
+  - id: push-runtime-image
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_IMAGE}:${BUILD_ID}
+    waitFor:
+      - trivy-runtime-image
+
+  - id: terraform-plan-and-apply
+    name: hashicorp/terraform:1.12.2
+    entrypoint: sh
+    env:
+      - TF_IN_AUTOMATION=1
+    args:
+      - -ceu
+      - |
+        if [ -z "${_TF_STATE_BUCKET}" ] || [ -z "${_HEALTH_BUCKET_NAME}" ]; then
+          echo "Terraform substitutions _TF_STATE_BUCKET and _HEALTH_BUCKET_NAME are required." >&2
+          exit 1
+        fi
+
+        IMAGE="${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_IMAGE}:${BUILD_ID}"
+        cd infra/main
+        terraform init -input=false -backend-config="bucket=${_TF_STATE_BUCKET}"
+        terraform plan -input=false -out=/workspace/health-data-pipeline.tfplan \
+          -var="project_id=${PROJECT_ID}" \
+          -var="region=${_REGION}" \
+          -var="health_bucket_name=${_HEALTH_BUCKET_NAME}" \
+          -var="terraform_state_bucket_name=${_TF_STATE_BUCKET}" \
+          -var="container_image=$${IMAGE}" \
+          -var="deploy_workloads=true" \
+          -var="notification_email=${_NOTIFICATION_EMAIL}" \
+          -var="notion_data_source_id=${_NOTION_DATA_SOURCE_ID}" \
+          -var="billing_account_id=${_BILLING_ACCOUNT_ID}" \
+          -var="github_repository=${_GITHUB_REPOSITORY}"
+
+        if [ "${_DEPLOY}" = "true" ]; then
+          terraform apply -input=false -auto-approve /workspace/health-data-pipeline.tfplan
+        else
+          echo "Terraform apply skipped because _DEPLOY=${_DEPLOY}."
+        fi
+    waitFor:
+      - push-runtime-image
+
+images:
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_IMAGE}:${BUILD_ID}
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 3600s

@@ -1,0 +1,45 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Cloud Build and deploy
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Submit approved production build
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          CLOUD_BUILD_SERVICE_ACCOUNT: ${{ vars.CLOUD_BUILD_SERVICE_ACCOUNT }}
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          HEALTH_BUCKET_NAME: ${{ vars.HEALTH_BUCKET_NAME }}
+          NOTIFICATION_EMAIL: ${{ vars.NOTIFICATION_EMAIL }}
+          NOTION_DATA_SOURCE_ID: ${{ vars.NOTION_DATA_SOURCE_ID }}
+          BILLING_ACCOUNT_ID: ${{ vars.BILLING_ACCOUNT_ID }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          gcloud builds submit . \
+            --project="${GCP_PROJECT_ID}" \
+            --region="${GCP_REGION}" \
+            --config=cloudbuild.yaml \
+            --service-account="projects/${GCP_PROJECT_ID}/serviceAccounts/${CLOUD_BUILD_SERVICE_ACCOUNT}" \
+            --substitutions="_REGION=${GCP_REGION},_TF_STATE_BUCKET=${TF_STATE_BUCKET},_HEALTH_BUCKET_NAME=${HEALTH_BUCKET_NAME},_NOTIFICATION_EMAIL=${NOTIFICATION_EMAIL},_NOTION_DATA_SOURCE_ID=${NOTION_DATA_SOURCE_ID},_BILLING_ACCOUNT_ID=${BILLING_ACCOUNT_ID},_GITHUB_REPOSITORY=${GITHUB_REPOSITORY},_DEPLOY=true"
