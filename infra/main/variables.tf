@@ -71,14 +71,25 @@ variable "billing_account_id" {
   default     = ""
 }
 
-variable "monthly_budget_usd" {
-  description = "Optional monthly project budget in USD. It sends notifications but never stops services."
+variable "monthly_budget_amount" {
+  description = "Optional monthly project budget in the billing account currency. It sends notifications but never stops services."
   type        = number
   default     = 5
 
   validation {
-    condition     = var.monthly_budget_usd > 0 && floor(var.monthly_budget_usd) == var.monthly_budget_usd
-    error_message = "monthly_budget_usd must be a positive whole number."
+    condition     = var.monthly_budget_amount > 0 && floor(var.monthly_budget_amount) == var.monthly_budget_amount
+    error_message = "monthly_budget_amount must be a positive whole number."
+  }
+}
+
+variable "billing_currency_code" {
+  description = "ISO 4217 currency code of the billing account."
+  type        = string
+  default     = "USD"
+
+  validation {
+    condition     = can(regex("^[A-Z]{3}$", var.billing_currency_code))
+    error_message = "billing_currency_code must be a three-letter ISO 4217 code."
   }
 }
 
@@ -93,6 +104,17 @@ variable "github_repository" {
   }
 }
 
+variable "github_repository_id" {
+  description = "Immutable numeric GitHub repository ID used in the WIF condition."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.github_repository_id == "" || can(regex("^[0-9]+$", var.github_repository_id))
+    error_message = "github_repository_id must be an immutable numeric GitHub repository ID."
+  }
+}
+
 variable "github_deploy_branch" {
   description = "Only this branch may exchange GitHub OIDC credentials for deployment."
   type        = string
@@ -102,6 +124,12 @@ variable "github_deploy_branch" {
     condition     = can(regex("^[A-Za-z0-9._/-]+$", var.github_deploy_branch))
     error_message = "github_deploy_branch contains unsupported characters."
   }
+}
+
+variable "scheduler_paused" {
+  description = "Keep the hourly recovery scheduler paused until owner OAuth setup has completed."
+  type        = bool
+  default     = true
 }
 
 variable "deletion_protection" {

@@ -12,4 +12,6 @@ The first apply uses `deploy_workloads=false`. It creates APIs, storage, secrets
 
 Secret values are deliberately absent from Terraform. Add versions with `gcloud secrets versions add` or through the OAuth setup flow.
 
-If `billing_account_id` is set, the Terraform caller and Cloud Build service account need permission to manage budgets on that billing account. A budget only sends notifications; it does not cap charges.
+If `billing_account_id` is set, the Terraform caller and Cloud Build service account need permission to manage budgets on that billing account. `billing_currency_code` must match the billing account currency. A budget only sends notifications; it does not cap charges.
+
+Keep `scheduler_paused=true` for the first workload deploy. Set it to `false` only after the owner OAuth flow has stored the refresh token.

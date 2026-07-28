@@ -66,6 +66,8 @@ locals {
     "roles/cloudscheduler.admin",
     "roles/cloudtasks.admin",
     "roles/iam.securityAdmin",
+    "roles/iam.serviceAccountAdmin",
+    "roles/iam.workloadIdentityPoolAdmin",
     "roles/logging.admin",
     "roles/monitoring.admin",
     "roles/run.admin",
