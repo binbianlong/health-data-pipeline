@@ -137,8 +137,14 @@ class GoogleHealthSubscriberProvisioner:
     ) -> None:
         for attempt in range(ACTIVATION_ATTEMPTS):
             subscriber = _find_subscriber(self._list_subscribers(parent, headers), name)
-            if subscriber is not None and subscriber.get("state") == "ACTIVE":
-                return
+            if subscriber is not None:
+                state = subscriber.get("state")
+                if state in (None, "ACTIVE"):
+                    # A completed create/patch operation already means endpoint
+                    # verification succeeded. The current v4 list response can
+                    # omit the output-only state field, so absence is compatible
+                    # with success while explicit UNVERIFIED/INACTIVE is not.
+                    return
             if attempt + 1 < ACTIVATION_ATTEMPTS:
                 self._sleeper(ACTIVATION_DELAY_SECONDS)
         raise SubscriberProvisioningError("Google Health subscriber did not become ACTIVE")
