@@ -26,13 +26,18 @@ resource "google_iam_workload_identity_pool_provider" "github" {
   workload_identity_pool_id          = google_iam_workload_identity_pool.github[0].workload_identity_pool_id
   workload_identity_pool_provider_id = "github"
   display_name                       = "GitHub Actions OIDC"
-  attribute_condition                = "assertion.repository == '${var.github_repository}' && assertion.ref == 'refs/heads/${var.github_deploy_branch}'"
+  attribute_condition = join(" && ", compact([
+    "assertion.repository == '${var.github_repository}'",
+    var.github_repository_id == "" ? "" : "assertion.repository_id == '${var.github_repository_id}'",
+    "assertion.ref == 'refs/heads/${var.github_deploy_branch}'",
+  ]))
 
   attribute_mapping = {
-    "google.subject"       = "assertion.sub"
-    "attribute.actor"      = "assertion.actor"
-    "attribute.repository" = "assertion.repository"
-    "attribute.ref"        = "assertion.ref"
+    "google.subject"          = "assertion.sub"
+    "attribute.actor"         = "assertion.actor"
+    "attribute.repository"    = "assertion.repository"
+    "attribute.repository_id" = "assertion.repository_id"
+    "attribute.ref"           = "assertion.ref"
   }
 
   oidc {

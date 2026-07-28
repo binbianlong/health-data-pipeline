@@ -46,6 +46,17 @@ make docker-runtime
 
 ## Google Cloudの初期構築
 
+### 0. CLIとTerraformの認証
+
+Terraformより先にCLIとApplication Default Credentialsを設定します。
+
+```bash
+gcloud auth login
+gcloud config set project <PROJECT_ID>
+gcloud auth application-default login
+gcloud auth application-default set-quota-project <PROJECT_ID>
+```
+
 ### 1. Terraform state bucket
 
 ```bash
@@ -200,8 +211,14 @@ Terraform outputをGitHub ActionsのRepository Variablesへ設定します。
 | `NOTION_DATA_SOURCE_ID` | 前節で取得したNotion data sourceのID |
 | `NOTIFICATION_EMAIL` | 通知先 |
 | `BILLING_ACCOUNT_ID` | 任意 |
+| `BILLING_CURRENCY_CODE` | 請求先アカウントの通貨（例: `JPY`） |
+| `MONTHLY_BUDGET_AMOUNT` | 通貨単位の月次警告予算（例: `1000`） |
+| `REPOSITORY_ID` | GitHub repositoryの変更されない数値ID |
+| `SCHEDULER_PAUSED` | OAuth完了前は`true`、完了後は`false` |
 
-GitHubの`production` Environmentにrequired reviewerと`main`だけのdeployment branch ruleを設定します。WIF側も`main`以外のtoken交換を拒否します。`Deploy` workflowを`main`から手動実行すると、Cloud Buildがtest/runtime build、scan、push、Terraform plan/applyを行います。初回deploy以降は`deploy_workloads=true`になり、Cloud RunとSchedulerが作成されます。
+GitHubの`production` Environmentに`main`だけのdeployment branch ruleを設定します。プランが対応している場合はrequired reviewerも追加します。WIF側も`main`以外のtoken交換を拒否します。`Deploy` workflowを`main`から手動実行すると、Cloud Buildがtest/runtime build、scan、push、Terraform plan/applyを行います。初回deploy以降は`deploy_workloads=true`になり、Cloud RunとSchedulerが作成されます。
+
+BudgetをCDで管理する場合は、Cloud Build service accountへ請求先アカウント上の`roles/billing.costsManager`を一度付与します。SchedulerはOAuth refresh tokenが作成されるまで停止し、初回連携完了後に`SCHEDULER_PAUSED=false`として再deployします。
 
 ## 初回連携
 

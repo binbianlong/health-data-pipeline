@@ -7,7 +7,11 @@ substitutions:
   _NOTIFICATION_EMAIL: ""
   _NOTION_DATA_SOURCE_ID: ""
   _BILLING_ACCOUNT_ID: ""
+  _BILLING_CURRENCY_CODE: USD
+  _MONTHLY_BUDGET_AMOUNT: "5"
   _GITHUB_REPOSITORY: ""
+  _GITHUB_REPOSITORY_ID: ""
+  _SCHEDULER_PAUSED: "true"
   _DEPLOY: "false"
 
 steps:
@@ -81,7 +85,11 @@ steps:
           -var="notification_email=${_NOTIFICATION_EMAIL}" \
           -var="notion_data_source_id=${_NOTION_DATA_SOURCE_ID}" \
           -var="billing_account_id=${_BILLING_ACCOUNT_ID}" \
-          -var="github_repository=${_GITHUB_REPOSITORY}"
+          -var="billing_currency_code=${_BILLING_CURRENCY_CODE}" \
+          -var="monthly_budget_amount=${_MONTHLY_BUDGET_AMOUNT}" \
+          -var="github_repository=${_GITHUB_REPOSITORY}" \
+          -var="github_repository_id=${_GITHUB_REPOSITORY_ID}" \
+          -var="scheduler_paused=${_SCHEDULER_PAUSED}"
 
         if [ "${_DEPLOY}" = "true" ]; then
           terraform apply -input=false -auto-approve /workspace/health-data-pipeline.tfplan

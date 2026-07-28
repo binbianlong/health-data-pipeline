@@ -8,6 +8,7 @@ resource "google_cloud_scheduler_job" "hourly_sync" {
   schedule         = "0 * * * *"
   time_zone        = "Asia/Tokyo"
   attempt_deadline = "180s"
+  paused           = var.scheduler_paused
 
   retry_config {
     retry_count          = 3
