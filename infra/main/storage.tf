@@ -30,8 +30,12 @@ resource "google_storage_bucket" "health" {
       type = "Delete"
     }
     condition {
-      age            = 90
-      matches_prefix = ["blobs/normalized/record_kind=DETAIL/", "state/runs/"]
+      age = 90
+      matches_prefix = [
+        "blobs/normalized/record_kind=INTERVAL/",
+        "blobs/normalized/record_kind=SAMPLE/",
+        "state/runs/",
+      ]
     }
   }
 
@@ -42,8 +46,8 @@ resource "google_storage_bucket" "health" {
     condition {
       age = 365
       matches_prefix = [
+        "blobs/normalized/record_kind=DAILY/",
         "blobs/normalized/record_kind=SESSION/",
-        "blobs/normalized/record_kind=DAILY_SOURCE/",
         "manifests/ingestion/",
       ]
     }

@@ -317,7 +317,8 @@ Jobs APIの成功はExecution作成成功であり、HEAD commit成功ではあ�
 
 - `state/data-head.json`のGCS generation付きCAS更新だけがcommit pointです。
 - prefix列挙や最大generation探索では現行データを決めません。
-- API原本とnormalized detailは期限付きの非権威cacheです。
+- API原本とnormalized cacheは期限付きの非権威cacheです。`SAMPLE`と`INTERVAL`は90日、
+  `SESSION`と`DAILY`は365日で削除します。
 - HEADから到達する日次revisionは正式な長期状態です。
 - CAS失敗時は同じJob内で再試行せず、objectも即時削除しません。
 - NotionとSVGは適用済みHEAD generationを比較し、古い値へ逆行しません。

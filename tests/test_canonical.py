@@ -187,9 +187,9 @@ def test_generic_content_addressed_path_supports_partitions() -> None:
         "blobs/normalized",
         digest,
         suffix=".ndjson.gz",
-        partitions=("record_kind=DETAIL",),
+        partitions=("record_kind=SAMPLE", "data_type=heart-rate"),
     )
-    assert result.startswith("blobs/normalized/record_kind=DETAIL/")
+    assert result.startswith("blobs/normalized/record_kind=SAMPLE/data_type=heart-rate/")
     assert result.endswith(f"/{digest}.ndjson.gz")
 
 

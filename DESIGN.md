@@ -526,9 +526,10 @@ API原本保存前に日次値、Notion、SVGを更新しない。
 
 ```text
 blobs/api-pages/canonicalization=fhcj-1/encoding=gzip-v1/sha256/ab/<hash>.json.gz
-blobs/normalized/record_kind=DETAIL/canonicalization=fhcj-1/encoding=gzip-v1/sha256/cd/<hash>.ndjson.gz
-blobs/normalized/record_kind=SESSION/canonicalization=fhcj-1/encoding=gzip-v1/sha256/ef/<hash>.ndjson.gz
-blobs/normalized/record_kind=DAILY_SOURCE/canonicalization=fhcj-1/encoding=gzip-v1/sha256/01/<hash>.ndjson.gz
+blobs/normalized/record_kind=SAMPLE/data_type=heart-rate/canonicalization=fhcj-1/encoding=gzip-v1/sha256/cd/<hash>.ndjson.gz
+blobs/normalized/record_kind=INTERVAL/data_type=steps/canonicalization=fhcj-1/encoding=gzip-v1/sha256/de/<hash>.ndjson.gz
+blobs/normalized/record_kind=SESSION/data_type=sleep/canonicalization=fhcj-1/encoding=gzip-v1/sha256/ef/<hash>.ndjson.gz
+blobs/normalized/record_kind=DAILY/data_type=daily-resting-heart-rate/canonicalization=fhcj-1/encoding=gzip-v1/sha256/01/<hash>.ndjson.gz
 ```
 
 - 同じcanonical contentは同じobjectを再利用する。
@@ -567,7 +568,7 @@ manifests/ingestion/date=YYYY-MM-DD/
 
 Fitbit／Google Healthクラウドを詳細rawデータの上流sourceとする。
 
-GCS上のAPI blob、normalized DETAIL、SESSION、DAILY_SOURCEは期限付き非権威キャッシュである。
+GCS上のAPI blobとnormalized `SAMPLE`、`INTERVAL`、`SESSION`、`DAILY`は期限付き非権威キャッシュである。
 
 - cacheの期限切れはHEAD commitを無効にしない
 - cache indexは`state/raw-partitions/`へ置く
@@ -815,9 +816,10 @@ leaseはAPI取得とGCS操作の重複を減らす最適化である。
 |---|---:|
 | `webhook-events/` | 30日 |
 | `blobs/api-pages/` | 30日 |
-| `blobs/normalized/record_kind=DETAIL/` | 90日 |
+| `blobs/normalized/record_kind=SAMPLE/` | 90日 |
+| `blobs/normalized/record_kind=INTERVAL/` | 90日 |
 | `blobs/normalized/record_kind=SESSION/` | 365日 |
-| `blobs/normalized/record_kind=DAILY_SOURCE/` | 365日 |
+| `blobs/normalized/record_kind=DAILY/` | 365日 |
 | `manifests/ingestion/` | 365日 |
 | OAuth一時session | 失効後24時間 |
 | 一時処理履歴 | 90日 |
