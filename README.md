@@ -311,7 +311,14 @@ Cloud TasksとSchedulerはCloud Run Admin APIの次のendpointをOAuth tokenで�
 POST https://run.googleapis.com/v2/projects/<PROJECT>/locations/us-central1/jobs/health-data-pipeline-sync:run
 ```
 
-Jobs APIの成功はExecution作成成功であり、HEAD commit成功ではありません。実行失敗やCAS競合は、GCSに残った未処理イベントを次回の毎時Jobが回収します。
+WebhookのJob起動Taskは、GCS保存完了後の時刻から求めた次の10分境界まで
+遅延実行します。同一bucketの通知は同じ明示Task名へ合流するため、後続通知を
+取りこぼさず、通常は10分ごとに1回だけJobを起動します。Job終了時にもHEADと
+GCSを再照合し、未処理イベントがあれば次の境界Taskへ回収します。
+
+Jobs APIの成功はExecution作成成功であり、HEAD commit成功ではありません。
+実行失敗やCAS競合後もGCSに未処理イベントを残し、次回Taskまたは毎時Jobが
+回収します。
 
 ## データと安全性
 

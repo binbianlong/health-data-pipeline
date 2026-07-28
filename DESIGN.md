@@ -152,10 +152,14 @@ POST /webhooks/google-health
 4. JSON schemaを検証する。
 5. `healthUserId`をHMAC化して所有者と照合する。
 6. 変更区間を含むイベントをGCSへ不変保存する。
-7. 受信時刻を10分bucketへ丸めたJob起動Taskを作成する。
+7. GCS保存完了後の時刻を10分bucketへ丸め、次のbucket境界を
+   `schedule_time`とするJob起動Taskを作成する。
 8. 保存とTask作成成功後に`204`を返す。
 
 GCS保存またはTask作成失敗時は5xxを返し、Google Health APIの再送に委ねる。
+Taskのbucketは受信開始時刻ではなくGCS保存完了後に取り直した時刻から決める。
+これにより、保存処理が境界をまたいでも、すでにdispatchされた旧bucketのTask名を
+再利用しない。
 
 ### 6.2 Cloud TasksからCloud Run Jobを起動
 
@@ -180,10 +184,22 @@ Task設定：
 - body: `{}`
 - Job overrideは使用しない
 - task name: `<owner-hmac>-sync-<10-minute-bucket>`
+- `schedule_time`: 対象10分bucketの終了境界
 
 Webhook本文や変更区間をTask bodyへ入れない。GCSイベントとHEAD cursorが処理対象の正である。
+同一bucketのWebhookは、境界までdispatchされない同名Taskへ合流する。したがって
+Cloud Tasksの明示Task名による冪等性を保ちながら、通常は10分bucketあたりの
+Job起動を1回に抑える。最初のWebhookで即時dispatchすると、後続Webhookが
+削除済みTask名と重複して取り残されるため、即時実行はしない。
 
 Jobs APIの成功はExecution作成成功を意味し、データcommit成功を意味しない。Job失敗時もイベントはGCSに残り、次回Taskまたは毎時Jobが回収する。
+Jobは同期処理とlease解放後にHEADの`processed_objects`とGCSイベントを再照合する。
+未処理イベントがあれば、完了時刻が属するbucketの次境界Taskを登録する。すでに
+同bucketのTaskがあれば明示Task名の重複として合流する。これにより、長時間Job中に
+別bucketの起動がleaseで空振りしても、毎時回収を待たずに再起動できる。
+この終了時再照合とTask登録はcommit後のwake-up最適化であり、列挙、Snapshot読込、
+Task登録のいずれかが失敗しても成功済みHEAD commitを失敗扱いにしない。失敗時は
+種類だけを記録し、GCSイベントを残して毎時Schedulerへ委ねる。
 
 ### 6.3 Cloud Scheduler
 
@@ -1203,10 +1219,11 @@ backfillとrebuildは延期できる。Cloud Billing Budgetも別に設定する
 | Webhook GCS失敗 | 5xx、Google再送 |
 | Job起動Task作成失敗 | 5xx、保存eventを毎時回収 |
 | Jobs API起動失敗 | Cloud Tasks retry |
-| Job Execution失敗 | eventを未処理のまま次回Jobで回収 |
+| Job Execution失敗 | eventを未処理のまま次回Taskまたは毎時Jobで回収 |
 | API page途中失敗 | SnapshotとHEAD更新なし |
 | 正規化失敗 | SnapshotとHEAD更新なし |
 | HEAD CAS失敗 | 削除・再試行せずJob正常終了 |
+| HEAD成功・終了時回収失敗 | HEADを維持し、未処理eventを毎時Jobで回収 |
 | HEAD成功・View Task失敗 | 次回Jobがdesired generationから回収 |
 | Notion失敗 | GCS commitを維持しNotionだけretry |
 | SVG生成失敗 | 旧pointerを維持し次回retry |
@@ -1219,7 +1236,7 @@ backfillとrebuildは延期できる。Cloud Billing Budgetも別に設定する
 
 | 指標 | 目標 |
 |---|---|
-| 有効Webhook受信からHEAD commit | 通常時P95 20分以内 |
+| 有効Webhook受信からHEAD commit | 通常時P95 20分以内（最大10分のbucket待機を含む） |
 | Task／Execution失敗時の毎時回収 | 70分以内 |
 | Notion反映 | HEAD commit後70分以内 |
 | GitHub歩数更新 | HEAD commit後70分以内 |
@@ -1406,7 +1423,8 @@ BigQuery API、dataset、table、IAMは作らない。
 - canonical hash URI
 - encoding namespace
 - Webhook Tink署名
-- 10分bucket
+- GCS保存完了後時刻による10分bucket境界schedule
+- Job終了時の未処理Webhook回収
 - interval union
 - replacement membership
 - duplicate conflict

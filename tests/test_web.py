@@ -39,10 +39,10 @@ class EventSink:
 
 class Tasks:
     def __init__(self) -> None:
-        self.syncs: list[str] = []
+        self.syncs: list[tuple[str, datetime]] = []
 
-    def enqueue_sync_job(self, *, owner_hmac: str, received_at: datetime) -> None:
-        self.syncs.append(owner_hmac)
+    def enqueue_sync_job(self, *, owner_hmac: str, ready_at: datetime) -> None:
+        self.syncs.append((owner_hmac, ready_at))
 
 
 class OAuth:
@@ -109,7 +109,10 @@ def _config() -> AppConfig:
     )
 
 
-def _client() -> tuple[TestClient, EventSink, Tasks, OAuth, Views]:
+def _client(
+    *,
+    clock: Any | None = None,
+) -> tuple[TestClient, EventSink, Tasks, OAuth, Views]:
     key = b"owner-key"
     sink = EventSink()
     tasks = Tasks()
@@ -130,6 +133,7 @@ def _client() -> tuple[TestClient, EventSink, Tasks, OAuth, Views]:
         expected_task_service_account="tasks@example.iam.gserviceaccount.com",
         views=views,  # type: ignore[arg-type]
         steps=Steps(),  # type: ignore[arg-type]
+        clock=clock or (lambda: datetime(2026, 7, 28, 12, 7, tzinfo=UTC)),
     )
     return (
         TestClient(create_app(dependencies), base_url="https://service.example"),
@@ -141,7 +145,13 @@ def _client() -> tuple[TestClient, EventSink, Tasks, OAuth, Views]:
 
 
 def test_webhook_persists_before_enqueuing_job() -> None:
-    client, sink, tasks, _, _ = _client()
+    times = iter(
+        (
+            datetime(2026, 7, 28, 12, 9, 59, tzinfo=UTC),
+            datetime(2026, 7, 28, 12, 10, tzinfo=UTC),
+        )
+    )
+    client, sink, tasks, _, _ = _client(clock=lambda: next(times))
     body = json.dumps(
         {
             "data": {
@@ -165,7 +175,13 @@ def test_webhook_persists_before_enqueuing_job() -> None:
 
     assert response.status_code == 204
     assert len(sink.events) == 1
-    assert tasks.syncs == [identifier_hmac(b"owner-key", "health-user")]
+    assert sink.events[0][1] == datetime(2026, 7, 28, 12, 9, 59, tzinfo=UTC)
+    assert tasks.syncs == [
+        (
+            identifier_hmac(b"owner-key", "health-user"),
+            datetime(2026, 7, 28, 12, 10, tzinfo=UTC),
+        )
+    ]
 
 
 def test_subscriber_verification_succeeds_before_owner_oauth_setup() -> None:

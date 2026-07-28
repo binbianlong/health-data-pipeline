@@ -118,6 +118,39 @@ class RecordingViewDispatcher:
         return TaskEnqueueResult(task_name=f"views-{generation}", created=True)
 
 
+@dataclass(frozen=True, slots=True)
+class SyncTaskCall:
+    owner_hmac: str
+    ready_at: datetime
+
+
+class RecordingSyncDispatcher:
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+        self.calls: list[SyncTaskCall] = []
+
+    def enqueue_sync_job(
+        self,
+        *,
+        owner_hmac: str,
+        ready_at: datetime,
+    ) -> TaskEnqueueResult:
+        self._events.append("recover")
+        self.calls.append(SyncTaskCall(owner_hmac=owner_hmac, ready_at=ready_at))
+        return TaskEnqueueResult(task_name="sync-recovery", created=True)
+
+
+class FailingSyncDispatcher:
+    def enqueue_sync_job(
+        self,
+        *,
+        owner_hmac: str,
+        ready_at: datetime,
+    ) -> TaskEnqueueResult:
+        del owner_hmac, ready_at
+        raise RuntimeError("simulated sync recovery failure")
+
+
 class FailingViewDispatcher:
     def __init__(self, store: InMemoryObjectStore) -> None:
         self._store = store
@@ -345,22 +378,115 @@ def test_job_runner_calls_completion_hook_after_failure() -> None:
     assert events == ["pipeline", "complete"]
 
 
-def test_sync_job_task_calls_jobs_api_with_oauth_and_deduplicates_ten_minute_bucket() -> None:
+def test_job_runner_enqueues_pending_webhook_recovery_after_main_work() -> None:
+    events: list[str] = []
+    sync_dispatcher = RecordingSyncDispatcher(events)
+
+    def pending() -> bool:
+        events.append("pending")
+        return True
+
+    runner = JobRunner(
+        pipeline=StubPipeline(
+            SyncOutcome(committed=True, generation=15, owner_hmac="owner"),
+            events,
+        ),
+        tasks=RecordingViewDispatcher(
+            InMemoryObjectStore(clock=lambda: NOW),
+            events,
+        ),
+        latest_generation=lambda: 15,
+        request_view_generation=lambda _generation: False,
+        sync_tasks=sync_dispatcher,
+        sync_recovery_needed=pending,
+        clock=lambda: NOW,
+    )
+
+    runner.run()
+
+    assert events == ["pipeline", "pending", "recover"]
+    assert sync_dispatcher.calls == [SyncTaskCall(owner_hmac="owner", ready_at=NOW)]
+
+
+def test_job_runner_skips_sync_recovery_without_pending_webhook() -> None:
+    events: list[str] = []
+    sync_dispatcher = RecordingSyncDispatcher(events)
+    runner = JobRunner(
+        pipeline=StubPipeline(
+            SyncOutcome(committed=False, generation=15, owner_hmac="owner"),
+            events,
+        ),
+        tasks=RecordingViewDispatcher(
+            InMemoryObjectStore(clock=lambda: NOW),
+            events,
+        ),
+        latest_generation=lambda: 15,
+        request_view_generation=lambda _generation: False,
+        sync_tasks=sync_dispatcher,
+        sync_recovery_needed=lambda: False,
+        clock=lambda: NOW,
+    )
+
+    runner.run()
+
+    assert sync_dispatcher.calls == []
+
+
+def test_sync_recovery_failure_does_not_fail_a_successful_commit() -> None:
+    events: list[str] = []
+    errors: list[str] = []
+    outcome = SyncOutcome(committed=True, generation=16, owner_hmac="owner")
+    runner = JobRunner(
+        pipeline=StubPipeline(outcome, events),
+        tasks=RecordingViewDispatcher(
+            InMemoryObjectStore(clock=lambda: NOW),
+            events,
+        ),
+        latest_generation=lambda: 16,
+        request_view_generation=lambda _generation: False,
+        sync_tasks=FailingSyncDispatcher(),
+        sync_recovery_needed=lambda: True,
+        on_sync_recovery_error=lambda exc: errors.append(type(exc).__name__),
+        clock=lambda: NOW,
+    )
+
+    assert runner.run() == outcome
+    assert errors == ["RuntimeError"]
+
+
+def test_job_runner_requires_both_sync_recovery_dependencies() -> None:
+    with pytest.raises(ValueError, match="configured together"):
+        JobRunner(
+            pipeline=StubPipeline(
+                SyncOutcome(committed=False, generation=None, owner_hmac="owner"),
+                [],
+            ),
+            tasks=RecordingViewDispatcher(
+                InMemoryObjectStore(clock=lambda: NOW),
+                [],
+            ),
+            latest_generation=lambda: 0,
+            request_view_generation=lambda _generation: False,
+            sync_tasks=RecordingSyncDispatcher([]),
+        )
+
+
+def test_sync_job_task_runs_at_next_boundary_and_deduplicates_bucket() -> None:
     client = FakeCloudTasksClient()
     config = _config()
     dispatcher = CloudTaskDispatcher(client=client, config=config)
 
     first = dispatcher.enqueue_sync_job(
         owner_hmac="owner:hash",
-        received_at=NOW,
+        ready_at=NOW,
     )
     duplicate = dispatcher.enqueue_sync_job(
         owner_hmac="owner:hash",
-        received_at=NOW + timedelta(minutes=2),
+        ready_at=NOW + timedelta(minutes=2),
     )
     next_bucket = dispatcher.enqueue_sync_job(
         owner_hmac="owner:hash",
-        received_at=NOW + timedelta(minutes=3),
+        ready_at=NOW + timedelta(minutes=3),
     )
 
     assert first.created is True
@@ -374,6 +500,23 @@ def test_sync_job_task_calls_jobs_api_with_oauth_and_deduplicates_ten_minute_buc
     assert request["parent"] == config.tasks_parent
     task = cast(Mapping[str, Any], request["task"])
     http = cast(Mapping[str, Any], task["http_request"])
+    assert task["schedule_time"] == datetime(
+        2026,
+        7,
+        28,
+        12,
+        10,
+        tzinfo=UTC,
+    )
+    next_task = cast(Mapping[str, Any], client.requests[2]["task"])
+    assert next_task["schedule_time"] == datetime(
+        2026,
+        7,
+        28,
+        12,
+        20,
+        tzinfo=UTC,
+    )
     assert http == {
         "http_method": tasks_v2.HttpMethod.POST,
         "url": config.jobs_run_url,

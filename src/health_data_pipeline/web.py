@@ -68,6 +68,7 @@ class WebDependencies:
     expected_task_service_account: str
     views: ViewApplicationService
     steps: StepsSvgService
+    clock: Callable[[], datetime] = lambda: datetime.now(UTC)
 
 
 class GcsWebhookEventSink:
@@ -205,9 +206,12 @@ def create_app(dependencies: WebDependencies | None = None) -> FastAPI:
         if isinstance(event, WebhookVerification):
             return Response(status_code=200)
 
-        now = datetime.now(UTC)
-        deps.webhook_events.persist(event, received_at=now)
-        deps.tasks.enqueue_sync_job(owner_hmac=event.owner_hmac, received_at=now)
+        received_at = deps.clock()
+        deps.webhook_events.persist(event, received_at=received_at)
+        # Bucket from the time at which the durable event is ready. If a write
+        # crosses a bucket boundary, using the earlier receipt time could target
+        # a task that has already dispatched and is still name-deduplicated.
+        deps.tasks.enqueue_sync_job(owner_hmac=event.owner_hmac, ready_at=deps.clock())
         return Response(status_code=204)
 
     @app.post("/internal/tasks/apply-views", status_code=204)

@@ -296,9 +296,11 @@ def test_pending_webhook_is_processed_before_backfill() -> None:
         cache_control="no-store",
     )
 
+    assert pipeline.has_pending_webhooks()
     outcome = pipeline.run()
 
     assert outcome.committed
+    assert not pipeline.has_pending_webhooks()
     assert health.requests[initial_request_count:] == [
         (
             "steps",

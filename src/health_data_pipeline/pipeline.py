@@ -174,6 +174,22 @@ class IncrementalSyncPipeline:
         finally:
             self._leases.release(lease)
 
+    def has_pending_webhooks(self) -> bool:
+        """Return whether a durable webhook is not represented by current HEAD."""
+
+        base = self._heads.read()
+        root = (
+            None
+            if base.head is None
+            else self._snapshots.load_root_snapshot(base.head.root_snapshot)
+        )
+        processed: set[str] = set()
+        if root is not None:
+            raw_processed = root.state.webhook_cursor.get("processed_objects", [])
+            if isinstance(raw_processed, list):
+                processed = {value for value in raw_processed if isinstance(value, str)}
+        return any(item.name not in processed for item in self._store.list("webhook-events/"))
+
     def _run_with_lease(self, now: datetime) -> SyncOutcome:
         base = self._heads.read()
         root = (

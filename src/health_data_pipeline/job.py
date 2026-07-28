@@ -10,7 +10,7 @@ import os
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, cast
 
 from google.api_core.exceptions import AlreadyExists
@@ -42,13 +42,17 @@ def _safe_task_component(value: str) -> str:
     return safe[:128]
 
 
-def _ten_minute_bucket(value: datetime, minutes: int) -> str:
-    if value.tzinfo is None:
+def _task_bucket(value: datetime, minutes: int) -> tuple[str, datetime]:
+    if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("task bucket time must be timezone-aware")
     utc = value.astimezone(UTC)
-    rounded_minute = utc.minute - (utc.minute % minutes)
-    rounded = utc.replace(minute=rounded_minute, second=0, microsecond=0)
-    return rounded.strftime("%Y%m%dT%H%MZ")
+    bucket_seconds = minutes * 60
+    rounded_seconds = int(utc.timestamp()) // bucket_seconds * bucket_seconds
+    rounded = datetime.fromtimestamp(rounded_seconds, tz=UTC)
+    return (
+        rounded.strftime("%Y%m%dT%H%MZ"),
+        rounded + timedelta(minutes=minutes),
+    )
 
 
 class CloudTaskDispatcher:
@@ -63,12 +67,20 @@ class CloudTaskDispatcher:
         self._client = client
         self._config = config
 
-    def _create(self, task_id: str, http_request: Mapping[str, Any]) -> TaskEnqueueResult:
+    def _create(
+        self,
+        task_id: str,
+        http_request: Mapping[str, Any],
+        *,
+        schedule_at: datetime | None = None,
+    ) -> TaskEnqueueResult:
         task_name = f"{self._config.tasks_parent}/tasks/{task_id}"
         task: dict[str, Any] = {
             "name": task_name,
             "http_request": dict(http_request),
         }
+        if schedule_at is not None:
+            task["schedule_time"] = schedule_at
         try:
             self._client.create_task(request={"parent": self._config.tasks_parent, "task": task})
         except AlreadyExists:
@@ -79,11 +91,11 @@ class CloudTaskDispatcher:
         self,
         *,
         owner_hmac: str,
-        received_at: datetime,
+        ready_at: datetime,
     ) -> TaskEnqueueResult:
-        """Call ``jobs.run`` directly; the webhook body never enters the task."""
+        """Coalesce persisted events and call ``jobs.run`` at the next bucket boundary."""
 
-        bucket = _ten_minute_bucket(received_at, self._config.task_bucket_minutes)
+        bucket, schedule_at = _task_bucket(ready_at, self._config.task_bucket_minutes)
         task_id = f"{_safe_task_component(owner_hmac)}-sync-{bucket}"
         return self._create(
             task_id,
@@ -97,6 +109,7 @@ class CloudTaskDispatcher:
                     "scope": CLOUD_PLATFORM_SCOPE,
                 },
             },
+            schedule_at=schedule_at,
         )
 
     def enqueue_view_update(
@@ -108,7 +121,7 @@ class CloudTaskDispatcher:
     ) -> TaskEnqueueResult:
         if generation < 1:
             raise ValueError("HEAD generation must be positive")
-        bucket = _ten_minute_bucket(
+        bucket, _ = _task_bucket(
             requested_at,
             self._config.task_bucket_minutes,
         )
@@ -154,6 +167,15 @@ class ViewTaskDispatcher(Protocol):
     ) -> TaskEnqueueResult: ...
 
 
+class SyncTaskDispatcher(Protocol):
+    def enqueue_sync_job(
+        self,
+        *,
+        owner_hmac: str,
+        ready_at: datetime,
+    ) -> TaskEnqueueResult: ...
+
+
 class JobRunner:
     """Run one sync and recover materialized views from committed HEAD."""
 
@@ -164,34 +186,62 @@ class JobRunner:
         tasks: ViewTaskDispatcher,
         latest_generation: Callable[[], int],
         request_view_generation: Callable[[int], bool],
+        sync_tasks: SyncTaskDispatcher | None = None,
+        sync_recovery_needed: Callable[[], bool] | None = None,
+        on_sync_recovery_error: Callable[[Exception], object] | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         on_complete: Callable[[], object] | None = None,
     ) -> None:
+        if (sync_tasks is None) is not (sync_recovery_needed is None):
+            raise ValueError("sync_tasks and sync_recovery_needed must be configured together")
         self._pipeline = pipeline
         self._tasks = tasks
         self._latest_generation = latest_generation
         self._request_view_generation = request_view_generation
+        self._sync_tasks = sync_tasks
+        self._sync_recovery_needed = sync_recovery_needed
+        self._on_sync_recovery_error = on_sync_recovery_error
         self._clock = clock
         self._on_complete = on_complete
+
+    def _recover_pending_sync(self, owner_hmac: str) -> None:
+        if self._sync_tasks is None or self._sync_recovery_needed is None:
+            return
+        try:
+            if self._sync_recovery_needed():
+                self._sync_tasks.enqueue_sync_job(
+                    owner_hmac=owner_hmac,
+                    ready_at=self._clock(),
+                )
+        except Exception as exc:
+            # This is a wake-up optimization after the authoritative HEAD
+            # commit. Durable events remain available to the hourly recovery.
+            if self._on_sync_recovery_error is not None:
+                self._on_sync_recovery_error(exc)
 
     def run(self) -> SyncOutcome:
         try:
             outcome = self._pipeline.run()
-            if outcome.committed and outcome.generation is None:
-                raise RuntimeError("committed sync has no HEAD generation")
-            generation = (
-                outcome.generation if outcome.generation is not None else self._latest_generation()
-            )
-            if (
-                generation is not None
-                and generation > 0
-                and self._request_view_generation(generation)
-            ):
-                self._tasks.enqueue_view_update(
-                    owner_hmac=outcome.owner_hmac,
-                    generation=generation,
-                    requested_at=self._clock(),
+            try:
+                if outcome.committed and outcome.generation is None:
+                    raise RuntimeError("committed sync has no HEAD generation")
+                generation = (
+                    outcome.generation
+                    if outcome.generation is not None
+                    else self._latest_generation()
                 )
+                if (
+                    generation is not None
+                    and generation > 0
+                    and self._request_view_generation(generation)
+                ):
+                    self._tasks.enqueue_view_update(
+                        owner_hmac=outcome.owner_hmac,
+                        generation=generation,
+                        requested_at=self._clock(),
+                    )
+            finally:
+                self._recover_pending_sync(outcome.owner_hmac)
             return outcome
         finally:
             if self._on_complete is not None:

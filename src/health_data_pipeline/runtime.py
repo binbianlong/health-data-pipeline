@@ -260,19 +260,26 @@ def build_job_runner() -> JobRunner:
         sync_alert=sync_alert,
     )
     source = SnapshotViewSource(heads=heads, snapshots=snapshots)
+    task_dispatcher = CloudTaskDispatcher(
+        client=cast(
+            CloudTasksClientProtocol,
+            tasks_v2.CloudTasksClient(),
+        ),
+        config=config,
+    )
     return JobRunner(
         pipeline=pipeline,
-        tasks=CloudTaskDispatcher(
-            client=cast(
-                CloudTasksClientProtocol,
-                tasks_v2.CloudTasksClient(),
-            ),
-            config=config,
-        ),
+        tasks=task_dispatcher,
         latest_generation=source.latest_generation,
         request_view_generation=lambda generation: request_notion_generation(
             store,
             generation,
+        ),
+        sync_tasks=task_dispatcher,
+        sync_recovery_needed=pipeline.has_pending_webhooks,
+        on_sync_recovery_error=lambda exc: logger.error(
+            "sync_recovery_failed",
+            error_type=type(exc).__name__,
         ),
         on_complete=flush_class_a_usage,
     )
