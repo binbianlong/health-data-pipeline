@@ -302,6 +302,7 @@ def test_setup_code_is_posted_then_oauth_redirects() -> None:
     client, _, _, oauth, _ = _client()
     form = client.get("/setup")
     assert form.status_code == 200
+    assert form.headers["referrer-policy"] == "same-origin"
     csrf = parse_qs(form.text.split('name="csrf_token" value="', 1)[1].split('"', 1)[0])
     # parse_qs intentionally returns empty for a bare token, so use the source value.
     assert csrf == {}
