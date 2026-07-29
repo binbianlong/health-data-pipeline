@@ -22,6 +22,7 @@ from health_data_pipeline.storage import (
 NOTION_STATE_PATH = "state/notion/sync.json"
 NOTION_PAGE_STATE_PREFIX = "state/notion/pages"
 STEPS_HEAD_PATH = "state/views/steps-head.json"
+STEPS_SVG_CANONICALIZATION = "fhcj-3"
 
 
 class ViewUpdateError(RuntimeError):
@@ -507,20 +508,24 @@ class StepsSvgService:
         current = read_state(self._store, STEPS_HEAD_PATH)
         if current is not None:
             pointer = StepsPointer.from_bytes(current.data)
-            if pointer.through_date is None:
-                # A legacy pointer has no completed-day cursor. Allow exactly
-                # one same-generation migration; the rewritten pointer then
-                # follows the normal strict generation/date monotonicity.
-                if generation < pointer.generation:
-                    return False
-            else:
-                if generation <= pointer.generation:
-                    return False
+            if generation < pointer.generation:
+                return False
+            current_rendering_prefix = (
+                f"public/steps/canonicalization={STEPS_SVG_CANONICALIZATION}/"
+            )
+            rendering_is_current = pointer.svg_uri.startswith(current_rendering_prefix)
+            # A legacy pointer without a completed-day cursor may migrate once
+            # at the same generation. Its replacement follows the date guard.
+            if pointer.through_date is not None:
                 try:
                     published_through = date.fromisoformat(pointer.through_date)
                 except ValueError as exc:
                     raise ViewUpdateError("invalid steps pointer through_date") from exc
-                if through_date <= published_through:
+                if rendering_is_current and generation <= pointer.generation:
+                    return False
+                if rendering_is_current and through_date <= published_through:
+                    return False
+                if not rendering_is_current and through_date < published_through:
                     return False
             expected_generation = current.generation
         else:
@@ -528,7 +533,10 @@ class StepsSvgService:
 
         svg = render_steps_svg(ordered)
         digest = hashlib.sha256(svg).hexdigest()
-        uri = f"public/steps/canonicalization=fhcj-2/sha256/{digest[:2]}/{digest}.svg"
+        uri = (
+            f"public/steps/canonicalization={STEPS_SVG_CANONICALIZATION}/"
+            f"sha256/{digest[:2]}/{digest}.svg"
+        )
         try:
             self._store.put(
                 uri,
