@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
@@ -188,14 +189,96 @@ def test_steps_svg_pointer_is_content_addressed_and_monotonic() -> None:
     pointer = StepsPointer.from_bytes(store.get("state/views/steps-head.json").data)
     assert generation == 9
     assert pointer.generation == 9
+    assert pointer.through_date == "2026-07-28"
     assert pointer.content_sha256 in pointer.svg_uri
+    assert "/canonicalization=fhcj-3/" in pointer.svg_uri
     assert b"7" in svg
     assert b"health" not in svg.lower()
     assert b"Steps over the last 7 days" in svg
-    assert b"#4493f8" in svg
-    assert b"#238636" in svg
+    assert b"#f0f6fc" in svg
+    assert b"#84e17a" in svg
+    assert b"BlinkMacSystemFont" in svg
+    assert b'width="40"' in svg
+    assert b'rx="' not in svg
     assert b'fill="#fff"' not in svg
     assert "直近7日間の歩数".encode() not in svg
+
+
+def test_steps_svg_publishes_only_once_per_completed_date() -> None:
+    store = InMemoryObjectStore()
+    service = StepsSvgService(store)
+    first = [StepSample(date(2026, 7, day), day * 1000) for day in range(22, 29)]
+    corrected = [StepSample(sample.metric_date, (sample.steps or 0) + 1) for sample in first]
+    following = [StepSample(date(2026, 7, day), day * 1000) for day in range(23, 30)]
+
+    assert service.publish(generation=9, samples=first)
+    assert not service.publish(generation=10, samples=corrected)
+    assert len(tuple(store.list("public/steps/"))) == 1
+    assert service.publish(generation=11, samples=following)
+    assert len(tuple(store.list("public/steps/"))) == 2
+
+    pointer = StepsPointer.from_bytes(store.get("state/views/steps-head.json").data)
+    assert pointer.generation == 11
+    assert pointer.through_date == "2026-07-29"
+
+
+def test_steps_svg_migrates_legacy_pointer_at_same_generation() -> None:
+    store = InMemoryObjectStore()
+    store.put(
+        "state/views/steps-head.json",
+        json.dumps(
+            {
+                "generation": 9,
+                "svg_uri": "public/steps/legacy.svg",
+                "content_sha256": "legacy",
+                "updated_at": "2026-07-29T15:00:00Z",
+            }
+        ).encode(),
+        if_generation_match=0,
+        metadata={},
+        content_type="application/json",
+        cache_control="no-store",
+    )
+    service = StepsSvgService(store)
+    samples = [StepSample(date(2026, 7, day), day * 1000) for day in range(22, 29)]
+
+    assert service.publish(generation=9, samples=samples)
+    assert not service.publish(generation=9, samples=samples)
+
+    pointer = StepsPointer.from_bytes(store.get("state/views/steps-head.json").data)
+    assert pointer.generation == 9
+    assert pointer.through_date == "2026-07-28"
+
+
+def test_steps_svg_migrates_previous_rendering_at_same_generation() -> None:
+    store = InMemoryObjectStore()
+    store.put(
+        "state/views/steps-head.json",
+        json.dumps(
+            {
+                "generation": 9,
+                "svg_uri": "public/steps/canonicalization=fhcj-2/sha256/old.svg",
+                "content_sha256": "old",
+                "updated_at": "2026-07-29T15:00:00Z",
+                "through_date": "2026-07-28",
+            }
+        ).encode(),
+        if_generation_match=0,
+        metadata={},
+        content_type="application/json",
+        cache_control="no-store",
+    )
+    service = StepsSvgService(store)
+    samples = [StepSample(date(2026, 7, day), day * 1000) for day in range(22, 29)]
+
+    assert not service.publish(generation=8, samples=samples)
+    assert service.publish(generation=9, samples=samples)
+    assert not service.publish(generation=9, samples=samples)
+
+    pointer = StepsPointer.from_bytes(store.get("state/views/steps-head.json").data)
+    assert pointer.generation == 9
+    assert pointer.through_date == "2026-07-28"
+    assert "/canonicalization=fhcj-3/" in pointer.svg_uri
 
 
 def _step_rows(value: int) -> list[dict[str, object]]:
@@ -251,3 +334,7 @@ def test_snapshot_source_collects_all_dates_across_generation_gap() -> None:
         if metric.metric_name == "steps"
     )
     assert first_steps == 4_000
+
+    samples = source.for_generation(4)
+    assert samples[-1] == StepSample(metric_date=first_date, steps=4_000)
+    assert samples[0].metric_date == date(2026, 7, 21)
