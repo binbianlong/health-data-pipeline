@@ -524,7 +524,7 @@ CAS失敗時：
 ```text
 manifests/snapshot-shards/
   year=2026/
-  canonicalization=fhcj-1/
+  canonicalization=fhcj-2/
   encoding=gzip-v1/
   sha256/ab/<canonical-sha256>.json.gz
 ```
@@ -1000,7 +1000,8 @@ Cloud Tasks retryにより同じgenerationが再実行されても、同じ内�
 
 ## 20. GitHub歩数SVG
 
-GitHubへ公開するのは直近7日分の歩数だけとする。
+GitHubへ公開するのは前日までの直近7日分の歩数だけとする。当日途中の値は公開せず、
+日付が変わった後の最初の新しいHEADを使って、完了したcivil dayにつき1回だけ更新する。
 
 ```text
 public/steps/
@@ -1017,13 +1018,15 @@ state/views/steps-head.json
   "generation": 1842,
   "svg_uri": "public/steps/...svg",
   "content_sha256": "...",
-  "updated_at": "..."
+  "updated_at": "...",
+  "through_date": "2026-07-29"
 }
 ```
 
 - SVGはcontent-addressedで上書きしない。
 - pointerはGCS CASで更新する。
-- 古いgenerationからのpointer更新を拒否する。
+- 古いgenerationまたは公開済み日付以前からのpointer更新を拒否する。
+- 同じ`through_date`のHEADが複数あってもSVG生成とGCS保存を省略する。
 - `GET /public/steps.svg`はpointerが指すSVGだけを返す。
 - SVGへ他の健康値、owner ID、最終同期時刻を含めない。
 - `Cache-Control: public, max-age=300`とする。
@@ -1293,7 +1296,7 @@ backfillとrebuildは延期できる。Cloud Billing Budgetも別に設定する
 | 有効Webhook受信からHEAD commit | 通常時P95 20分以内（最大10分のbucket待機を含む） |
 | Task／Execution失敗時の毎時回収 | 70分以内 |
 | Notion反映 | HEAD commit後70分以内 |
-| GitHub歩数更新 | HEAD commit後70分以内 |
+| GitHub歩数更新 | civil day終了後、次の新しいHEAD commitから70分以内 |
 | Scheduler Job未実行検知 | 2時間以内 |
 | Fitbit未同期通知 | 5日到達後70分以内 |
 
@@ -1528,7 +1531,7 @@ BigQuery API、dataset、table、IAMは作らない。
 - Root SnapshotとYear Shardから全日付の現行revisionを1件ずつ解決できる。
 - 同じ日次内容は同じcanonical hashになる。
 - 過去修正で同じ暦週、同じ暦月、必要なYear Shardが更新される。
-- NotionとSVGが古いgenerationへ逆行しない。
+- Notionが古いgenerationへ逆行せず、SVGが古いgenerationまたは公開済み日付へ逆行しない。
 - Notion障害中もHEAD commitが進む。
 - raw cache期限切れ後もdaily-canonicalを読める。
 - audit参照がraw payloadを永久保持しない。
