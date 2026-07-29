@@ -138,6 +138,7 @@ def test_steps_svg_pointer_is_content_addressed_and_monotonic() -> None:
     assert pointer.generation == 9
     assert pointer.through_date == "2026-07-28"
     assert pointer.content_sha256 in pointer.svg_uri
+    assert "/canonicalization=fhcj-3/" in pointer.svg_uri
     assert b"7" in svg
     assert b"health" not in svg.lower()
     assert b"Steps over the last 7 days" in svg
@@ -194,6 +195,37 @@ def test_steps_svg_migrates_legacy_pointer_at_same_generation() -> None:
     pointer = StepsPointer.from_bytes(store.get("state/views/steps-head.json").data)
     assert pointer.generation == 9
     assert pointer.through_date == "2026-07-28"
+
+
+def test_steps_svg_migrates_previous_rendering_at_same_generation() -> None:
+    store = InMemoryObjectStore()
+    store.put(
+        "state/views/steps-head.json",
+        json.dumps(
+            {
+                "generation": 9,
+                "svg_uri": "public/steps/canonicalization=fhcj-2/sha256/old.svg",
+                "content_sha256": "old",
+                "updated_at": "2026-07-29T15:00:00Z",
+                "through_date": "2026-07-28",
+            }
+        ).encode(),
+        if_generation_match=0,
+        metadata={},
+        content_type="application/json",
+        cache_control="no-store",
+    )
+    service = StepsSvgService(store)
+    samples = [StepSample(date(2026, 7, day), day * 1000) for day in range(22, 29)]
+
+    assert not service.publish(generation=8, samples=samples)
+    assert service.publish(generation=9, samples=samples)
+    assert not service.publish(generation=9, samples=samples)
+
+    pointer = StepsPointer.from_bytes(store.get("state/views/steps-head.json").data)
+    assert pointer.generation == 9
+    assert pointer.through_date == "2026-07-28"
+    assert "/canonicalization=fhcj-3/" in pointer.svg_uri
 
 
 def _step_rows(value: int) -> list[dict[str, object]]:
