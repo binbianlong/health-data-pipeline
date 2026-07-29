@@ -155,18 +155,15 @@ OAuth redirect URI、GitHub SVGへ登録しない。
 
 1. body sizeとContent-Typeを検証する。
 2. `Authorization` headerをSecret Managerの値とconstant-time比較する。
-3. `GOOGLE-HEALTH-API-SIGNATURE`を分割前のraw body全体に対して1回だけTinkで検証する。
-4. 通知objectまたは通知objectの非空arrayとして、全要素の必須構造を検証する。
-5. 各`healthUserId`をHMAC化して所有者と照合し、所有者以外の通知を除外する。
-6. 所有者の変更区間をイベント単位でGCSへ不変保存する。同一batch内の同一イベントは
-   canonical JSONのcontent hashで重複排除する。
+3. `GOOGLE-HEALTH-API-SIGNATURE`をTinkでraw bodyに対して検証する。
+4. JSON schemaを検証する。
+5. `healthUserId`をHMAC化して所有者と照合する。
+6. 変更区間を含むイベントをGCSへ不変保存する。
 7. GCS保存完了後の時刻を10分bucketへ丸め、次のbucket境界を
-   `schedule_time`とするJob起動Taskをbatchにつき1件作成する。
+   `schedule_time`とするJob起動Taskを作成する。
 8. 保存とTask作成成功後に`204`を返す。
 
 GCS保存またはTask作成失敗時は5xxを返し、Google Health APIの再送に委ねる。
-構造不正は一部を保存せずbatch全体を400とする。署名済みでも所有者以外の通知だけなら、
-保存もTask作成も行わず204とし、他ユーザーのデータを保持しない。
 Taskのbucketは受信開始時刻ではなくGCS保存完了後に取り直した時刻から決める。
 これにより、保存処理が境界をまたいでも、すでにdispatchされた旧bucketのTask名を
 再利用しない。
@@ -1000,11 +997,12 @@ Cloud Tasks retryにより同じgenerationが再実行されても、同じ内�
 
 ## 20. GitHub歩数SVG
 
-GitHubへ公開するのは直近7日分の歩数だけとする。
+GitHubへ公開するのは前日までの直近7日分の歩数だけとする。当日途中の値は公開せず、
+日付が変わった後の最初の新しいHEADを使って、完了したcivil dayにつき1回だけ更新する。
 
 ```text
 public/steps/
-  canonicalization=fhcj-1/
+  canonicalization=fhcj-2/
   sha256/<content-sha256>.svg
 
 state/views/steps-head.json
@@ -1017,13 +1015,15 @@ state/views/steps-head.json
   "generation": 1842,
   "svg_uri": "public/steps/...svg",
   "content_sha256": "...",
-  "updated_at": "..."
+  "updated_at": "...",
+  "through_date": "2026-07-29"
 }
 ```
 
 - SVGはcontent-addressedで上書きしない。
 - pointerはGCS CASで更新する。
-- 古いgenerationからのpointer更新を拒否する。
+- 古いgenerationまたは公開済み日付以前からのpointer更新を拒否する。
+- 同じ`through_date`のHEADが複数あってもSVG生成とGCS保存を省略する。
 - `GET /public/steps.svg`はpointerが指すSVGだけを返す。
 - SVGへ他の健康値、owner ID、最終同期時刻を含めない。
 - `Cache-Control: public, max-age=300`とする。
@@ -1293,7 +1293,7 @@ backfillとrebuildは延期できる。Cloud Billing Budgetも別に設定する
 | 有効Webhook受信からHEAD commit | 通常時P95 20分以内（最大10分のbucket待機を含む） |
 | Task／Execution失敗時の毎時回収 | 70分以内 |
 | Notion反映 | HEAD commit後70分以内 |
-| GitHub歩数更新 | HEAD commit後70分以内 |
+| GitHub歩数更新 | civil day終了後、次の新しいHEAD commitから70分以内 |
 | Scheduler Job未実行検知 | 2時間以内 |
 | Fitbit未同期通知 | 5日到達後70分以内 |
 
@@ -1528,7 +1528,7 @@ BigQuery API、dataset、table、IAMは作らない。
 - Root SnapshotとYear Shardから全日付の現行revisionを1件ずつ解決できる。
 - 同じ日次内容は同じcanonical hashになる。
 - 過去修正で同じ暦週、同じ暦月、必要なYear Shardが更新される。
-- NotionとSVGが古いgenerationへ逆行しない。
+- Notionが古いgenerationへ逆行せず、SVGが古いgenerationまたは公開済み日付へ逆行しない。
 - Notion障害中もHEAD commitが進む。
 - raw cache期限切れ後もdaily-canonicalを読める。
 - audit参照がraw payloadを永久保持しない。
