@@ -142,13 +142,21 @@ def _dependencies(request: Request) -> WebDependencies:
     return dependencies
 
 
-def _secure_html_headers(response: Response) -> None:
+def _secure_response_headers(response: Response) -> None:
     response.headers["Cache-Control"] = "no-store"
-    response.headers["Content-Security-Policy"] = (
-        "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
-    )
     response.headers["Referrer-Policy"] = "same-origin"
     response.headers["X-Content-Type-Options"] = "nosniff"
+
+
+def _secure_html_headers(
+    response: Response,
+    *,
+    form_action: str = "'self'",
+) -> None:
+    _secure_response_headers(response)
+    response.headers["Content-Security-Policy"] = (
+        f"default-src 'none'; form-action {form_action}; base-uri 'none'; frame-ancestors 'none'"
+    )
 
 
 def _setup_form(message: str | None = None) -> str:
@@ -260,7 +268,12 @@ def create_app(dependencies: WebDependencies | None = None) -> FastAPI:
     @app.get("/setup", response_class=HTMLResponse)
     def setup_form() -> HTMLResponse:
         response = HTMLResponse(_setup_form())
-        _secure_html_headers(response)
+        # Chromium applies form-action to every redirect in a form submission.
+        # Permit only Google's exact OAuth origin in addition to this service.
+        _secure_html_headers(
+            response,
+            form_action="'self' https://accounts.google.com",
+        )
         return response
 
     @app.post("/setup/session")
@@ -307,7 +320,7 @@ def create_app(dependencies: WebDependencies | None = None) -> FastAPI:
             samesite="lax",
             path="/",
         )
-        _secure_html_headers(response)
+        _secure_response_headers(response)
         return response
 
     @app.get("/setup/oauth/start")
@@ -321,7 +334,7 @@ def create_app(dependencies: WebDependencies | None = None) -> FastAPI:
         except InvalidOAuthSession as exc:
             raise HTTPException(status_code=401, detail="setup session rejected") from exc
         response = RedirectResponse(authorization.authorization_url, status_code=303)
-        _secure_html_headers(response)
+        _secure_response_headers(response)
         return response
 
     @app.get("/setup/oauth/callback")
