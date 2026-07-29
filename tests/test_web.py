@@ -32,19 +32,27 @@ class SignatureVerifier:
 
 
 class EventSink:
-    def __init__(self) -> None:
+    def __init__(self, *, fail_on_call: int | None = None) -> None:
         self.events: list[Any] = []
+        self.calls = 0
+        self.fail_on_call = fail_on_call
 
     def persist(self, event: Any, *, received_at: datetime) -> str:
+        self.calls += 1
+        if self.calls == self.fail_on_call:
+            raise RuntimeError("event persistence failed")
         self.events.append((event, received_at))
         return "webhook-events/event.json"
 
 
 class Tasks:
-    def __init__(self) -> None:
+    def __init__(self, *, fail: bool = False) -> None:
         self.syncs: list[tuple[str, datetime]] = []
+        self.fail = fail
 
     def enqueue_sync_job(self, *, owner_hmac: str, ready_at: datetime) -> None:
+        if self.fail:
+            raise RuntimeError("task enqueue failed")
         self.syncs.append((owner_hmac, ready_at))
 
 
@@ -117,10 +125,13 @@ def _client(
     *,
     clock: Any | None = None,
     oidc: Any | None = None,
+    event_sink: EventSink | None = None,
+    task_dispatcher: Tasks | None = None,
+    raise_server_exceptions: bool = True,
 ) -> tuple[TestClient, EventSink, Tasks, OAuth, Views]:
     key = b"owner-key"
-    sink = EventSink()
-    tasks = Tasks()
+    sink = event_sink or EventSink()
+    tasks = task_dispatcher or Tasks()
     oauth = OAuth()
     views = Views()
     dependencies = WebDependencies(
@@ -141,7 +152,11 @@ def _client(
         clock=clock or (lambda: datetime(2026, 7, 28, 12, 7, tzinfo=UTC)),
     )
     return (
-        TestClient(create_app(dependencies), base_url="https://public.example"),
+        TestClient(
+            create_app(dependencies),
+            base_url="https://public.example",
+            raise_server_exceptions=raise_server_exceptions,
+        ),
         sink,
         tasks,
         oauth,
@@ -196,6 +211,169 @@ def test_webhook_persists_before_enqueuing_job() -> None:
             datetime(2026, 7, 28, 12, 10, tzinfo=UTC),
         )
     ]
+
+
+def test_webhook_batch_persists_each_event_and_enqueues_one_job() -> None:
+    times = iter(
+        (
+            datetime(2026, 7, 28, 12, 9, 59, tzinfo=UTC),
+            datetime(2026, 7, 28, 12, 10, tzinfo=UTC),
+        )
+    )
+    client, sink, tasks, _, _ = _client(clock=lambda: next(times))
+    body = json.dumps(
+        [
+            {
+                "data": {
+                    "healthUserId": "health-user",
+                    "dataType": "steps",
+                    "intervals": [],
+                }
+            },
+            {
+                "data": {
+                    "healthUserId": "health-user",
+                    "dataType": "sleep",
+                    "intervals": [],
+                }
+            },
+        ]
+    ).encode()
+
+    response = client.post(
+        "/webhooks/google-health",
+        content=body,
+        headers={
+            "Authorization": "Bearer secret",
+            "Content-Type": "application/json",
+            "GOOGLE-HEALTH-API-SIGNATURE": base64.b64encode(b"valid").decode(),
+        },
+    )
+
+    assert response.status_code == 204
+    assert len(sink.events) == 2
+    assert {event.payload["data"]["dataType"] for event, _ in sink.events} == {
+        "steps",
+        "sleep",
+    }
+    assert {received_at for _, received_at in sink.events} == {
+        datetime(2026, 7, 28, 12, 9, 59, tzinfo=UTC)
+    }
+    assert tasks.syncs == [
+        (
+            identifier_hmac(b"owner-key", "health-user"),
+            datetime(2026, 7, 28, 12, 10, tzinfo=UTC),
+        )
+    ]
+
+
+def test_webhook_batch_rejects_invalid_item_without_writes() -> None:
+    client, sink, tasks, _, _ = _client()
+    body = json.dumps(
+        [
+            {"data": {"healthUserId": "health-user", "dataType": "steps"}},
+            {"data": []},
+        ]
+    ).encode()
+
+    response = client.post(
+        "/webhooks/google-health",
+        content=body,
+        headers={
+            "Authorization": "Bearer secret",
+            "Content-Type": "application/json",
+            "GOOGLE-HEALTH-API-SIGNATURE": base64.b64encode(b"valid").decode(),
+        },
+    )
+
+    assert response.status_code == 400
+    assert sink.events == []
+    assert tasks.syncs == []
+
+
+def test_webhook_batch_does_not_enqueue_when_a_later_write_fails() -> None:
+    sink = EventSink(fail_on_call=2)
+    client, _, tasks, _, _ = _client(
+        event_sink=sink,
+        raise_server_exceptions=False,
+    )
+    body = json.dumps(
+        [
+            {"data": {"healthUserId": "health-user", "dataType": "steps"}},
+            {"data": {"healthUserId": "health-user", "dataType": "sleep"}},
+        ]
+    ).encode()
+
+    response = client.post(
+        "/webhooks/google-health",
+        content=body,
+        headers={
+            "Authorization": "Bearer secret",
+            "Content-Type": "application/json",
+            "GOOGLE-HEALTH-API-SIGNATURE": base64.b64encode(b"valid").decode(),
+        },
+    )
+
+    assert response.status_code == 500
+    assert len(sink.events) == 1
+    assert tasks.syncs == []
+
+
+def test_webhook_batch_returns_failure_after_writes_when_enqueue_fails() -> None:
+    task_dispatcher = Tasks(fail=True)
+    client, sink, _, _, _ = _client(
+        task_dispatcher=task_dispatcher,
+        raise_server_exceptions=False,
+    )
+    body = json.dumps(
+        [
+            {"data": {"healthUserId": "health-user", "dataType": "steps"}},
+            {"data": {"healthUserId": "health-user", "dataType": "sleep"}},
+        ]
+    ).encode()
+
+    response = client.post(
+        "/webhooks/google-health",
+        content=body,
+        headers={
+            "Authorization": "Bearer secret",
+            "Content-Type": "application/json",
+            "GOOGLE-HEALTH-API-SIGNATURE": base64.b64encode(b"valid").decode(),
+        },
+    )
+
+    assert response.status_code == 500
+    assert len(sink.events) == 2
+    assert task_dispatcher.syncs == []
+
+
+def test_webhook_batch_without_owned_events_acknowledges_without_work() -> None:
+    client, sink, tasks, _, _ = _client()
+    body = json.dumps(
+        [
+            {
+                "data": {
+                    "healthUserId": "someone-else",
+                    "dataType": "steps",
+                    "intervals": [],
+                }
+            }
+        ]
+    ).encode()
+
+    response = client.post(
+        "/webhooks/google-health",
+        content=body,
+        headers={
+            "Authorization": "Bearer secret",
+            "Content-Type": "application/json",
+            "GOOGLE-HEALTH-API-SIGNATURE": base64.b64encode(b"valid").decode(),
+        },
+    )
+
+    assert response.status_code == 204
+    assert sink.events == []
+    assert tasks.syncs == []
 
 
 def test_subscriber_verification_succeeds_before_owner_oauth_setup() -> None:

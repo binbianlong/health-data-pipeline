@@ -21,6 +21,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from health_data_pipeline.config import AppConfig
 from health_data_pipeline.google_health import (
     VerifiedWebhook,
+    VerifiedWebhookBatch,
     WebhookAuthenticationError,
     WebhookPayloadError,
     WebhookVerification,
@@ -55,7 +56,7 @@ class WebhookAuthenticator(Protocol):
         signature_header: str | None,
         content_type: str | None,
         raw_body: bytes,
-    ) -> VerifiedWebhook | WebhookVerification: ...
+    ) -> VerifiedWebhookBatch | WebhookVerification: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,7 +202,7 @@ def create_app(dependencies: WebDependencies | None = None) -> FastAPI:
         if len(body) > deps.config.webhook_max_body_bytes:
             raise HTTPException(status_code=413, detail="request is too large")
         try:
-            event = deps.webhook_authenticator.authenticate(
+            result = deps.webhook_authenticator.authenticate(
                 authorization=request.headers.get("authorization"),
                 signature_header=request.headers.get("google-health-api-signature"),
                 content_type=request.headers.get("content-type"),
@@ -211,15 +212,21 @@ def create_app(dependencies: WebDependencies | None = None) -> FastAPI:
             raise HTTPException(status_code=401, detail="webhook rejected") from exc
         except WebhookPayloadError as exc:
             raise HTTPException(status_code=400, detail="invalid webhook") from exc
-        if isinstance(event, WebhookVerification):
+        if isinstance(result, WebhookVerification):
             return Response(status_code=201)
 
+        if not result.events:
+            return Response(status_code=204)
         received_at = deps.clock()
-        deps.webhook_events.persist(event, received_at=received_at)
+        for event in result.events:
+            deps.webhook_events.persist(event, received_at=received_at)
         # Bucket from the time at which the durable event is ready. If a write
         # crosses a bucket boundary, using the earlier receipt time could target
         # a task that has already dispatched and is still name-deduplicated.
-        deps.tasks.enqueue_sync_job(owner_hmac=event.owner_hmac, ready_at=deps.clock())
+        deps.tasks.enqueue_sync_job(
+            owner_hmac=result.owner_hmac,
+            ready_at=deps.clock(),
+        )
         return Response(status_code=204)
 
     @app.post("/internal/tasks/apply-views", status_code=204)
