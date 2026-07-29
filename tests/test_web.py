@@ -63,7 +63,7 @@ class OAuth:
     def start_authorization(self, *, session_id: str) -> AuthorizationStart:
         assert session_id == "session-id"
         return AuthorizationStart(
-            authorization_url="https://accounts.example/authorize?state=oauth-state",
+            authorization_url="https://accounts.google.com/authorize?state=oauth-state",
             expires_at=datetime(2026, 7, 28, tzinfo=UTC),
         )
 
@@ -302,6 +302,11 @@ def test_setup_code_is_posted_then_oauth_redirects() -> None:
     form = client.get("/setup")
     assert form.status_code == 200
     assert form.headers["referrer-policy"] == "same-origin"
+    assert form.headers["content-security-policy"] == (
+        "default-src 'none'; "
+        "form-action 'self' https://accounts.google.com; "
+        "base-uri 'none'; frame-ancestors 'none'"
+    )
     assert 'name="csrf_token"' not in form.text
     assert form.headers.get_list("set-cookie") == []
 
@@ -317,10 +322,15 @@ def test_setup_code_is_posted_then_oauth_redirects() -> None:
     assert created.status_code == 303
     assert created.headers["location"] == "/setup/oauth/start"
     assert started.status_code == 303
-    assert started.headers["location"].startswith("https://accounts.example/")
+    assert started.headers["location"].startswith("https://accounts.google.com/")
     assert callback.status_code == 200
     assert oauth.created == ["one-time-code"]
     assert oauth.completed == ["authorization-code"]
+    for response in (created, started):
+        assert response.headers["cache-control"] == "no-store"
+        assert response.headers["referrer-policy"] == "same-origin"
+        assert response.headers["x-content-type-options"] == "nosniff"
+        assert "content-security-policy" not in response.headers
     for response in (created, callback):
         cookie_headers = response.headers.get_list("set-cookie")
         assert len(cookie_headers) == 1
