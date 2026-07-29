@@ -309,7 +309,10 @@ class SnapshotViewSource:
         root = self._root_for_generation(generation)
         available = self._available_dates(root)
         commit_date = root.change_set.created_at.astimezone(ZoneInfo(root.state.time_zone)).date()
-        last = max(available[-1], commit_date) if available else commit_date
+        # The public profile is a once-daily view of completed civil days.
+        # Excluding the commit date prevents partial intraday totals from
+        # appearing while Fitbit is still updating that day.
+        last = date.fromordinal(commit_date.toordinal() - 1)
         by_date = {value: self._step_count(root, value) for value in available}
         return tuple(
             StepSample(
