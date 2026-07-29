@@ -147,7 +147,7 @@ def _secure_html_headers(response: Response) -> None:
     response.headers["Content-Security-Policy"] = (
         "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
     )
-    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Referrer-Policy"] = "same-origin"
     response.headers["X-Content-Type-Options"] = "nosniff"
 
 
