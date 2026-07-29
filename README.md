@@ -370,6 +370,9 @@ WebhookのJob起動Taskは、GCS保存完了後の時刻から求めた次の10�
 遅延実行します。同一bucketの通知は同じ明示Task名へ合流するため、後続通知を
 取りこぼさず、通常は10分ごとに1回だけJobを起動します。Job終了時にもHEADと
 GCSを再照合し、未処理イベントがあれば次の境界Taskへ回収します。
+Webhook本文は単一通知objectと通知objectのarrayの両方を受け付けます。署名は
+分割前のraw body全体で1回検証し、所有者の各通知を個別に冪等保存した後、
+batch全体でJob起動Taskを1件だけ作成します。
 
 Jobs APIの成功はExecution作成成功であり、HEAD commit成功ではありません。
 実行失敗やCAS競合後もGCSに未処理イベントを残し、次回Taskまたは毎時Jobが
