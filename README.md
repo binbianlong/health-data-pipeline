@@ -1,6 +1,6 @@
 # health-data-pipeline
 
-Fitbit Sense 2のGoogle Health APIデータをGCSへ保存し、日次値・月曜始まりの暦週平均・暦月の月初来平均をNotionへ反映する個人用パイプラインです。GitHubプロフィール向けには直近7日分の歩数SVGだけを公開します。
+Fitbit Sense 2のGoogle Health APIデータをGCSへ保存し、日次値・月曜始まりの暦週平均・暦月の月初来平均をNotionへ反映する個人用パイプラインです。GitHubプロフィール向けには前日までの直近7日分の歩数SVGだけを1日1回公開します。
 
 BigQueryは使用しません。HEAD、Root Snapshot、年単位Shard、content-addressedな日次revisionにより、将来BigQueryを追加しても取得・日次計算を作り直さない構造です。詳細設計は[DESIGN.md](DESIGN.md)を参照してください。
 
@@ -370,9 +370,6 @@ WebhookのJob起動Taskは、GCS保存完了後の時刻から求めた次の10�
 遅延実行します。同一bucketの通知は同じ明示Task名へ合流するため、後続通知を
 取りこぼさず、通常は10分ごとに1回だけJobを起動します。Job終了時にもHEADと
 GCSを再照合し、未処理イベントがあれば次の境界Taskへ回収します。
-Webhook本文は単一通知objectと通知objectのarrayの両方を受け付けます。署名は
-分割前のraw body全体で1回検証し、所有者の各通知を個別に冪等保存した後、
-batch全体でJob起動Taskを1件だけ作成します。
 
 Jobs APIの成功はExecution作成成功であり、HEAD commit成功ではありません。
 実行失敗やCAS競合後もGCSに未処理イベントを残し、次回Taskまたは毎時Jobが
@@ -386,7 +383,7 @@ Jobs APIの成功はExecution作成成功であり、HEAD commit成功ではあ�
   `SESSION`と`DAILY`は365日で削除します。
 - HEADから到達する日次revisionは正式な長期状態です。
 - CAS失敗時は同じJob内で再試行せず、objectも即時削除しません。
-- NotionとSVGは適用済みHEAD generationを比較し、古い値へ逆行しません。
+- Notionは適用済みHEAD generationを比較し、古い値へ逆行しません。SVGは公開済みの最終日付とHEAD generationを比較し、前日までの7日分を1日1回だけ更新します。
 - BigQuery API、dataset、table、client dependencyは含みません。
 - バックフィルは現在同期を常に優先し、空き実行で1日1 data type・14 civil日だけ進めます。
 - 高頻度詳細は直近90日、その他は`2009-01-01`までを上限とし、成功したHEADでだけcursorを進めます。
