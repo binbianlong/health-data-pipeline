@@ -35,7 +35,7 @@ from health_data_pipeline.storage import ObjectNotFound, ObjectStore, Preconditi
 from health_data_pipeline.views import StepsSvgService, ViewApplicationService
 
 # Firebase Hosting forwards only this specially named cookie to Cloud Run.
-# Its value changes from the setup CSRF token to the opaque OAuth session ID.
+# It is issued only after the one-time setup code is accepted.
 SESSION_COOKIE = "__session"
 
 
@@ -151,7 +151,7 @@ def _secure_html_headers(response: Response) -> None:
     response.headers["X-Content-Type-Options"] = "nosniff"
 
 
-def _setup_form(csrf_token: str, message: str | None = None) -> str:
+def _setup_form(message: str | None = None) -> str:
     notice = "" if message is None else f"<p>{html.escape(message)}</p>"
     return f"""<!doctype html>
 <html lang="ja">
@@ -159,7 +159,6 @@ def _setup_form(csrf_token: str, message: str | None = None) -> str:
 <title>Health data setup</title></head>
 <body><main><h1>Google Health 接続</h1>{notice}
 <form method="post" action="/setup/session">
-<input type="hidden" name="csrf_token" value="{html.escape(csrf_token)}">
 <label>セットアップコード
 <input name="setup_code" type="password" required autocomplete="one-time-code">
 </label><button type="submit">Googleアカウントへ接続</button>
@@ -260,17 +259,7 @@ def create_app(dependencies: WebDependencies | None = None) -> FastAPI:
 
     @app.get("/setup", response_class=HTMLResponse)
     def setup_form() -> HTMLResponse:
-        csrf_token = secrets.token_urlsafe(32)
-        response = HTMLResponse(_setup_form(csrf_token))
-        response.set_cookie(
-            SESSION_COOKIE,
-            csrf_token,
-            max_age=600,
-            secure=True,
-            httponly=True,
-            samesite="strict",
-            path="/",
-        )
+        response = HTMLResponse(_setup_form())
         _secure_html_headers(response)
         return response
 
@@ -279,7 +268,7 @@ def create_app(dependencies: WebDependencies | None = None) -> FastAPI:
         deps = _dependencies(request)
         expected_origin = deps.config.public_base_url
         origin = request.headers.get("origin")
-        if origin is None or not secrets.compare_digest(origin.rstrip("/"), expected_origin):
+        if origin is None or not secrets.compare_digest(origin, expected_origin):
             raise HTTPException(status_code=403, detail="origin rejected")
         media_type = request.headers.get("content-type", "").split(";", 1)[0]
         if media_type != "application/x-www-form-urlencoded":
@@ -288,19 +277,24 @@ def create_app(dependencies: WebDependencies | None = None) -> FastAPI:
         if len(body) > 4096:
             raise HTTPException(status_code=413, detail="form is too large")
         try:
-            fields = parse_qs(body.decode("utf-8"), strict_parsing=True)
-            setup_code = fields["setup_code"][0]
-            form_csrf = fields["csrf_token"][0]
-        except (KeyError, UnicodeDecodeError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail="invalid setup form") from exc
-        cookie_csrf = request.cookies.get(SESSION_COOKIE, "")
-        if not cookie_csrf or not secrets.compare_digest(cookie_csrf, form_csrf):
-            raise HTTPException(status_code=403, detail="CSRF validation failed")
-        try:
-            session = deps.oauth_sessions.create_session(
-                setup_code=setup_code,
-                csrf_token=form_csrf,
+            fields = parse_qs(
+                body.decode("utf-8"),
+                strict_parsing=True,
+                keep_blank_values=True,
             )
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="invalid setup form") from exc
+        setup_codes = fields.get("setup_code")
+        if (
+            set(fields) != {"setup_code"}
+            or setup_codes is None
+            or len(setup_codes) != 1
+            or not setup_codes[0]
+        ):
+            raise HTTPException(status_code=400, detail="invalid setup form")
+        setup_code = setup_codes[0]
+        try:
+            session = deps.oauth_sessions.create_session(setup_code=setup_code)
         except InvalidSetupCode as exc:
             raise HTTPException(status_code=403, detail="setup code rejected") from exc
         response = RedirectResponse("/setup/oauth/start", status_code=303)
