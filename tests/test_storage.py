@@ -107,6 +107,44 @@ def test_content_publish_is_idempotent_without_overwrite() -> None:
     assert repository.read(first.reference) == payload
 
 
+def test_content_publish_uses_persisted_gcs_headers_before_media_download() -> None:
+    payload = b"{}"
+    encoded = encode_content(payload)
+    object_name = snapshot_object_name(encoded.canonical_sha256)
+    blob = Mock()
+    blob.name = object_name
+    blob.generation = 19
+    blob.metadata = {
+        "canonicalization": CANONICALIZATION_VERSION,
+        "encoding": ENCODING_VERSION,
+        "canonical-sha256": encoded.canonical_sha256,
+        "object-sha256": encoded.object_sha256,
+        "logical-content-type": "application/json",
+    }
+    blob.content_type = "application/gzip"
+    blob.cache_control = "no-transform"
+    blob.time_created = NOW
+    blob.upload_from_string.side_effect = _GoogleApiError(412)
+
+    def download_response(**_: object) -> bytes:
+        blob.cache_control = "no-cache, no-store, max-age=0, must-revalidate, no-transform"
+        return encoded.object_bytes
+
+    blob.download_as_bytes.side_effect = download_response
+    bucket = Mock()
+    bucket.blob.return_value = blob
+    repository = ContentAddressedStore(GoogleCloudStorageObjectStore(bucket))
+
+    published = repository.publish(
+        object_name,
+        payload,
+        logical_content_type="application/json",
+    )
+
+    assert published.created is False
+    assert published.object_generation == 19
+
+
 def test_existing_content_addressed_object_must_match_exactly() -> None:
     store = InMemoryObjectStore(clock=lambda: NOW)
     repository = ContentAddressedStore(store)
@@ -194,7 +232,16 @@ def test_gcs_adapter_reads_one_generation_with_crc32c() -> None:
     blob.content_type = "application/json"
     blob.cache_control = "no-store"
     blob.time_created = NOW
-    blob.download_as_bytes.return_value = b'{"generation":1}'
+
+    def download_response(**_: object) -> bytes:
+        blob.generation = "18"
+        blob.metadata = {}
+        blob.content_type = "application/octet-stream"
+        blob.cache_control = "no-cache, no-store, max-age=0, must-revalidate"
+        blob.time_created = NOW + timedelta(seconds=1)
+        return b'{"generation":1}'
+
+    blob.download_as_bytes.side_effect = download_response
     bucket = Mock()
     bucket.blob.return_value = blob
     adapter = GoogleCloudStorageObjectStore(bucket)
@@ -209,6 +256,9 @@ def test_gcs_adapter_reads_one_generation_with_crc32c() -> None:
     assert stored.generation == 17
     assert stored.data == b'{"generation":1}'
     assert stored.metadata["canonicalization"] == "fhcj-1"
+    assert stored.content_type == "application/json"
+    assert stored.cache_control == "no-store"
+    assert stored.created_at == NOW
 
 
 def test_gcs_adapter_put_forwards_generation_precondition_and_metadata() -> None:
@@ -273,7 +323,12 @@ def test_gcs_adapter_list_and_delete_keep_generation_guards() -> None:
     listed_blob.content_type = "application/gzip"
     listed_blob.cache_control = "no-transform"
     listed_blob.time_created = NOW
-    listed_blob.download_as_bytes.return_value = b"gzip"
+
+    def download_response(**_: object) -> bytes:
+        listed_blob.cache_control = "no-cache, no-store, max-age=0, must-revalidate"
+        return b"gzip"
+
+    listed_blob.download_as_bytes.side_effect = download_response
     delete_blob = Mock()
     bucket = Mock()
     bucket.list_blobs.return_value = [listed_blob]
@@ -289,6 +344,7 @@ def test_gcs_adapter_list_and_delete_keep_generation_guards() -> None:
         checksum="crc32c",
     )
     assert results[0].generation == 31
+    assert results[0].cache_control == "no-transform"
     delete_blob.delete.assert_called_once_with(if_generation_match=31)
 
 

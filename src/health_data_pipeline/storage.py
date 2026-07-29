@@ -143,6 +143,29 @@ class _GcsClient(Protocol):
     def bucket(self, bucket_name: str) -> _GcsBucket: ...
 
 
+@dataclass(frozen=True, slots=True)
+class _BlobProperties:
+    """GCS object properties captured before a media download mutates Blob."""
+
+    name: str
+    generation: int
+    metadata: Mapping[str, str]
+    content_type: str
+    cache_control: str
+    created_at: datetime
+
+    def stored_object(self, data: bytes) -> StoredObject:
+        return StoredObject(
+            name=self.name,
+            data=bytes(data),
+            generation=self.generation,
+            metadata=self.metadata,
+            content_type=self.content_type,
+            cache_control=self.cache_control,
+            created_at=self.created_at,
+        )
+
+
 class GoogleCloudStorageObjectStore:
     """Production ObjectStore backed by ``google-cloud-storage``.
 
@@ -182,7 +205,8 @@ class GoogleCloudStorageObjectStore:
         expected_generation: int | None = None
         try:
             blob.reload()
-            expected_generation = _required_generation(blob, object_name)
+            properties = self._snapshot_blob_properties(blob)
+            expected_generation = properties.generation
             data = blob.download_as_bytes(
                 if_generation_match=expected_generation,
                 checksum="crc32c",
@@ -193,7 +217,7 @@ class GoogleCloudStorageObjectStore:
                 object_name,
                 expected_generation=expected_generation,
             )
-        return self._stored_from_blob(blob, data)
+        return properties.stored_object(data)
 
     def put(
         self,
@@ -246,12 +270,12 @@ class GoogleCloudStorageObjectStore:
         try:
             blobs = self._bucket.list_blobs(prefix=prefix)
             for blob in blobs:
-                generation = _required_generation(blob, blob.name)
+                properties = self._snapshot_blob_properties(blob)
                 data = blob.download_as_bytes(
-                    if_generation_match=generation,
+                    if_generation_match=properties.generation,
                     checksum="crc32c",
                 )
-                stored_objects.append(self._stored_from_blob(blob, data))
+                stored_objects.append(properties.stored_object(data))
         except Exception as exc:
             _raise_translated_gcs_error(exc, prefix, expected_generation=None)
         return tuple(sorted(stored_objects, key=lambda stored: stored.name))
@@ -270,10 +294,9 @@ class GoogleCloudStorageObjectStore:
                 expected_generation=if_generation_match,
             )
 
-    def _stored_from_blob(self, blob: _GcsBlob, data: bytes) -> StoredObject:
-        return StoredObject(
+    def _snapshot_blob_properties(self, blob: _GcsBlob) -> _BlobProperties:
+        return _BlobProperties(
             name=blob.name,
-            data=bytes(data),
             generation=_required_generation(blob, blob.name),
             metadata=MappingProxyType(dict(blob.metadata or {})),
             content_type=blob.content_type or "application/octet-stream",
