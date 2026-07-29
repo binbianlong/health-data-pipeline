@@ -1005,7 +1005,7 @@ GitHubへ公開するのは前日までの直近7日分の歩数だけとする�
 
 ```text
 public/steps/
-  canonicalization=fhcj-1/
+  canonicalization=fhcj-3/
   sha256/<content-sha256>.svg
 
 state/views/steps-head.json
@@ -1027,6 +1027,8 @@ state/views/steps-head.json
 - pointerはGCS CASで更新する。
 - 古いgenerationまたは公開済み日付以前からのpointer更新を拒否する。
 - 同じ`through_date`のHEADが複数あってもSVG生成とGCS保存を省略する。
+- 描画仕様を変更した場合だけcanonicalization versionを上げ、同じgeneration・
+  `through_date`から新仕様へ1回だけ移行できる。移行後は通常の日次制御へ戻る。
 - `GET /public/steps.svg`はpointerが指すSVGだけを返す。
 - SVGへ他の健康値、owner ID、最終同期時刻を含めない。
 - `Cache-Control: public, max-age=300`とする。
