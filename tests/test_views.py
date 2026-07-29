@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
@@ -165,6 +166,34 @@ def test_steps_svg_publishes_only_once_per_completed_date() -> None:
     pointer = StepsPointer.from_bytes(store.get("state/views/steps-head.json").data)
     assert pointer.generation == 11
     assert pointer.through_date == "2026-07-29"
+
+
+def test_steps_svg_migrates_legacy_pointer_at_same_generation() -> None:
+    store = InMemoryObjectStore()
+    store.put(
+        "state/views/steps-head.json",
+        json.dumps(
+            {
+                "generation": 9,
+                "svg_uri": "public/steps/legacy.svg",
+                "content_sha256": "legacy",
+                "updated_at": "2026-07-29T15:00:00Z",
+            }
+        ).encode(),
+        if_generation_match=0,
+        metadata={},
+        content_type="application/json",
+        cache_control="no-store",
+    )
+    service = StepsSvgService(store)
+    samples = [StepSample(date(2026, 7, day), day * 1000) for day in range(22, 29)]
+
+    assert service.publish(generation=9, samples=samples)
+    assert not service.publish(generation=9, samples=samples)
+
+    pointer = StepsPointer.from_bytes(store.get("state/views/steps-head.json").data)
+    assert pointer.generation == 9
+    assert pointer.through_date == "2026-07-28"
 
 
 def _step_rows(value: int) -> list[dict[str, object]]:
