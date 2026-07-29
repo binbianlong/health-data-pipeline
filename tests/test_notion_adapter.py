@@ -5,23 +5,36 @@ from typing import Any
 
 import pytest
 
-from health_data_pipeline.notion_adapter import NotionDataSourceGateway
+from health_data_pipeline.notion_adapter import NotionApiError, NotionDataSourceGateway
 from health_data_pipeline.views import DailyView
 
 
 class FakeResponse:
-    def __init__(self, status_code: int, payload: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        payload: dict[str, Any],
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.status_code = status_code
         self._payload = payload
+        self.headers = headers or {}
 
     def json(self) -> dict[str, Any]:
         return self._payload
 
 
 class RecordingNotionClient:
-    def __init__(self, *, fail_on_path: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        fail_on_path: str | None = None,
+        responses: list[FakeResponse] | None = None,
+    ) -> None:
         self.calls: list[tuple[str, str, dict[str, Any] | None]] = []
         self.fail_on_path = fail_on_path
+        self.responses = responses or []
 
     def request(
         self,
@@ -35,6 +48,8 @@ class RecordingNotionClient:
         self.calls.append((method, path, json))
         if path == self.fail_on_path:
             raise RuntimeError("injected Notion failure")
+        if self.responses:
+            return self.responses.pop(0)
         if method == "POST" and path == "/v1/pages":
             return FakeResponse(200, {"id": "new-page"})
         if method == "GET" and path == "/v1/data_sources/source":
@@ -153,3 +168,49 @@ def test_configure_schema_renames_title_and_adds_required_properties() -> None:
     assert properties["Source HEAD generation"] == {"number": {}}
     assert properties["Content SHA-256"] == {"rich_text": {}}
     assert properties["Fitbit last sync time"] == {"date": {}}
+
+
+def test_rate_limit_retries_after_server_requested_delay() -> None:
+    client = RecordingNotionClient(
+        responses=[
+            FakeResponse(429, {"sensitive": "not exposed"}, headers={"Retry-After": "0.25"}),
+            FakeResponse(200, {"properties": {"Name": {"type": "title", "title": {}}}}),
+        ]
+    )
+    delays: list[float] = []
+    gateway = NotionDataSourceGateway(
+        token="token",
+        data_source_id="source",
+        client=client,  # type: ignore[arg-type]
+        sleeper=delays.append,
+    )
+
+    assert gateway.ensure_schema()
+    assert delays == [0.25]
+    assert [call[:2] for call in client.calls[:2]] == [
+        ("GET", "/v1/data_sources/source"),
+        ("GET", "/v1/data_sources/source"),
+    ]
+
+
+def test_rate_limit_retry_is_bounded_and_error_omits_response_data() -> None:
+    client = RecordingNotionClient(
+        responses=[
+            FakeResponse(429, {"secret": "private"}, headers={"Retry-After": "2"}) for _ in range(4)
+        ]
+    )
+    delays: list[float] = []
+    gateway = NotionDataSourceGateway(
+        token="token",
+        data_source_id="source",
+        client=client,  # type: ignore[arg-type]
+        sleeper=delays.append,
+    )
+
+    with pytest.raises(NotionApiError, match=r"Notion request failed \(429\)") as exc_info:
+        gateway.ensure_schema()
+
+    assert len(client.calls) == 4
+    assert delays == [2.0, 2.0, 2.0]
+    assert "private" not in str(exc_info.value)
+    assert "token" not in str(exc_info.value)

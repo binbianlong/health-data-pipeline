@@ -27,6 +27,7 @@ from health_data_pipeline.canonical import (
 from health_data_pipeline.models import ContentReference, DataHead
 
 HEAD_OBJECT_NAME = "state/data-head.json"
+GCS_LIST_PAGE_SIZE = 1_000
 HTTP_NOT_FOUND = 404
 HTTP_PRECONDITION_FAILED = 412
 
@@ -100,6 +101,9 @@ class ObjectStore(Protocol):
     def list(self, prefix: str) -> Iterable[StoredObject]:
         """List objects for maintenance workflows such as reachability GC."""
 
+    def list_names(self, prefix: str) -> Iterable[str]:
+        """List object names without downloading their payloads."""
+
     def delete(self, object_name: str, *, if_generation_match: int) -> None:
         """Delete one explicitly resolved object with a generation guard."""
 
@@ -136,7 +140,12 @@ class _GcsBlob(Protocol):
 class _GcsBucket(Protocol):
     def blob(self, blob_name: str) -> _GcsBlob: ...
 
-    def list_blobs(self, *, prefix: str) -> Iterable[_GcsBlob]: ...
+    def list_blobs(
+        self,
+        *,
+        prefix: str,
+        page_size: int,
+    ) -> Iterable[_GcsBlob]: ...
 
 
 class _GcsClient(Protocol):
@@ -268,7 +277,10 @@ class GoogleCloudStorageObjectStore:
 
         stored_objects: list[StoredObject] = []
         try:
-            blobs = self._bucket.list_blobs(prefix=prefix)
+            blobs = self._bucket.list_blobs(
+                prefix=prefix,
+                page_size=GCS_LIST_PAGE_SIZE,
+            )
             for blob in blobs:
                 properties = self._snapshot_blob_properties(blob)
                 data = blob.download_as_bytes(
@@ -279,6 +291,21 @@ class GoogleCloudStorageObjectStore:
         except Exception as exc:
             _raise_translated_gcs_error(exc, prefix, expected_generation=None)
         return tuple(sorted(stored_objects, key=lambda stored: stored.name))
+
+    def list_names(self, prefix: str) -> tuple[str, ...]:
+        """List metadata only, without a Class B payload download per object."""
+
+        try:
+            names = tuple(
+                blob.name
+                for blob in self._bucket.list_blobs(
+                    prefix=prefix,
+                    page_size=GCS_LIST_PAGE_SIZE,
+                )
+            )
+        except Exception as exc:
+            _raise_translated_gcs_error(exc, prefix, expected_generation=None)
+        return tuple(sorted(names))
 
     def delete(self, object_name: str, *, if_generation_match: int) -> None:
         if if_generation_match <= 0:
@@ -381,6 +408,10 @@ class InMemoryObjectStore:
                 for name in sorted(self._objects)
                 if name.startswith(prefix)
             )
+
+    def list_names(self, prefix: str) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(name for name in sorted(self._objects) if name.startswith(prefix))
 
     def delete(self, object_name: str, *, if_generation_match: int) -> None:
         if if_generation_match <= 0:

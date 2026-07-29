@@ -127,6 +127,7 @@ def _client(
     oidc: Any | None = None,
     event_sink: EventSink | None = None,
     task_dispatcher: Tasks | None = None,
+    on_complete: Any | None = None,
     raise_server_exceptions: bool = True,
 ) -> tuple[TestClient, EventSink, Tasks, OAuth, Views]:
     key = b"owner-key"
@@ -150,6 +151,7 @@ def _client(
         views=views,  # type: ignore[arg-type]
         steps=Steps(),  # type: ignore[arg-type]
         clock=clock or (lambda: datetime(2026, 7, 28, 12, 7, tzinfo=UTC)),
+        on_complete=on_complete,
     )
     return (
         TestClient(
@@ -171,6 +173,15 @@ def test_health_endpoint_avoids_cloud_run_reserved_paths() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_request_completion_hook_runs_for_success_and_not_found() -> None:
+    completed: list[str] = []
+    client, _, _, _, _ = _client(on_complete=lambda: completed.append("done"))
+
+    assert client.get("/health").status_code == 200
+    assert client.get("/does-not-exist").status_code == 404
+    assert completed == ["done", "done"]
 
 
 def test_webhook_persists_before_enqueuing_job() -> None:

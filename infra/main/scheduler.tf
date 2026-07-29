@@ -4,8 +4,8 @@ resource "google_cloud_scheduler_job" "hourly_sync" {
   project          = var.project_id
   region           = var.region
   name             = local.scheduler_name
-  description      = "Hourly recovery and reconciliation for the health data pipeline"
-  schedule         = "0 * * * *"
+  description      = "Three-hour recovery and reconciliation for the health data pipeline"
+  schedule         = "0 */3 * * *"
   time_zone        = "Asia/Tokyo"
   attempt_deadline = "180s"
   paused           = var.scheduler_paused

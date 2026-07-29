@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import threading
 from collections.abc import Mapping
 from contextlib import suppress
 from typing import cast
@@ -66,6 +67,7 @@ from health_data_pipeline.views import (
     NotionViewService,
     StepsSvgService,
     ViewApplicationService,
+    read_notion_sync_state,
     request_notion_generation,
 )
 from health_data_pipeline.web import (
@@ -129,7 +131,26 @@ def build_web_dependencies() -> WebDependencies:
 
     _configure_structured_logging()
     config = AppConfig.from_env()
-    store = _store(config)
+    raw_store = _store(config)
+    store = ClassACountingObjectStore(raw_store)
+    logger = structlog.get_logger("health_data_pipeline")
+    class_a_usage = ClassAUsageReporter(
+        store=raw_store,
+        counter=store,
+        emit=lambda event, payload: logger.warning(event, **payload),
+    )
+    class_a_flush_lock = threading.Lock()
+
+    def flush_class_a_usage() -> None:
+        with class_a_flush_lock:
+            try:
+                class_a_usage.flush()
+            except Exception as exc:
+                logger.error(  # noqa: TRY400 - deliberately omit exception details.
+                    "class_a_state_update_failed",
+                    error_type=type(exc).__name__,
+                )
+
     secrets = SecretManager(project_id=config.project_id)
     oauth_client = _oauth_client(secrets)
     application_hmac_key = _key_secret(
@@ -200,6 +221,7 @@ def build_web_dependencies() -> WebDependencies:
             step_samples=source,
         ),
         steps=steps,
+        on_complete=flush_class_a_usage,
     )
 
 
@@ -258,6 +280,9 @@ def build_job_runner() -> JobRunner:
         owner_hmac=_owner_hmac(store),
         default_time_zone=os.environ.get("OWNER_TIME_ZONE", "Asia/Tokyo"),
         sync_alert=sync_alert,
+        backfill_ready=lambda generation: (
+            read_notion_sync_state(store)[0].applied_generation >= generation
+        ),
     )
     source = SnapshotViewSource(heads=heads, snapshots=snapshots)
     task_dispatcher = CloudTaskDispatcher(

@@ -106,6 +106,59 @@ def test_notion_applies_latest_once_and_uses_month_average() -> None:
     assert store.get("state/notion/pages/year=2026/2026-07-28.json").data
 
 
+def test_notion_renders_requested_metrics_in_fixed_japanese_order() -> None:
+    requested = (
+        ("sleep_minutes", "睡眠時間"),
+        ("sleep_rem_minutes", "REM睡眠"),
+        ("sleep_deep_minutes", "深い睡眠"),
+        ("sleep_light_minutes", "浅い睡眠"),
+        ("sleep_awake_minutes", "覚醒時間"),
+        ("exercise_minutes", "運動時間"),
+    )
+    view = DailyView(
+        metric_date=date(2026, 7, 28),
+        source_generation=7,
+        data_status="CANONICAL_SYNCED",
+        fitbit_last_sync_time=datetime(2026, 7, 29, tzinfo=UTC),
+        metrics=(
+            *(
+                DailyMetric(
+                    metric_name=metric_name,
+                    statistic="value",
+                    value=index,
+                    unit="min",
+                    status="OK",
+                )
+                for index, (metric_name, _) in reversed(tuple(enumerate(requested, start=1)))
+            ),
+            DailyMetric(
+                metric_name="steps",
+                statistic="value",
+                value=8_000,
+                unit="count",
+                status="OK",
+            ),
+        ),
+    )
+
+    body = render_notion_body(view)
+    positions = [body.index(f"| {label} |") for _, label in requested]
+
+    assert positions == sorted(positions)
+    assert body.index("| 運動時間 |") < body.index("| steps |")
+    for metric_name, label in requested:
+        assert metric_name not in body
+        assert label in body
+
+
+def test_notion_marks_unavailable_requested_metrics_as_missing() -> None:
+    body = render_notion_body(_daily())
+
+    for label in ("睡眠時間", "REM睡眠", "深い睡眠", "浅い睡眠", "覚醒時間", "運動時間"):
+        assert f"| {label} | 欠損 | min |" in body
+    assert body.count("| MISSING |") == 6
+
+
 def test_notion_never_overwrites_a_newer_page() -> None:
     store = InMemoryObjectStore()
     notion = FakeNotion()

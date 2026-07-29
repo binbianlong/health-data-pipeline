@@ -71,6 +71,7 @@ class WebDependencies:
     views: ViewApplicationService
     steps: StepsSvgService
     clock: Callable[[], datetime] = lambda: datetime.now(UTC)
+    on_complete: Callable[[], object] | None = None
 
 
 class GcsWebhookEventSink:
@@ -182,6 +183,15 @@ def create_app(dependencies: WebDependencies | None = None) -> FastAPI:
         openapi_url=None,
     )
     app.state.dependencies = dependencies
+
+    @app.middleware("http")
+    async def complete_request(request: Request, call_next: Callable[[Request], Any]) -> Response:
+        try:
+            return cast(Response, await call_next(request))
+        finally:
+            deps = getattr(request.app.state, "dependencies", None)
+            if isinstance(deps, WebDependencies) and deps.on_complete is not None:
+                deps.on_complete()
 
     @app.get("/health")
     def health() -> Mapping[str, str]:

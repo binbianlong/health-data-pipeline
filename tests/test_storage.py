@@ -338,7 +338,10 @@ def test_gcs_adapter_list_and_delete_keep_generation_guards() -> None:
     results = adapter.list("manifests/snapshots/")
     adapter.delete("manifests/snapshots/one.json.gz", if_generation_match=31)
 
-    bucket.list_blobs.assert_called_once_with(prefix="manifests/snapshots/")
+    bucket.list_blobs.assert_called_once_with(
+        prefix="manifests/snapshots/",
+        page_size=1_000,
+    )
     listed_blob.download_as_bytes.assert_called_once_with(
         if_generation_match=31,
         checksum="crc32c",
@@ -346,6 +349,23 @@ def test_gcs_adapter_list_and_delete_keep_generation_guards() -> None:
     assert results[0].generation == 31
     assert results[0].cache_control == "no-transform"
     delete_blob.delete.assert_called_once_with(if_generation_match=31)
+
+
+def test_gcs_adapter_lists_names_without_downloading_payloads() -> None:
+    listed_blob = Mock()
+    listed_blob.name = "webhook-events/event.json"
+    bucket = Mock()
+    bucket.list_blobs.return_value = [listed_blob]
+    adapter = GoogleCloudStorageObjectStore(bucket)
+
+    names = adapter.list_names("webhook-events/")
+
+    assert names == ("webhook-events/event.json",)
+    bucket.list_blobs.assert_called_once_with(
+        prefix="webhook-events/",
+        page_size=1_000,
+    )
+    listed_blob.download_as_bytes.assert_not_called()
 
 
 def test_gcs_adapter_factory_is_lazy_and_uses_requested_project(
