@@ -135,7 +135,6 @@ resource "google_cloud_run_v2_job" "sync" {
             local.secret_environment,
             {
               RUNTIME_KIND                = "job"
-              CLOUD_RUN_SERVICE_URL       = google_cloud_run_v2_service.api[0].uri
               TASK_CALLER_SERVICE_ACCOUNT = google_service_account.task_caller.email
             },
           )

@@ -159,6 +159,7 @@ def test_firebase_hosting_exposes_only_the_required_routes() -> None:
     assert '"roles/apigateway.admin"' not in service_accounts
     assert "invoker_iam_disabled = true" in cloud_run
     assert 'member   = "allUsers"' not in cloud_run
+    assert "CLOUD_RUN_SERVICE_URL       = google_cloud_run_v2_service.api[0].uri" not in cloud_run
 
     assert "PUBLIC_BASE_URL       = local.public_base_url" in locals_tf
     assert "CLOUD_RUN_SERVICE_URL = local.service_url" in locals_tf
