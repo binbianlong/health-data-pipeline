@@ -138,6 +138,11 @@ def test_steps_svg_pointer_is_content_addressed_and_monotonic() -> None:
     assert pointer.content_sha256 in pointer.svg_uri
     assert b"7" in svg
     assert b"health" not in svg.lower()
+    assert b"Steps over the last 7 days" in svg
+    assert b"#4493f8" in svg
+    assert b"#238636" in svg
+    assert b'fill="#fff"' not in svg
+    assert "直近7日間の歩数".encode() not in svg
 
 
 def _step_rows(value: int) -> list[dict[str, object]]:

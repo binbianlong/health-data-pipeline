@@ -454,14 +454,12 @@ def render_steps_svg(samples: Sequence[StepSample]) -> bytes:
         (
             f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
             f'height="{height}" viewBox="0 0 {width} {height}" '
-            'role="img" aria-label="直近7日間の歩数">'
+            'role="img" aria-label="Steps over the last 7 days">'
         ),
         "<style>"
-        "text{font-family:system-ui,sans-serif;fill:#263238}"
-        ".bar{fill:#1a73e8}.missing{fill:#cfd8dc}"
+        "text{font-family:system-ui,sans-serif;fill:#4493f8}"
+        ".bar{fill:#238636}.missing{fill:#656d76}"
         "</style>",
-        '<rect width="100%" height="100%" rx="12" fill="#fff"/>',
-        '<text x="24" y="24" font-size="16" font-weight="600">直近7日間の歩数</text>',
     ]
     for index, sample in enumerate(ordered):
         value = sample.steps
