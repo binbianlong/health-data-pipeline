@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import JsonValue
 
+from health_data_pipeline.budget import class_a_backfill_allowed
 from health_data_pipeline.canonical import (
     canonical_json_bytes,
     canonical_ndjson_bytes,
@@ -68,16 +69,28 @@ _METRICS_BY_DATA_TYPE: Mapping[str, frozenset[str]] = {
     "daily-heart-rate-variability": frozenset({"hrv_rmssd"}),
     "oxygen-saturation": frozenset({"spo2"}),
     "daily-oxygen-saturation": frozenset({"spo2"}),
-    "sleep": frozenset({"sleep_minutes"}),
+    "sleep": frozenset(
+        {
+            "sleep_minutes",
+            "sleep_rem_minutes",
+            "sleep_deep_minutes",
+            "sleep_light_minutes",
+            "sleep_awake_minutes",
+        }
+    ),
     "respiratory-rate-sleep-summary": frozenset({"sleep_respiratory_rate"}),
     "exercise": frozenset({"exercise_minutes"}),
 }
-_BACKFILL_BATCH_DAYS = 14
+_BACKFILL_BATCH_DAYS = 31
+_LEGACY_BACKFILL_BATCH_DAYS = 14
 _BACKFILL_EARLIEST_DATE = date(2009, 1, 1)
 _BACKFILL_HIGH_FREQUENCY_DAYS = 90
 _RECONCILIATION_MAX_DAYS = 90
 _BACKFILL_TIME_ZONE = ZoneInfo("Asia/Tokyo")
 _BACKFILL_META_KEY = "_schedule"
+_BACKFILL_POLICY_VERSION = 2
+_NORMALIZER_VERSION = "daily-v2"
+_PRIORITY_BACKFILL_DATA_TYPES = ("sleep", "exercise")
 _HIGH_FREQUENCY_DATA_TYPES = frozenset(
     {
         "heart-rate",
@@ -100,6 +113,7 @@ class IngestedQuery:
     metric_date: date
     data_points: tuple[Mapping[str, Any], ...]
     manifest: ContentReference
+    replacement_scope: Mapping[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,7 +121,7 @@ class BackfillChunk:
     data_type: str
     dates: tuple[date, ...]
     floor: date
-    next_data_type_index: int
+    next_data_type_index: int | None = None
 
 
 class SyncAlert(Protocol):
@@ -146,6 +160,7 @@ class IncrementalSyncPipeline:
         owner_hmac: str,
         default_time_zone: str = "Asia/Tokyo",
         sync_alert: SyncAlert | None = None,
+        backfill_ready: Callable[[int], bool] | None = None,
         now: Any = None,
     ) -> None:
         self._store = store
@@ -157,6 +172,7 @@ class IncrementalSyncPipeline:
         self._owner_hmac = owner_hmac
         self._default_time_zone = default_time_zone
         self._sync_alert = sync_alert
+        self._backfill_ready = backfill_ready or (lambda _generation: True)
         self._now = now or (lambda: datetime.now(UTC))
         self._leases = LeaseRepository(store, owner_hmac=owner_hmac)
 
@@ -188,7 +204,7 @@ class IncrementalSyncPipeline:
             raw_processed = root.state.webhook_cursor.get("processed_objects", [])
             if isinstance(raw_processed, list):
                 processed = {value for value in raw_processed if isinstance(value, str)}
-        return any(item.name not in processed for item in self._store.list("webhook-events/"))
+        return any(name not in processed for name in self._store.list_names("webhook-events/"))
 
     def _run_with_lease(self, now: datetime) -> SyncOutcome:
         base = self._heads.read()
@@ -212,15 +228,19 @@ class IncrementalSyncPipeline:
         )
         backfill_day = now.astimezone(_BACKFILL_TIME_ZONE).date()
         idle_root = root if not pending and not sync_advanced else None
-        backfill_chunk = (
-            _select_backfill_chunk(
+        backfill_chunks = (
+            _select_backfill_chunks(
                 idle_root.state.backfill_cursors,
                 today=backfill_day,
             )
-            if idle_root is not None
-            else None
+            if (
+                idle_root is not None
+                and self._backfill_ready(idle_root.generation)
+                and class_a_backfill_allowed(self._store, now=now)
+            )
+            else ()
         )
-        if idle_root is not None and backfill_chunk is None:
+        if idle_root is not None and not backfill_chunks:
             return SyncOutcome(
                 committed=False,
                 generation=idle_root.generation,
@@ -233,21 +253,31 @@ class IncrementalSyncPipeline:
             sync_advanced=sync_advanced,
             today=today,
             zone=zone,
-            backfill_chunk=backfill_chunk,
+            backfill_chunks=backfill_chunks,
         )
 
         expected_generation = 1 if root is None else root.generation + 1
         ingested: list[IngestedQuery] = []
-        for data_type in SUPPORTED_DATA_TYPES:
-            ingested.extend(
-                self._ingest_day(
-                    data_type,
-                    metric_date,
-                    zone=zone,
-                    expected_generation=expected_generation,
+        if backfill_chunks:
+            for chunk in backfill_chunks:
+                ingested.extend(
+                    self._ingest_backfill_chunk(
+                        chunk,
+                        zone=zone,
+                        expected_generation=expected_generation,
+                    )
                 )
-                for metric_date in sorted(fetch_dates.get(data_type, ()))
-            )
+        else:
+            for data_type in SUPPORTED_DATA_TYPES:
+                for metric_date in sorted(fetch_dates.get(data_type, ())):
+                    ingested.extend(
+                        self._ingest_dates(
+                            data_type,
+                            (metric_date,),
+                            zone=zone,
+                            expected_generation=expected_generation,
+                        )
+                    )
 
         changed_dates = {query.metric_date for query in ingested}
         changed_dates.update(
@@ -269,7 +299,7 @@ class IncrementalSyncPipeline:
         )
         cursors = dict(root.state.data_type_cursors) if root is not None else {}
         cursor_time = now.isoformat().replace("+00:00", "Z")
-        if backfill_chunk is None:
+        if not backfill_chunks:
             for data_type in reconciled_data_types:
                 cursors[data_type] = cast(
                     JsonValue,
@@ -280,23 +310,23 @@ class IncrementalSyncPipeline:
                 )
         webhook_cursor = (
             dict(root.state.webhook_cursor)
-            if backfill_chunk is not None and root is not None
+            if backfill_chunks and root is not None
             else {"processed_objects": cast(JsonValue, event_names)}
         )
         backfill_cursors = _next_backfill_cursors(
             root,
-            backfill_chunk,
+            backfill_chunks,
             truncated_reconciliation,
             completed_on=backfill_day,
         )
         commit_kind = (
             CommitKind.BACKFILL
-            if backfill_chunk is not None
+            if backfill_chunks
             else (CommitKind.WEBHOOK if pending else CommitKind.SCHEDULED)
         )
         committed_sync_time = (
             root.state.fitbit_last_sync_time
-            if backfill_chunk is not None and root is not None
+            if backfill_chunks and root is not None
             else fitbit_last_sync
         )
         try:
@@ -310,15 +340,8 @@ class IncrementalSyncPipeline:
                     backfill_cursors=backfill_cursors,
                     fitbit_last_sync_time=committed_sync_time,
                     time_zone=time_zone,
-                    raw_replacements=tuple(
-                        cast(
-                            JsonValue,
-                            {
-                                "data_type": item.data_type,
-                                "metric_date": item.metric_date.isoformat(),
-                            },
-                        )
-                        for item in ingested
+                    raw_replacements=_unique_raw_replacements(
+                        item.replacement_scope for item in ingested
                     ),
                     ingestion_manifests=_unique_manifest_references(
                         item.manifest for item in ingested
@@ -338,75 +361,144 @@ class IncrementalSyncPipeline:
             owner_hmac=self._owner_hmac,
         )
 
-    def _ingest_day(
+    def _ingest_backfill_chunk(
         self,
-        data_type: str,
-        metric_date: date,
+        chunk: BackfillChunk,
         *,
         zone: ZoneInfo,
         expected_generation: int,
-    ) -> IngestedQuery:
+    ) -> tuple[IngestedQuery, ...]:
+        """Range-fetch priority sessions; keep legacy high-volume work daily."""
+
+        if chunk.next_data_type_index is None:
+            return self._ingest_dates(
+                chunk.data_type,
+                chunk.dates,
+                zone=zone,
+                expected_generation=expected_generation,
+            )
+
+        ingested: list[IngestedQuery] = []
+        for metric_date in chunk.dates:
+            ingested.extend(
+                self._ingest_dates(
+                    chunk.data_type,
+                    (metric_date,),
+                    zone=zone,
+                    expected_generation=expected_generation,
+                )
+            )
+        return tuple(ingested)
+
+    def _ingest_dates(
+        self,
+        data_type: str,
+        dates: Sequence[date],
+        *,
+        zone: ZoneInfo,
+        expected_generation: int,
+    ) -> tuple[IngestedQuery, ...]:
+        ordered_dates = tuple(sorted(set(dates)))
+        if not ordered_dates:
+            raise ValueError("ingestion dates must not be empty")
+        if ordered_dates != tuple(_inclusive_dates(ordered_dates[0], ordered_dates[-1])):
+            raise ValueError("ingestion dates must form one contiguous civil interval")
+
         spec = data_type_spec(data_type)
+        first_date = ordered_dates[0]
+        civil_end = ordered_dates[-1] + timedelta(days=1)
         start = datetime.combine(
-            metric_date,
+            first_date,
             time.min,
             tzinfo=zone,
         ).astimezone(UTC)
-        next_date = metric_date + timedelta(days=1)
         end = datetime.combine(
-            next_date,
+            civil_end,
             time.min,
             tzinfo=zone,
         ).astimezone(UTC)
+        if end - start > spec.max_window:
+            raise ValueError("ingestion interval exceeds the data type API window")
         pages = tuple(
             self._health.iter_data_point_pages(
                 data_type,
                 FetchWindow(
                     start=start,
                     end=end,
-                    civil_start=metric_date,
-                    civil_end=next_date,
+                    civil_start=first_date,
+                    civil_end=civil_end,
                 ),
             )
         )
         raw_references = tuple(self._publish_api_page(page) for page in pages)
         points = tuple(point for page in pages for point in page.data_points)
+        normalized = normalize_daily_observations(points)
         normalized_reference = self._publish_normalized_source(
             data_type,
             spec.record_kind,
             points,
         )
+        replacement_kind = _replacement_kind(spec.record_kind)
+        replacement_scope: dict[str, object] = {"kind": replacement_kind}
+        if replacement_kind == "PHYSICAL_WINDOW_REPLACE":
+            replacement_scope.update(
+                {
+                    "physical_start": start,
+                    "physical_end": end,
+                }
+            )
+            raw_replacement_scope: Mapping[str, Any] = {
+                "data_type": data_type,
+                "kind": replacement_kind,
+                "physical_start": start.isoformat().replace("+00:00", "Z"),
+                "physical_end": end.isoformat().replace("+00:00", "Z"),
+            }
+        elif len(ordered_dates) == 1:
+            replacement_scope["metric_date"] = first_date
+            raw_replacement_scope = {
+                "data_type": data_type,
+                "kind": replacement_kind,
+                "metric_date": first_date.isoformat(),
+            }
+        else:
+            replacement_scope.update(
+                {
+                    "civil_start": first_date,
+                    "civil_end": civil_end,
+                }
+            )
+            raw_replacement_scope = {
+                "data_type": data_type,
+                "kind": replacement_kind,
+                "civil_start": first_date.isoformat(),
+                "civil_end": civil_end.isoformat(),
+            }
         manifest_payload = {
             "schema_version": 1,
             "data_type": data_type,
             "query_window": {
                 "physical_start": start,
                 "physical_end": end,
-                "civil_start": metric_date,
-                "civil_end": next_date,
+                "civil_start": first_date,
+                "civil_end": civil_end,
                 "time_zone": zone.key,
             },
-            "replacement_scope": {
-                "kind": _replacement_kind(spec.record_kind),
-                "metric_date": metric_date,
-            },
+            "replacement_scope": replacement_scope,
             "page_count": len(pages),
             "api_pages": list(raw_references),
             "normalized_source": normalized_reference,
             "source_count": len(points),
-            "normalized_count": sum(
-                len(values) for values in normalize_daily_observations(points).values()
-            ),
+            "normalized_count": sum(len(values) for values in normalized.values()),
             "deduplicate_count": 0,
             "schema_version_daily": 1,
-            "normalizer_version": "daily-v1",
+            "normalizer_version": _NORMALIZER_VERSION,
             "expected_head_generation": expected_generation,
             "validation_result": "VALID",
         }
         canonical = canonical_json_bytes(manifest_payload)
         digest = sha256_hex(canonical)
         object_name = content_addressed_object_name(
-            f"manifests/ingestion/date={metric_date.isoformat()}",
+            f"manifests/ingestion/date={first_date.isoformat()}",
             digest,
             suffix=".json.gz",
         )
@@ -415,11 +507,25 @@ class IncrementalSyncPipeline:
             canonical,
             logical_content_type="application/json",
         )
-        return IngestedQuery(
-            data_type=data_type,
-            metric_date=metric_date,
-            data_points=points,
-            manifest=published.reference,
+        points_by_date: dict[date, list[Mapping[str, Any]]] = defaultdict(list)
+        if len(ordered_dates) == 1:
+            points_by_date[first_date].extend(points)
+        else:
+            requested_dates = set(ordered_dates)
+            for point in points:
+                for point_date in normalize_daily_observations((point,)):
+                    if point_date not in requested_dates:
+                        raise ValueError("normalized observation falls outside replacement scope")
+                    points_by_date[point_date].append(point)
+        return tuple(
+            IngestedQuery(
+                data_type=data_type,
+                metric_date=metric_date,
+                data_points=tuple(points_by_date.get(metric_date, ())),
+                manifest=published.reference,
+                replacement_scope=raw_replacement_scope,
+            )
+            for metric_date in ordered_dates
         )
 
     def _publish_api_page(self, page: DataPointPage) -> ContentReference:
@@ -472,14 +578,14 @@ class IncrementalSyncPipeline:
             raw_processed = root.state.webhook_cursor.get("processed_objects", [])
             if isinstance(raw_processed, list):
                 processed = {value for value in raw_processed if isinstance(value, str)}
-        objects = tuple(self._store.list("webhook-events/"))
-        current_names = [item.name for item in objects]
+        current_names = list(self._store.list_names("webhook-events/"))
         pending: list[PendingWebhook] = []
-        for stored in objects:
-            if stored.name in processed:
+        for object_name in current_names:
+            if object_name in processed:
                 continue
+            stored = self._store.get(object_name)
             event = _parse_webhook_event(
-                stored.name,
+                object_name,
                 stored.data,
                 zone=zone,
             )
@@ -546,10 +652,10 @@ class IncrementalSyncPipeline:
         history: dict[date, Sequence[Observation]] = {}
         cursor = earliest
         while cursor <= latest:
-            history[cursor] = changed.get(
-                cursor,
-                self._observations_for_date(root, cursor),
-            )
+            if cursor in changed:
+                history[cursor] = changed[cursor]
+            else:
+                history[cursor] = self._observations_for_date(root, cursor)
             cursor += timedelta(days=1)
 
         rows: dict[date, Sequence[Mapping[str, object]] | None] = {}
@@ -583,6 +689,7 @@ class IncrementalSyncPipeline:
                 time_zone=zone.key,
                 physical_day_start=start,
                 physical_day_end=end,
+                logic_version=_NORMALIZER_VERSION,
             )
             rows[metric_date] = build_daily_rows(context, observations, history)
         return rows
@@ -672,11 +779,85 @@ def _select_backfill_chunk(
     *,
     today: date,
 ) -> BackfillChunk | None:
+    """Return the first chunk selected by the current multi-type policy."""
+
+    chunks = _select_backfill_chunks(cursors, today=today)
+    return chunks[0] if chunks else None
+
+
+def _select_backfill_chunks(
+    cursors: Mapping[str, JsonValue],
+    *,
+    today: date,
+) -> tuple[BackfillChunk, ...]:
+    """Select the same recent-first 31-day interval for sleep and exercise.
+
+    The two session types share one HEAD commit, so one historical day cannot
+    become current for sleep without the matching exercise replacement. The
+    Class A monthly gate is evaluated separately before this selector runs.
+    """
+
     schedule = cursors.get(_BACKFILL_META_KEY)
     schedule_mapping = schedule if isinstance(schedule, Mapping) else {}
-    if schedule_mapping.get("last_completed_civil_date") == today.isoformat():
-        return None
-    raw_index = schedule_mapping.get("next_data_type_index", 0)
+    migration_pending = (
+        schedule_mapping.get("policy_version") != _BACKFILL_POLICY_VERSION
+        or schedule_mapping.get("normalizer_version") != _NORMALIZER_VERSION
+    )
+    newest_default = today
+    floor = _BACKFILL_EARLIEST_DATE
+    next_ends: list[date] = []
+    all_complete = True
+    for data_type in _PRIORITY_BACKFILL_DATA_TYPES:
+        cursor = cursors.get(data_type)
+        cursor_mapping = cursor if isinstance(cursor, Mapping) else {}
+        complete = cursor_mapping.get("complete") is True
+        all_complete = all_complete and complete
+        if migration_pending:
+            next_end = newest_default
+        else:
+            next_end = _iso_date(cursor_mapping.get("next_end_date")) or newest_default
+        next_end = min(next_end, newest_default)
+        if not complete or migration_pending:
+            next_ends.append(next_end)
+    if all_complete and not migration_pending:
+        if schedule_mapping.get("last_completed_civil_date") == today.isoformat():
+            return ()
+        legacy = _select_legacy_backfill_chunk(
+            cursors,
+            schedule=schedule_mapping,
+            today=today,
+        )
+        return () if legacy is None else (legacy,)
+
+    # Re-fetching an already-covered partner interval is safe and ensures a
+    # migrated or previously divergent cursor never skips either session type.
+    common_end = max(next_ends, default=newest_default)
+    if common_end < floor:
+        return ()
+    common_start = max(
+        floor,
+        common_end - timedelta(days=_BACKFILL_BATCH_DAYS - 1),
+    )
+    dates = tuple(_inclusive_dates(common_start, common_end))
+    return tuple(
+        BackfillChunk(
+            data_type=data_type,
+            dates=dates,
+            floor=floor,
+        )
+        for data_type in _PRIORITY_BACKFILL_DATA_TYPES
+    )
+
+
+def _select_legacy_backfill_chunk(
+    cursors: Mapping[str, JsonValue],
+    *,
+    schedule: Mapping[str, object],
+    today: date,
+) -> BackfillChunk | None:
+    """Continue the former round-robin after priority session history completes."""
+
+    raw_index = schedule.get("next_data_type_index", 0)
     start_index = (
         raw_index
         if isinstance(raw_index, int)
@@ -684,7 +865,7 @@ def _select_backfill_chunk(
         and 0 <= raw_index < len(SUPPORTED_DATA_TYPES)
         else 0
     )
-    newest_default = today - timedelta(days=2)
+    newest_default = today
     for offset in range(len(SUPPORTED_DATA_TYPES)):
         index = (start_index + offset) % len(SUPPORTED_DATA_TYPES)
         data_type = SUPPORTED_DATA_TYPES[index]
@@ -699,7 +880,7 @@ def _select_backfill_chunk(
             continue
         chunk_start = max(
             floor,
-            next_end - timedelta(days=_BACKFILL_BATCH_DAYS - 1),
+            next_end - timedelta(days=_LEGACY_BACKFILL_BATCH_DAYS - 1),
         )
         return BackfillChunk(
             data_type=data_type,
@@ -716,24 +897,62 @@ def _advance_backfill_cursors(
     *,
     completed_on: date,
 ) -> dict[str, JsonValue]:
-    result = dict(cursors)
-    oldest = min(chunk.dates)
-    complete = oldest <= chunk.floor
-    result[chunk.data_type] = cast(
-        JsonValue,
-        {
-            "next_end_date": (oldest - timedelta(days=1)).isoformat(),
-            "complete": complete,
-        },
+    return _advance_backfill_cursors_many(
+        cursors,
+        (chunk,),
+        completed_on=completed_on,
     )
+
+
+def _advance_backfill_cursors_many(
+    cursors: Mapping[str, JsonValue],
+    chunks: Sequence[BackfillChunk],
+    *,
+    completed_on: date,
+) -> dict[str, JsonValue]:
+    if not chunks:
+        raise ValueError("backfill cursor advancement requires at least one chunk")
+    result = dict(cursors)
+    for chunk in chunks:
+        oldest = min(chunk.dates)
+        complete = oldest <= chunk.floor
+        result[chunk.data_type] = cast(
+            JsonValue,
+            {
+                "next_end_date": (oldest - timedelta(days=1)).isoformat(),
+                "complete": complete,
+            },
+        )
     result[_BACKFILL_META_KEY] = cast(
         JsonValue,
         {
             "last_completed_civil_date": completed_on.isoformat(),
-            "next_data_type_index": chunk.next_data_type_index,
+            "normalizer_version": _NORMALIZER_VERSION,
+            "next_data_type_index": next(
+                (
+                    chunk.next_data_type_index
+                    for chunk in chunks
+                    if chunk.next_data_type_index is not None
+                ),
+                _backfill_schedule_index(cursors),
+            ),
+            "policy_version": _BACKFILL_POLICY_VERSION,
         },
     )
     return result
+
+
+def _backfill_schedule_index(cursors: Mapping[str, JsonValue]) -> int:
+    raw_schedule = cursors.get(_BACKFILL_META_KEY)
+    schedule = raw_schedule if isinstance(raw_schedule, Mapping) else {}
+    raw_index = schedule.get("next_data_type_index", 0)
+    if (
+        isinstance(raw_index, int)
+        and not isinstance(raw_index, bool)
+        and 0 <= raw_index < len(SUPPORTED_DATA_TYPES)
+    ):
+        return raw_index
+    return 0
 
 
 def _backfill_floor(data_type: str, *, today: date) -> date:
@@ -749,7 +968,7 @@ def _plan_fetch_dates(
     sync_advanced: bool,
     today: date,
     zone: ZoneInfo,
-    backfill_chunk: BackfillChunk | None,
+    backfill_chunks: Sequence[BackfillChunk],
 ) -> tuple[dict[str, set[date]], set[str], dict[str, date]]:
     fetch_dates: dict[str, set[date]] = defaultdict(set)
     for event in pending:
@@ -776,8 +995,9 @@ def _plan_fetch_dates(
             reconciled_data_types.add(data_type)
             if data_type not in _HIGH_FREQUENCY_DATA_TYPES and requested_start < fetch_start:
                 truncated[data_type] = fetch_start - timedelta(days=1)
-    elif backfill_chunk is not None:
-        fetch_dates[backfill_chunk.data_type].update(backfill_chunk.dates)
+    elif backfill_chunks:
+        for chunk in backfill_chunks:
+            fetch_dates[chunk.data_type].update(chunk.dates)
     return fetch_dates, reconciled_data_types, truncated
 
 
@@ -857,15 +1077,15 @@ def _reopen_backfill_gaps(
 
 def _next_backfill_cursors(
     root: RootSnapshot | None,
-    backfill_chunk: BackfillChunk | None,
+    backfill_chunks: Sequence[BackfillChunk],
     truncated_reconciliation: Mapping[str, date],
     *,
     completed_on: date,
 ) -> Mapping[str, JsonValue] | None:
-    if backfill_chunk is not None and root is not None:
-        return _advance_backfill_cursors(
+    if backfill_chunks and root is not None:
+        return _advance_backfill_cursors_many(
             root.state.backfill_cursors,
-            backfill_chunk,
+            backfill_chunks,
             completed_on=completed_on,
         )
     if truncated_reconciliation:
@@ -913,6 +1133,16 @@ def _unique_manifest_references(
             raise ValueError(f"manifest URI has conflicting integrity metadata: {reference.uri}")
         by_uri[reference.uri] = reference
     return tuple(by_uri[uri] for uri in sorted(by_uri))
+
+
+def _unique_raw_replacements(
+    replacements: Iterable[Mapping[str, Any]],
+) -> tuple[JsonValue, ...]:
+    by_canonical: dict[bytes, JsonValue] = {}
+    for replacement in replacements:
+        canonical = canonical_json_bytes(replacement)
+        by_canonical[canonical] = cast(JsonValue, dict(replacement))
+    return tuple(by_canonical[key] for key in sorted(by_canonical))
 
 
 def _interval_dates(

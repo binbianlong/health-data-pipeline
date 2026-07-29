@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 
 from health_data_pipeline.storage import (
+    GCS_LIST_PAGE_SIZE,
     ObjectNotFound,
     ObjectStore,
     PreconditionFailed,
@@ -19,6 +21,7 @@ from health_data_pipeline.storage import (
 CLASS_A_STATE_PREFIX = "state/budget/class-a"
 CLASS_A_NOTICE_THRESHOLD = 3_000
 CLASS_A_WARNING_THRESHOLD = 4_000
+CLASS_A_BACKFILL_PAUSE_THRESHOLD = CLASS_A_NOTICE_THRESHOLD
 DEFAULT_CAS_ATTEMPTS = 4
 
 
@@ -42,10 +45,12 @@ class ClassABudgetDecision:
     warning_level: WarningLevel
 
     def allows(self, work: WorkKind) -> bool:
-        """Return true because thresholds are notification-only guardrails."""
+        """Keep current data flowing while pausing optional historical work."""
 
-        del work
-        return True
+        return not (
+            work is WorkKind.BACKFILL
+            and self.estimated_operations >= CLASS_A_BACKFILL_PAUSE_THRESHOLD
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,7 +135,7 @@ class ClassAUsageStateError(RuntimeError):
 
 
 class ClassACountingObjectStore:
-    """Count Job-side Class A attempts while delegating all storage behavior."""
+    """Count estimated GCS Class A attempts while delegating storage behavior."""
 
     def __init__(self, store: ObjectStore) -> None:
         self._store = store
@@ -162,7 +167,19 @@ class ClassACountingObjectStore:
 
     def list(self, prefix: str) -> Iterable[StoredObject]:
         self._increment()
-        return self._store.list(prefix)
+        objects = tuple(self._store.list(prefix))
+        additional_pages = _estimated_list_pages(len(objects)) - 1
+        if additional_pages:
+            self._increment(additional_pages)
+        return objects
+
+    def list_names(self, prefix: str) -> Iterable[str]:
+        self._increment()
+        names = tuple(self._store.list_names(prefix))
+        additional_pages = _estimated_list_pages(len(names)) - 1
+        if additional_pages:
+            self._increment(additional_pages)
+        return names
 
     def delete(self, object_name: str, *, if_generation_match: int) -> None:
         self._store.delete(
@@ -182,9 +199,19 @@ class ClassACountingObjectStore:
                 raise ValueError("cannot acknowledge uncounted Class A operations")
             self._pending_operations -= operations
 
-    def _increment(self) -> None:
+    def _increment(self, operations: int = 1) -> None:
+        if operations < 1:
+            raise ValueError("operations must be positive")
         with self._lock:
-            self._pending_operations += 1
+            self._pending_operations += operations
+
+
+def _estimated_list_pages(item_count: int) -> int:
+    """Match the explicit GCS adapter page size, including an empty response."""
+
+    if item_count < 0:
+        raise ValueError("item_count must be non-negative")
+    return max(1, math.ceil(item_count / GCS_LIST_PAGE_SIZE))
 
 
 ClassAEventEmitter = Callable[[str, Mapping[str, object]], None]
@@ -321,6 +348,32 @@ def class_a_budget_decision(estimated_operations: int) -> ClassABudgetDecision:
     else:
         level = WarningLevel.NORMAL
     return ClassABudgetDecision(estimated_operations, level)
+
+
+def class_a_backfill_allowed(
+    store: ObjectStore,
+    *,
+    now: datetime,
+) -> bool:
+    """Return whether optional backfill may start in the current UTC month.
+
+    A missing month starts at zero. Invalid accounting state fails closed for
+    backfill only; current synchronization does not call this gate.
+    """
+
+    current = _aware_utc(now)
+    month = current.strftime("%Y-%m")
+    try:
+        stored = store.get(class_a_month_state_path(month))
+    except ObjectNotFound:
+        return True
+    try:
+        state = ClassAMonthState.from_bytes(stored.data)
+    except ClassAUsageStateError:
+        return False
+    if state.month != month:
+        return False
+    return class_a_budget_decision(state.estimated_operations).allows(WorkKind.BACKFILL)
 
 
 def class_a_month_state_path(month: str) -> str:

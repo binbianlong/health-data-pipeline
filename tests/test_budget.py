@@ -12,6 +12,7 @@ from health_data_pipeline.budget import (
     ClassAUsageReporter,
     WarningLevel,
     WorkKind,
+    class_a_backfill_allowed,
     class_a_budget_decision,
     class_a_month_state_path,
 )
@@ -107,6 +108,9 @@ class ConflictOnceObjectStore:
     def list(self, prefix: str) -> Iterable[StoredObject]:
         return self._delegate.list(prefix)
 
+    def list_names(self, prefix: str) -> Iterable[str]:
+        return self._delegate.list_names(prefix)
+
     def delete(self, object_name: str, *, if_generation_match: int) -> None:
         self._delegate.delete(
             object_name,
@@ -126,6 +130,16 @@ def test_counting_store_counts_put_and_list_attempts_only() -> None:
     store.delete(created.name, if_generation_match=created.generation)
 
     assert store.pending_operations() == 3
+
+
+def test_counting_store_counts_each_explicit_gcs_list_page() -> None:
+    raw = InMemoryObjectStore(clock=lambda: NOW)
+    for index in range(1_001):
+        _put(raw, f"webhook-events/{index:04d}.json")
+    store = ClassACountingObjectStore(raw)
+
+    assert len(tuple(store.list_names("webhook-events/"))) == 1_001
+    assert store.pending_operations() == 2
 
 
 def test_reporter_adds_job_operations_and_its_own_state_write() -> None:
@@ -244,8 +258,25 @@ def test_four_thousand_is_warning_not_collection_stop() -> None:
     assert decision.allows(WorkKind.VIEW_RECOVERY)
 
 
-def test_warning_does_not_mechanically_stop_nonessential_work() -> None:
+def test_notice_pauses_only_optional_backfill() -> None:
+    below = class_a_budget_decision(2_999)
+    notice = class_a_budget_decision(3_000)
     decision = class_a_budget_decision(4_000)
-    assert decision.allows(WorkKind.BACKFILL)
+
+    assert below.allows(WorkKind.BACKFILL)
+    assert not notice.allows(WorkKind.BACKFILL)
+    assert not decision.allows(WorkKind.BACKFILL)
     assert decision.allows(WorkKind.GARBAGE_COLLECTION)
     assert decision.allows(WorkKind.REBUILD)
+
+
+def test_backfill_gate_uses_only_current_utc_month_state() -> None:
+    store = InMemoryObjectStore(clock=lambda: NOW)
+    assert class_a_backfill_allowed(store, now=NOW)
+    _write_month_state(store, 3_000)
+
+    assert not class_a_backfill_allowed(store, now=NOW)
+    assert class_a_backfill_allowed(
+        store,
+        now=datetime(2026, 8, 1, tzinfo=UTC),
+    )

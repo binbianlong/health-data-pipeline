@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Callable, Mapping, Sequence
 from datetime import date
+from math import isfinite
 from typing import Any, cast
 from zoneinfo import ZoneInfo
 
@@ -31,6 +33,10 @@ MAX_RICH_TEXT_CHARS = 1_900
 HTTP_SUCCESS_MIN = 200
 HTTP_SUCCESS_MAX_EXCLUSIVE = 300
 HTTP_NO_CONTENT = 204
+HTTP_TOO_MANY_REQUESTS = 429
+NOTION_REQUEST_ATTEMPTS = 4
+DEFAULT_RETRY_AFTER_SECONDS = 1.0
+MAX_RETRY_AFTER_SECONDS = 60.0
 DATA_STATUS_OPTIONS = (
     "PROVISIONAL",
     "CANONICAL_SYNCED",
@@ -54,12 +60,14 @@ class NotionDataSourceGateway(NotionGateway):
         token: str,
         data_source_id: str,
         client: httpx.Client | None = None,
+        sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         if not token:
             raise ValueError("Notion token must not be empty")
         if not data_source_id:
             raise ValueError("Notion data source ID must not be empty")
         self._data_source_id = data_source_id
+        self._sleeper = sleeper
         self._client = client or httpx.Client(
             base_url="https://api.notion.com",
             headers={
@@ -239,7 +247,13 @@ class NotionDataSourceGateway(NotionGateway):
         json: Mapping[str, Any] | None = None,
         params: Mapping[str, str | int] | None = None,
     ) -> Mapping[str, Any]:
-        response = self._client.request(method, path, json=json, params=params)
+        for attempt in range(NOTION_REQUEST_ATTEMPTS):
+            response = self._client.request(method, path, json=json, params=params)
+            if response.status_code != HTTP_TOO_MANY_REQUESTS:
+                break
+            if attempt == NOTION_REQUEST_ATTEMPTS - 1:
+                break
+            self._sleeper(_retry_after_seconds(response.headers.get("Retry-After")))
         if not HTTP_SUCCESS_MIN <= response.status_code < HTTP_SUCCESS_MAX_EXCLUSIVE:
             raise NotionApiError(f"Notion request failed ({response.status_code})")
         if response.status_code == HTTP_NO_CONTENT:
@@ -248,6 +262,18 @@ class NotionDataSourceGateway(NotionGateway):
         if not isinstance(payload, Mapping):
             raise NotionApiError("Notion response must be a JSON object")
         return cast(Mapping[str, Any], payload)
+
+
+def _retry_after_seconds(raw_value: str | None) -> float:
+    if raw_value is None:
+        return DEFAULT_RETRY_AFTER_SECONDS
+    try:
+        value = float(raw_value)
+    except ValueError:
+        return DEFAULT_RETRY_AFTER_SECONDS
+    if not isfinite(value) or value < 0:
+        return DEFAULT_RETRY_AFTER_SECONDS
+    return min(value, MAX_RETRY_AFTER_SECONDS)
 
 
 class SnapshotViewSource:
@@ -310,13 +336,15 @@ class SnapshotViewSource:
         available = self._available_dates(root)
         commit_date = root.change_set.created_at.astimezone(ZoneInfo(root.state.time_zone)).date()
         last = max(available[-1], commit_date) if available else commit_date
-        by_date = {value: self._step_count(root, value) for value in available}
+        target_dates = tuple(
+            date.fromordinal(last.toordinal() - offset) for offset in range(6, -1, -1)
+        )
         return tuple(
             StepSample(
-                metric_date=date.fromordinal(last.toordinal() - offset),
-                steps=by_date.get(date.fromordinal(last.toordinal() - offset)),
+                metric_date=metric_date,
+                steps=self._step_count(root, metric_date),
             )
-            for offset in range(6, -1, -1)
+            for metric_date in target_dates
         )
 
     def observations_for_date(

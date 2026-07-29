@@ -25,7 +25,7 @@ resource "google_logging_metric" "class_a_warning" {
   project     = var.project_id
   name        = "${var.name_prefix}/class_a_warning"
   description = "Application warning that the monthly Class A estimate crossed a warning threshold."
-  filter      = "resource.type=\"cloud_run_job\" AND jsonPayload.event=\"class_a_warning\""
+  filter      = "(resource.type=\"cloud_run_job\" OR resource.type=\"cloud_run_revision\") AND jsonPayload.event=\"class_a_warning\""
 
   metric_descriptor {
     metric_kind = "DELTA"

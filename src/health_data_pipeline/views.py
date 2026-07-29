@@ -23,6 +23,18 @@ NOTION_STATE_PATH = "state/notion/sync.json"
 NOTION_PAGE_STATE_PREFIX = "state/notion/pages"
 STEPS_HEAD_PATH = "state/views/steps-head.json"
 
+_NOTION_METRIC_LABELS = {
+    "sleep_minutes": "睡眠時間",
+    "sleep_rem_minutes": "REM睡眠",
+    "sleep_deep_minutes": "深い睡眠",
+    "sleep_light_minutes": "浅い睡眠",
+    "sleep_awake_minutes": "覚醒時間",
+    "exercise_minutes": "運動時間",
+}
+_NOTION_METRIC_ORDER = {
+    metric_name: index for index, metric_name in enumerate(_NOTION_METRIC_LABELS)
+}
+
 
 class ViewUpdateError(RuntimeError):
     """A materialized view could not be safely updated."""
@@ -201,8 +213,29 @@ def _format_coverage(value: float | None) -> str:
     return "unknown" if value is None else f"{value * 100:.1f}%"
 
 
+def _notion_metric_sort_key(metric: DailyMetric) -> tuple[int, int | str, str]:
+    order = _NOTION_METRIC_ORDER.get(metric.metric_name)
+    if order is not None:
+        return (0, order, metric.statistic)
+    return (1, metric.metric_name, metric.statistic)
+
+
 def render_notion_body(view: DailyView) -> str:
     """Render a stable, compact table intended for ChatGPT consumption."""
+
+    metrics = list(view.metrics)
+    present = {(metric.metric_name, metric.statistic) for metric in metrics}
+    metrics.extend(
+        DailyMetric(
+            metric_name=metric_name,
+            statistic="value",
+            value=None,
+            unit="min",
+            status="MISSING",
+        )
+        for metric_name in _NOTION_METRIC_LABELS
+        if (metric_name, "value") not in present
+    )
 
     lines = [
         f"Date: {view.metric_date.isoformat()}",
@@ -222,11 +255,10 @@ def render_notion_body(view: DailyView) -> str:
         ),
         "|---|---:|---|---:|---:|---:|---:|---|---:|",
     ]
-    for metric in sorted(view.metrics, key=lambda item: (item.metric_name, item.statistic)):
+    for metric in sorted(metrics, key=_notion_metric_sort_key):
+        metric_label = _NOTION_METRIC_LABELS.get(metric.metric_name, metric.metric_name)
         label = (
-            metric.metric_name
-            if metric.statistic == "value"
-            else f"{metric.metric_name} ({metric.statistic})"
+            metric_label if metric.statistic == "value" else f"{metric_label} ({metric.statistic})"
         )
         coverage = _format_coverage(metric.coverage)
         flags = ",".join(sorted(metric.quality_flags))
@@ -286,7 +318,7 @@ class NotionViewService:
     def request_generation(self, generation: int) -> bool:
         """Monotonically raise desired_generation.
 
-        A CAS conflict is safe to retry from the caller or the next hourly job.
+        A CAS conflict is safe to retry from the caller or the next recovery job.
         """
 
         return request_notion_generation(self._store, generation)

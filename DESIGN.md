@@ -79,7 +79,7 @@ flowchart LR
     Service["Cloud Run Service（Invoker IAM check無効）<br/>Webhook / OAuth / View / SVG"]
     Tasks["Cloud Tasks<br/>HTTP target 1 queue"]
     RunAPI["Cloud Run Jobs API<br/>jobs.run"]
-    Scheduler["Cloud Scheduler<br/>1時間ごと"]
+    Scheduler["Cloud Scheduler<br/>3時間ごとの回収"]
     Job["Cloud Run Job<br/>同期・回収・バックフィル"]
     GCS["Cloud Storage<br/>Blob / Snapshot / HEAD"]
     Notion["Notion<br/>日次・暦週・暦月"]
@@ -112,7 +112,7 @@ flowchart LR
 | Cloud Run Service | 1 | Webhook、OAuth setup、View更新、歩数SVG |
 | Cloud Run Job | 1 | 同期、回収、日次計算、バックフィル、Class A集計 |
 | Cloud Tasks Queue | 1 | Job起動とView更新のHTTP task |
-| Cloud Scheduler Job | 1 | Cloud Run Jobを毎時起動 |
+| Cloud Scheduler Job | 1 | Cloud Run Jobを3時間ごとに回収起動 |
 | 健康データGCS Bucket | 1 | 原本、日次、Snapshot、state |
 | Terraform state GCS Bucket | 1 | Terraform backend |
 | Secret Manager | 1サービス | OAuth、Notion、署名・暗号鍵 |
@@ -202,26 +202,26 @@ Cloud Tasksの明示Task名による冪等性を保ちながら、通常は10分
 Job起動を1回に抑える。最初のWebhookで即時dispatchすると、後続Webhookが
 削除済みTask名と重複して取り残されるため、即時実行はしない。
 
-Jobs APIの成功はExecution作成成功を意味し、データcommit成功を意味しない。Job失敗時もイベントはGCSに残り、次回Taskまたは毎時Jobが回収する。
+Jobs APIの成功はExecution作成成功を意味し、データcommit成功を意味しない。Job失敗時もイベントはGCSに残り、次回Taskまたは3時間ごとのJobが回収する。
 Jobは同期処理とlease解放後にHEADの`processed_objects`とGCSイベントを再照合する。
 未処理イベントがあれば、完了時刻が属するbucketの次境界Taskを登録する。すでに
 同bucketのTaskがあれば明示Task名の重複として合流する。これにより、長時間Job中に
-別bucketの起動がleaseで空振りしても、毎時回収を待たずに再起動できる。
+別bucketの起動がleaseで空振りしても、定期回収を待たずに再起動できる。
 この終了時再照合とTask登録はcommit後のwake-up最適化であり、列挙、Snapshot読込、
 Task登録のいずれかが失敗しても成功済みHEAD commitを失敗扱いにしない。失敗時は
-種類だけを記録し、GCSイベントを残して毎時Schedulerへ委ねる。
+種類だけを記録し、GCSイベントを残して3時間ごとのSchedulerへ委ねる。
 
 ### 6.3 Cloud Scheduler
 
-Cloud Schedulerも同じJobs APIへ毎時`POST`する。
+Cloud Schedulerも同じJobs APIへ3時間ごとに`POST`する。
 
 - auth: OAuth access token
 - service account: Scheduler専用service account
 - IAM: 対象Jobに`roles/run.invoker`
 - timezone: `Asia/Tokyo`
-- schedule: 毎時
+- schedule: 3時間ごと（`0 */3 * * *`）
 
-毎時JobはWebhook欠落、Task作成失敗、Job失敗、Notion未反映を回収する。
+定期JobはWebhook欠落、Task作成失敗、Job失敗、Notion未反映を回収する。Webhookからの通常経路はCloud Tasksで起動するため、この変更は通常の最新反映速度を下げない。
 
 ### 6.4 View更新Task
 
@@ -299,7 +299,8 @@ Notion更新はJobまたは内部View更新Taskへ分離する。
 10. HEADをCAS更新する。
 11. 成功時だけView更新Taskを作成する。
 12. 同期状態とClass A推定metricを出力する。
-13. 現在処理がなく、Asia/Tokyoで当日未実行なら14日分のバックフィルを進める。
+13. 現在処理がなくClass A予算内なら、睡眠と運動の同一31日範囲を優先してバックフィルする。
+14. 睡眠と運動の全期間が完了した後は、他のdata typeを1日1種類・14日分ずつバックフィルする。
 
 Notion障害はデータcommitを失敗させない。
 
@@ -689,16 +690,19 @@ GCS上のAPI blobとnormalized `SAMPLE`、`INTERVAL`、`SESSION`、`DAILY`は期
 ### 14.5 Backfill
 
 - 高頻度詳細: 直近90日だけ
-- 日次rollup: `2009-01-01`まで14 civil日単位で後方処理
-- 睡眠・運動session: `2009-01-01`まで14 civil日単位で後方処理
+- 睡眠・運動session: `2009-01-01`まで、両data typeの同一31 civil日範囲を1 commitとして新しい日から後方処理
+- 睡眠・運動は空き実行ごとに1範囲進め、Webhookと現在照合を常に優先する
+- Notionのapplied generationがHEADに追いついていない間は、最新同期を継続して任意の過去backfillだけを待機する
+- 睡眠・運動の完了後、日次rollupなどの既存backfillを`2009-01-01`まで1日1 data type・14 civil日単位で後方処理
+- 高頻度詳細のlegacy backfillは14日を一括でメモリへ載せず、1 civil日ずつ取得・保存する
 - 現在照合が90日で切り詰められた場合、非高頻度data typeの未照合部分をbackfill cursorへ戻す
-- Asia/Tokyoのcivil dateごとに1回、1 data typeだけ処理する
 - ページ単位checkpointは持たない
 - chunk完了時だけRoot Snapshotのbackfill cursorを進める
 - API途中失敗またはHEAD CAS失敗時はcursorを進めない
 - 現在データを常に優先する
 - 20分SLOの対象外とする
-- Class A 4,000回は警告であり停止条件にはしない
+- 当月の推定Class A操作が3,000回に達したらbackfillだけを停止し、UTCの翌月に自動再開する
+- 現在同期、Webhook、HEAD commit、Notion／SVG回収はClass A gateで停止しない
 
 ## 15. civil timeと日次処理
 
@@ -789,7 +793,7 @@ daily-canonical/
   "time_zone": "Asia/Tokyo",
   "physical_day_start": "2026-07-27T15:00:00Z",
   "physical_day_end": "2026-07-28T15:00:00Z",
-  "logic_version": "daily-v1"
+  "logic_version": "daily-v2"
 }
 ```
 
@@ -942,7 +946,11 @@ Snapshot、Year Shard、daily revisionには単純なprefix lifecycleを設定�
 - Data status
 - Source HEAD generation
 - Fitbit last sync time
-- 睡眠
+- 睡眠時間
+- REM睡眠
+- 深い睡眠
+- 浅い睡眠
+- 覚醒時間
 - 心拍
 - HRV
 - SpO2
@@ -955,7 +963,7 @@ Snapshot、Year Shard、daily revisionには単純なprefix lifecycleを設定�
 - 各指標の暦月平均
 - coverageとquality flag
 
-Notion本文にはChatGPTが読みやすい固定順の短い表を生成する。API原本や高頻度sampleは書かない。
+Notion本文にはChatGPTが読みやすい固定順の短い表を生成する。睡眠時間、REM睡眠、深い睡眠、浅い睡眠、覚醒時間、運動時間の保存上の`metric_name`はそれぞれ`sleep_minutes`、`sleep_rem_minutes`、`sleep_deep_minutes`、`sleep_light_minutes`、`sleep_awake_minutes`、`exercise_minutes`とし、schemaはlong形式のv1を維持する。値が取得できない項目も表から省略せず`欠損`と表示し、0とは区別する。API原本や高頻度sampleは書かない。
 
 初回はtitleプロパティを1つ持つ空のdata sourceを作成し、integrationへ共有する。`make notion-configure`はNotion API `2026-03-11`を使い、次のschemaを冪等に作成または修復する。
 
@@ -996,7 +1004,7 @@ state/notion/sync.json
 - Notion障害時はGCS commitを再実行しない。
 - page IDとcontent hashはページ管理中無期限保存する。
 
-Cloud Tasks retryにより同じgenerationが再実行されても、同じ内容hashならNotion更新を省略する。
+Cloud Tasks retryにより同じgenerationが再実行されても、同じ内容hashならNotion更新を省略する。Notionが429を返した場合は`Retry-After`に従い、1 requestあたり最大4試行まで再実行する。
 
 ## 20. GitHub歩数SVG
 
@@ -1227,7 +1235,7 @@ OR
 
 Root Snapshotへ`fitbit_last_sync_time`を保存する。
 
-毎時Jobは最終同期からの経過秒数をCloud Monitoring metricとして出力する。
+Jobは最終同期からの経過秒数をCloud Monitoring metricとして出力する。
 
 - 5日未満: 通知なし
 - 5日以上: メール通知
@@ -1245,15 +1253,15 @@ Root Snapshotへ`fitbit_last_sync_time`を保存する。
 
 健康データGCSはStandard storage、soft delete無効、object versioning無効、Autoclass無効とする。
 
-Cloud Run Job内のGCS `put` / `list`試行を数え、Job終了時にUTC月単位のstateへCAS加算する。`get` / `delete`、WebhookやView handlerなどService側の操作はv1の推定対象外とし、bucket全体の容量警告とCloud Billing Budgetを併用する。月次state自身の書込試行とCAS競合時の再試行も推定値へ含めるが、推定stateの更新失敗によって、すでに成功した健康データのcommitを失敗扱いにはしない。
+Cloud Run JobとService内のGCS `put` / `list`試行を数え、各JobまたはHTTP request終了時にUTC月単位のstateへCAS加算する。`get`と無料操作である`delete`は推定対象外とする。Serviceでは同一instance内の集計更新をlockで直列化し、instance間の競合はGCS CASで解決する。月次state自身の書込試行とCAS競合時の再試行も推定値へ含めるが、推定stateの更新失敗によって、すでに成功した健康データのcommitやHTTP処理を失敗扱いにはしない。bucket全体の容量警告とCloud Billing Budgetも併用する。
 
 | 当月推定 | 動作 |
 |---:|---|
 | 3,000未満 | 通常 |
-| 3,000以上 | 予告通知 |
+| 3,000以上 | 予告通知、過去backfillだけ停止 |
 | 4,000以上 | 強い警告 |
 
-4,000回は収集停止条件ではない。
+us-central1のCloud Storage Always FreeはClass A月5,000回である。3,000回で任意の過去処理を止め、開始済みbatchの上振れ、Cloud Storage側との集計差、現在同期に2,000回の余白を残す。UTC月が変わると新しい月次stateを使うため、backfillは自動再開する。4,000回は現在収集の停止条件ではない。object listは1,000件単位のpage数で数え、Webhookはmetadataだけを列挙して未処理objectの本文だけを取得する。
 
 - Webhook保存
 - 現在データ取得
@@ -1263,7 +1271,7 @@ Cloud Run Job内のGCS `put` / `list`試行を数え、Job終了時にUTC月単�
 
 は継続する。
 
-backfillとrebuildは延期できる。Cloud Billing Budgetも別に設定する。Budget通知は課金を自動停止しないため、完全無料を保証するものではない。
+rebuildは手動実行とする。Cloud Billing Budgetも別に設定する。無料枠の条件自体やGoogle側で集計される未観測操作は変更され得るため、内部gateに加えてBilling通知も維持する。
 
 ## 27. 障害時の動作
 
@@ -1271,13 +1279,14 @@ backfillとrebuildは延期できる。Cloud Billing Budgetも別に設定する
 |---|---|
 | Webhook認証失敗 | 401/403、保存なし |
 | Webhook GCS失敗 | 5xx、Google再送 |
-| Job起動Task作成失敗 | 5xx、保存eventを毎時回収 |
+| Job起動Task作成失敗 | 5xx、保存eventを3時間ごとに回収 |
 | Jobs API起動失敗 | Cloud Tasks retry |
-| Job Execution失敗 | eventを未処理のまま次回Taskまたは毎時Jobで回収 |
+| Job Execution失敗 | eventを未処理のまま次回Taskまたは3時間ごとのJobで回収 |
+| Notion反映遅延 | 最新同期は継続し、NotionがHEADへ追いつくまで過去backfillだけを待機 |
 | API page途中失敗 | SnapshotとHEAD更新なし |
 | 正規化失敗 | SnapshotとHEAD更新なし |
 | HEAD CAS失敗 | 削除・再試行せずJob正常終了 |
-| HEAD成功・終了時回収失敗 | HEADを維持し、未処理eventを毎時Jobで回収 |
+| HEAD成功・終了時回収失敗 | HEADを維持し、未処理eventを3時間ごとのJobで回収 |
 | HEAD成功・View Task失敗 | 次回Jobがdesired generationから回収 |
 | Notion失敗 | GCS commitを維持しNotionだけretry |
 | SVG生成失敗 | 旧pointerを維持し次回retry |
@@ -1291,11 +1300,11 @@ backfillとrebuildは延期できる。Cloud Billing Budgetも別に設定する
 | 指標 | 目標 |
 |---|---|
 | 有効Webhook受信からHEAD commit | 通常時P95 20分以内（最大10分のbucket待機を含む） |
-| Task／Execution失敗時の毎時回収 | 70分以内 |
-| Notion反映 | HEAD commit後70分以内 |
-| GitHub歩数更新 | HEAD commit後70分以内 |
-| Scheduler Job未実行検知 | 2時間以内 |
-| Fitbit未同期通知 | 5日到達後70分以内 |
+| Task／Execution失敗時の定期回収 | 190分以内 |
+| Notion反映 | 通常時はHEAD commit後70分以内、Task失敗時の定期回収は190分以内 |
+| GitHub歩数更新 | 通常時はHEAD commit後70分以内、Task失敗時の定期回収は190分以内 |
+| Scheduler Job未実行検知 | 7時間以内 |
+| Fitbit未同期通知 | 5日到達後190分以内 |
 
 対象外：
 
@@ -1533,7 +1542,9 @@ BigQuery API、dataset、table、IAMは作らない。
 - raw cache期限切れ後もdaily-canonicalを読める。
 - audit参照がraw payloadを永久保持しない。
 - callback code、state、queryが`_Default` log bucketへ残らない。
-- Class A 4,000回警告後も現在データ収集が継続する。
+- Class A 3,000回到達後はbackfillだけ停止し、現在データ収集が継続する。
+- UTC月が変わると停止中のbackfillが自動再開する。
+- 睡眠時間、4睡眠stage、運動時間がNotionへ固定順で反映される。
 - GitHub endpointから歩数以外を取得できない。
 - Firebase Hosting経由のOAuth setupで`__session`がcallbackまで維持される。
 - Firebase Hostingに未定義のpathがCloud Runへrewriteされない。
@@ -1584,7 +1595,7 @@ Terraform bootstrap、main基盤、secret version、Cloud Run初回deployの完�
 2. `make notion-configure`を実行し、19.1のNotion schemaを作成または修復する。
 3. `make subscriber-upsert`を実行する。所有者未登録でもGoogleのendpoint verificationには応答するが、通常のWebhook通知はOAuth完了まで拒否する。
 4. `make setup-code`を実行し、10分有効のcodeを`GET /setup`で表示されるformへ入力してOAuthを完了する。
-5. 毎時SchedulerまたはWebhookで最初のHEAD commitが作られ、NotionとSVGへ反映されることを確認する。
+5. 3時間ごとのSchedulerまたはWebhookで最初のHEAD commitが作られ、NotionとSVGへ反映されることを確認する。
 
 `make subscriber-upsert`は次を冪等に実行する。
 
@@ -1598,7 +1609,7 @@ Terraform bootstrap、main基盤、secret version、Cloud Run初回deployの完�
 - mutation responseのOperation errorを拒否し、再listでSubscriberが`ACTIVE`になったことを確認してから成功とする。
 - 認証ありのendpoint verificationへ`201 Created`、認証なしへ`401 Unauthorized`を返す。
 
-Cloud Run ServiceとWebhook authorization secret versionが存在してから実行する。対応data type、endpoint URL、authorization secretを変更した場合は再実行する。Subscriber登録に失敗しても毎時Schedulerによる照合は動くが、20分SLOを満たすためには登録成功が必要である。
+Cloud Run ServiceとWebhook authorization secret versionが存在してから実行する。対応data type、endpoint URL、authorization secretを変更した場合は再実行する。Subscriber登録に失敗しても3時間ごとのSchedulerによる照合は動くが、20分SLOを満たすためには登録成功が必要である。
 
 事前に必要な情報：
 

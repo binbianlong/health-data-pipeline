@@ -21,19 +21,63 @@ resource "google_monitoring_alert_policy" "job_not_completed" {
   enabled      = !var.scheduler_paused
 
   conditions {
-    display_name = "No completed execution for two hours"
+    display_name = "No completed execution for seven hours"
 
     condition_absent {
       filter = join(" AND ", [
         "resource.type = \"cloud_run_job\"",
         "metric.type = \"run.googleapis.com/job/completed_execution_count\"",
+        "metric.label.result = \"succeeded\"",
         "resource.label.job_name = \"${local.job_name}\"",
         "resource.label.location = \"${var.region}\"",
       ])
-      duration = "7200s"
+      duration = "25200s"
 
       aggregations {
-        alignment_period   = "3600s"
+        alignment_period   = "10800s"
+        per_series_aligner = "ALIGN_SUM"
+      }
+    }
+  }
+
+  notification_channels = var.notification_email == "" ? [] : [
+    google_monitoring_notification_channel.email[0].name,
+  ]
+
+  alert_strategy {
+    auto_close = "86400s"
+  }
+
+  depends_on = [
+    google_cloud_run_v2_job.sync,
+    google_project_service.required["monitoring.googleapis.com"],
+  ]
+}
+
+resource "google_monitoring_alert_policy" "job_failed" {
+  count = var.deploy_workloads ? 1 : 0
+
+  project      = var.project_id
+  display_name = "Health pipeline job failed"
+  combiner     = "OR"
+
+  conditions {
+    display_name = "A scheduled or webhook execution failed"
+
+    condition_threshold {
+      filter = join(" AND ", [
+        "resource.type = \"cloud_run_job\"",
+        "metric.type = \"run.googleapis.com/job/completed_execution_count\"",
+        "metric.label.result = \"failed\"",
+        "resource.label.job_name = \"${local.job_name}\"",
+        "resource.label.location = \"${var.region}\"",
+      ])
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0
+      duration        = "0s"
+
+      aggregations {
+        alignment_period   = "300s"
         per_series_aligner = "ALIGN_SUM"
       }
     }
@@ -59,10 +103,26 @@ resource "google_monitoring_alert_policy" "class_a_warning" {
   combiner     = "OR"
 
   conditions {
-    display_name = "Class A warning event emitted"
+    display_name = "Class A warning emitted by Job"
 
     condition_threshold {
       filter          = "metric.type = \"logging.googleapis.com/user/${google_logging_metric.class_a_warning.name}\" AND resource.type = \"cloud_run_job\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = 0
+      duration        = "0s"
+
+      aggregations {
+        alignment_period   = "300s"
+        per_series_aligner = "ALIGN_SUM"
+      }
+    }
+  }
+
+  conditions {
+    display_name = "Class A warning emitted by Service"
+
+    condition_threshold {
+      filter          = "metric.type = \"logging.googleapis.com/user/${google_logging_metric.class_a_warning.name}\" AND resource.type = \"cloud_run_revision\""
       comparison      = "COMPARISON_GT"
       threshold_value = 0
       duration        = "0s"

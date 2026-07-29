@@ -4,6 +4,8 @@ Fitbit Sense 2のGoogle Health APIデータをGCSへ保存し、日次値・月�
 
 BigQueryは使用しません。HEAD、Root Snapshot、年単位Shard、content-addressedな日次revisionにより、将来BigQueryを追加しても取得・日次計算を作り直さない構造です。詳細設計は[DESIGN.md](DESIGN.md)を参照してください。
 
+Notionには歩数、心拍、HRV、SpO2などに加え、睡眠時間、REM睡眠、深い睡眠、浅い睡眠、覚醒時間、運動時間を日次long形式で表示します。各項目にはその日の値、月曜始まりの暦週平均、暦月の月初来平均を含め、取得できなかった値は0ではなく`欠損`と明示します。
+
 ## 構成
 
 ```text
@@ -15,7 +17,7 @@ Cloud Run Service（Invoker IAM check無効、内部routeはアプリでOIDC保�
                   ↓ GCS event
              Cloud Tasks ───────────────→ Cloud Run Jobs API
                   ↓ OIDC                           ↑
-             View更新                       Cloud Scheduler
+             View更新                 Cloud Scheduler（3時間ごとの保険）
                                                    ↓
                                       Cloud Run Job → Google Health API
                                                    ↓
@@ -375,7 +377,7 @@ Webhook本文は単一通知objectと通知objectのarrayの両方を受け付�
 batch全体でJob起動Taskを1件だけ作成します。
 
 Jobs APIの成功はExecution作成成功であり、HEAD commit成功ではありません。
-実行失敗やCAS競合後もGCSに未処理イベントを残し、次回Taskまたは毎時Jobが
+実行失敗やCAS競合後もGCSに未処理イベントを残し、次回Taskまたは3時間ごとの回収Jobが
 回収します。
 
 ## データと安全性
@@ -388,9 +390,12 @@ Jobs APIの成功はExecution作成成功であり、HEAD commit成功ではあ�
 - CAS失敗時は同じJob内で再試行せず、objectも即時削除しません。
 - NotionとSVGは適用済みHEAD generationを比較し、古い値へ逆行しません。
 - BigQuery API、dataset、table、client dependencyは含みません。
-- バックフィルは現在同期を常に優先し、空き実行で1日1 data type・14 civil日だけ進めます。
+- バックフィルは現在同期を常に優先します。睡眠と運動は同じ31 civil日範囲を1回のHEAD commitで新しい日から遡り、空き実行ごとに進めます。
+- 睡眠と運動が完了した後は、他のdata typeを1日1種類・14 civil日ずつ進めます。高頻度詳細は日単位取得のままにして、メモリ使用量を制限します。
 - 高頻度詳細は直近90日、その他は`2009-01-01`までを上限とし、成功したHEADでだけcursorを進めます。
-- Class A月4,000回は強い警告として扱い、現在同期やバックフィルの機械的な停止条件にはしません。
+- 保険のSchedulerは3時間ごとに実行し、Webhookによる通常の最新反映速度は変えません。
+- 当月の推定Class A操作が3,000回に達したら過去バックフィルだけを停止し、UTCの翌月に自動再開します。現在同期、Webhook、Notion回収は停止しません。
+- Class A 4,000回は強い警告です。Cloud Run JobとServiceのGCS書込み・一覧取得を同じ月次stateへ集計し、公式のus-central1無料枠5,000回に対して余白を残します。
 - 高容量のraw cacheは30〜365日のGCS lifecycleで削除し、小容量のcanonical／Snapshot／Shardはv1では自動削除しません。健康データbucketが1 GiBを超えたら見直し通知を送ります。
 
 日次long rowの期間は`period_kind`で区別します。

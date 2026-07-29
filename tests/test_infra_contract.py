@@ -96,9 +96,11 @@ def test_deploy_identity_and_scheduler_start_are_fail_closed() -> None:
     assert "assertion.repository_id == '${var.github_repository_id}'" in workload_identity
     assert '"attribute.repository_id" = "assertion.repository_id"' in workload_identity
     assert "paused           = var.scheduler_paused" in scheduler
-    assert "enabled      = !var.scheduler_paused" in (
-        _PROJECT_ROOT / "infra/main/monitoring.tf"
-    ).read_text(encoding="utf-8")
+    assert 'schedule         = "0 */3 * * *"' in scheduler
+    monitoring = (_PROJECT_ROOT / "infra/main/monitoring.tf").read_text(encoding="utf-8")
+    assert "enabled      = !var.scheduler_paused" in monitoring
+    assert 'duration = "25200s"' in monitoring
+    assert 'alignment_period   = "10800s"' in monitoring
 
 
 def test_cloud_build_source_staging_is_explicit_and_least_privilege() -> None:
@@ -177,3 +179,25 @@ def test_oauth_callback_request_logging_exclusion_covers_public_frontends() -> N
     assert 'log_id("webrequests")' in logging
     assert "apigateway.googleapis.com" not in logging
     assert logging.count('httpRequest.requestUrl=~"/setup/oauth/callback([?].*)?$"') == 2
+
+
+def test_class_a_warning_covers_job_and_service_usage() -> None:
+    logging = (_PROJECT_ROOT / "infra/main/logging.tf").read_text(encoding="utf-8")
+    monitoring = (_PROJECT_ROOT / "infra/main/monitoring.tf").read_text(encoding="utf-8")
+
+    metric_filter = (
+        '(resource.type=\\"cloud_run_job\\" OR '
+        'resource.type=\\"cloud_run_revision\\") AND '
+        'jsonPayload.event=\\"class_a_warning\\"'
+    )
+    assert metric_filter in logging
+    assert 'resource.type = \\"cloud_run_job\\"' in monitoring
+    assert 'resource.type = \\"cloud_run_revision\\"' in monitoring
+
+
+def test_job_monitoring_distinguishes_success_and_failure() -> None:
+    monitoring = (_PROJECT_ROOT / "infra/main/monitoring.tf").read_text(encoding="utf-8")
+
+    assert 'metric.label.result = \\"succeeded\\"' in monitoring
+    assert 'resource "google_monitoring_alert_policy" "job_failed"' in monitoring
+    assert 'metric.label.result = \\"failed\\"' in monitoring

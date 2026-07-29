@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 
@@ -126,6 +126,13 @@ EXTRACTORS: tuple[MetricExtractor, ...] = (
     ),
 )
 
+_SLEEP_STAGE_METRICS: Mapping[str, str] = {
+    "REM": "sleep_rem_minutes",
+    "DEEP": "sleep_deep_minutes",
+    "LIGHT": "sleep_light_minutes",
+    "AWAKE": "sleep_awake_minutes",
+}
+
 
 def normalize_daily_observations(
     data_points: Sequence[Mapping[str, Any]],
@@ -166,6 +173,16 @@ def normalize_daily_observations(
             )
             values[key].append(numeric * extractor.scale)
             sources[(metric_date, extractor.metric_name)].add(_kebab_case(field))
+        for metric_name, minutes in _additional_daily_metrics(field, payload).items():
+            key = (
+                metric_date,
+                metric_name,
+                "min",
+                "daily_sum",
+                "sum",
+            )
+            values[key].append(minutes)
+            sources[(metric_date, metric_name)].add(_kebab_case(field))
 
     result: dict[date, list[Observation]] = defaultdict(list)
     for (metric_date, metric_name, unit, aggregation, reducer), samples in values.items():
@@ -201,9 +218,19 @@ def normalize_daily_observations(
 
 def _metric_date(field: str, payload: Mapping[str, Any]) -> date | None:
     if field == "sleep":
-        return _date_from_path(payload, ("interval", "civilEndTime", "date"))
+        civil = _date_from_path(payload, ("interval", "civilEndTime", "date"))
+        return civil or _physical_interval_date(
+            payload,
+            time_field="endTime",
+            offset_field="endUtcOffset",
+        )
     if field == "exercise":
-        return _date_from_path(payload, ("interval", "civilStartTime", "date"))
+        civil = _date_from_path(payload, ("interval", "civilStartTime", "date"))
+        return civil or _physical_interval_date(
+            payload,
+            time_field="startTime",
+            offset_field="startUtcOffset",
+        )
     direct = _date_from_path(payload, ("date",))
     if direct is not None:
         return direct
@@ -221,6 +248,107 @@ def _date_from_path(payload: Mapping[str, Any], path: tuple[str, ...]) -> date |
         return date(int(value["year"]), int(value["month"]), int(value["day"]))
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def _physical_interval_date(
+    payload: Mapping[str, Any],
+    *,
+    time_field: str,
+    offset_field: str,
+) -> date | None:
+    interval = payload.get("interval")
+    if not isinstance(interval, Mapping):
+        return None
+    timestamp = _rfc3339_datetime(interval.get(time_field))
+    if timestamp is None:
+        return None
+
+    offset_seconds = _protobuf_duration_seconds(interval.get(offset_field))
+    if offset_seconds is None or abs(offset_seconds) > Decimal(24 * 60 * 60):
+        return None
+    utc_timestamp = timestamp.astimezone(UTC)
+    return (utc_timestamp + timedelta(seconds=int(offset_seconds))).date()
+
+
+def _rfc3339_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed
+
+
+def _protobuf_duration_seconds(value: Any) -> Decimal | None:
+    if not isinstance(value, str) or not value.endswith("s"):
+        return None
+    try:
+        seconds = Decimal(value[:-1])
+    except (InvalidOperation, ValueError):
+        return None
+    return seconds if seconds == seconds.to_integral_value() else None
+
+
+def _additional_daily_metrics(
+    field: str,
+    payload: Mapping[str, Any],
+) -> dict[str, Decimal]:
+    return _sleep_stage_minutes(payload) if field == "sleep" else {}
+
+
+def _sleep_stage_minutes(payload: Mapping[str, Any]) -> dict[str, Decimal]:
+    summary = _nested(payload, ("summary", "stagesSummary"))
+    summarized = _summarized_sleep_stage_minutes(summary)
+    result = summarized or _detailed_sleep_stage_minutes(payload.get("stages"))
+    minutes_awake = _decimal_value(
+        _nested(payload, ("summary", "minutesAwake")),
+        duration=False,
+    )
+    if "sleep_awake_minutes" not in result and minutes_awake is not None and minutes_awake >= 0:
+        result["sleep_awake_minutes"] = minutes_awake
+    return result
+
+
+def _summarized_sleep_stage_minutes(value: Any) -> dict[str, Decimal]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return {}
+    result: dict[str, Decimal] = defaultdict(Decimal)
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        metric_name = _sleep_stage_metric(item.get("type"))
+        minutes = _decimal_value(item.get("minutes"), duration=False)
+        if metric_name is None or minutes is None or minutes < 0:
+            continue
+        result[metric_name] += minutes
+    return dict(result)
+
+
+def _detailed_sleep_stage_minutes(value: Any) -> dict[str, Decimal]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return {}
+    result: dict[str, Decimal] = defaultdict(Decimal)
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        metric_name = _sleep_stage_metric(item.get("type"))
+        start = _rfc3339_datetime(item.get("startTime"))
+        end = _rfc3339_datetime(item.get("endTime"))
+        if metric_name is None or start is None or end is None or end <= start:
+            continue
+        seconds = Decimal(str((end - start).total_seconds()))
+        result[metric_name] += seconds / Decimal(60)
+    return dict(result)
+
+
+def _sleep_stage_metric(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.upper().removeprefix("SLEEP_STAGE_TYPE_")
+    return _SLEEP_STAGE_METRICS.get(normalized)
 
 
 def _nested(payload: Mapping[str, Any], path: tuple[str, ...]) -> Any:

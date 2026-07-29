@@ -215,7 +215,7 @@ class JobRunner:
                 )
         except Exception as exc:
             # This is a wake-up optimization after the authoritative HEAD
-            # commit. Durable events remain available to the hourly recovery.
+            # commit. Durable events remain available to scheduled recovery.
             if self._on_sync_recovery_error is not None:
                 self._on_sync_recovery_error(exc)
 
