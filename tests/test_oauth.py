@@ -83,7 +83,7 @@ def test_setup_code_and_callback_follow_state_machine() -> None:
     store = InMemoryObjectStore(clock=lambda: NOW)
     service, setup, provider, sink = _service(store)
     code = setup.issue(now=NOW).code
-    session = service.create_session(setup_code=code, csrf_token="csrf", now=NOW)
+    session = service.create_session(setup_code=code, now=NOW)
     start = service.start_authorization(session_id=session.session_id, now=NOW)
     state = parse_qs(urlparse(start.authorization_url).query)["state"][0]
 
@@ -116,16 +116,15 @@ def test_setup_code_is_one_time_and_expires() -> None:
     store = InMemoryObjectStore(clock=lambda: NOW)
     service, setup, _, _ = _service(store)
     issued = setup.issue(now=NOW)
-    service.create_session(setup_code=issued.code, csrf_token="csrf", now=NOW)
+    service.create_session(setup_code=issued.code, now=NOW)
 
     with pytest.raises(InvalidSetupCode):
-        service.create_session(setup_code=issued.code, csrf_token="csrf", now=NOW)
+        service.create_session(setup_code=issued.code, now=NOW)
 
     expired = setup.issue(now=NOW).code
     with pytest.raises(InvalidSetupCode):
         service.create_session(
             setup_code=expired,
-            csrf_token="csrf",
             now=NOW + timedelta(minutes=11),
         )
 
@@ -134,7 +133,7 @@ def test_reauthorization_rejects_different_owner() -> None:
     store = InMemoryObjectStore(clock=lambda: NOW)
     first, setup, _, _ = _service(store)
     code = setup.issue(now=NOW).code
-    session = first.create_session(setup_code=code, csrf_token="csrf", now=NOW)
+    session = first.create_session(setup_code=code, now=NOW)
     start = first.start_authorization(session_id=session.session_id, now=NOW)
     state = parse_qs(urlparse(start.authorization_url).query)["state"][0]
     first.complete_callback(
@@ -149,7 +148,7 @@ def test_reauthorization_rejects_different_owner() -> None:
         OAuthGrant("another-sub", "another-health-user", "new-token"),
     )
     second_code = second_setup.issue(now=NOW).code
-    second_session = second.create_session(setup_code=second_code, csrf_token="csrf-2", now=NOW)
+    second_session = second.create_session(setup_code=second_code, now=NOW)
     second_start = second.start_authorization(session_id=second_session.session_id, now=NOW)
     second_state = parse_qs(urlparse(second_start.authorization_url).query)["state"][0]
 

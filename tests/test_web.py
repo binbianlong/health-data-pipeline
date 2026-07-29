@@ -4,7 +4,6 @@ import base64
 import json
 from datetime import UTC, datetime
 from typing import Any
-from urllib.parse import parse_qs
 
 import pytest
 from fastapi.testclient import TestClient
@@ -54,7 +53,7 @@ class OAuth:
         self.created: list[str] = []
         self.completed: list[str] = []
 
-    def create_session(self, *, setup_code: str, csrf_token: str) -> IssuedSession:
+    def create_session(self, *, setup_code: str) -> IssuedSession:
         self.created.append(setup_code)
         return IssuedSession(
             session_id="session-id",
@@ -303,14 +302,12 @@ def test_setup_code_is_posted_then_oauth_redirects() -> None:
     form = client.get("/setup")
     assert form.status_code == 200
     assert form.headers["referrer-policy"] == "same-origin"
-    csrf = parse_qs(form.text.split('name="csrf_token" value="', 1)[1].split('"', 1)[0])
-    # parse_qs intentionally returns empty for a bare token, so use the source value.
-    assert csrf == {}
-    csrf_value = form.text.split('name="csrf_token" value="', 1)[1].split('"', 1)[0]
+    assert 'name="csrf_token"' not in form.text
+    assert form.headers.get_list("set-cookie") == []
 
     created = client.post(
         "/setup/session",
-        data={"csrf_token": csrf_value, "setup_code": "one-time-code"},
+        data={"setup_code": "one-time-code"},
         headers={"Origin": "https://public.example"},
         follow_redirects=False,
     )
@@ -324,7 +321,7 @@ def test_setup_code_is_posted_then_oauth_redirects() -> None:
     assert callback.status_code == 200
     assert oauth.created == ["one-time-code"]
     assert oauth.completed == ["authorization-code"]
-    for response in (form, created, callback):
+    for response in (created, callback):
         cookie_headers = response.headers.get_list("set-cookie")
         assert len(cookie_headers) == 1
         cookie_header = cookie_headers[0]
@@ -333,6 +330,60 @@ def test_setup_code_is_posted_then_oauth_redirects() -> None:
         assert "Secure" in cookie_header
         assert "HttpOnly" in cookie_header
         assert "Domain=" not in cookie_header
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        None,
+        "null",
+        "https://attacker.example",
+        "https://public.example.attacker.example",
+        "http://public.example",
+        "https://public.example:443",
+        "https://public.example/",
+    ],
+)
+def test_setup_session_rejects_untrusted_origin(origin: str | None) -> None:
+    client, _, _, oauth, _ = _client()
+    headers = {} if origin is None else {"Origin": origin}
+
+    response = client.post(
+        "/setup/session",
+        data={"setup_code": "one-time-code"},
+        headers=headers,
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "origin rejected"}
+    assert oauth.created == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"unexpected=value",
+        b"setup_code=one&setup_code=two",
+        b"setup_code=",
+    ],
+)
+def test_setup_session_rejects_ambiguous_form(body: bytes) -> None:
+    client, _, _, oauth, _ = _client()
+
+    response = client.post(
+        "/setup/session",
+        content=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": "https://public.example",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "invalid setup form"}
+    assert oauth.created == []
 
 
 def test_public_svg_has_short_cache_policy() -> None:

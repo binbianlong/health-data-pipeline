@@ -263,7 +263,7 @@ POST /webhooks/google-health
 Firebase Hostingからの動的rewriteには未認証呼出しが必要なため、Cloud Run Serviceは
 `invoker_iam_disabled = true`とする。これはService全体の`run.app` URLも直接呼出し
 可能にするため、内部routeの保護をHostingのroute制限だけへ依存させない。公開7 routeは
-それぞれWebhook secret・署名、CSRF、setup code、一時session、OAuth stateをアプリで検証し、
+それぞれWebhook secret・署名、厳密なOrigin、setup code、一時session、OAuth stateをアプリで検証し、
 未定義routeは404を返す。`POST /internal/tasks/apply-views`はCloud Tasks専用OIDCを検証する。
 
 Hostingの動的rewriteは60秒でtimeoutする。公開7 routeは60秒未満で応答し、長い収集・再計算・
@@ -276,7 +276,7 @@ Notion更新はJobまたは内部View更新Taskへ分離する。
 | `GET /public/steps.svg` | 公開 | 現行7日歩数SVG |
 | `GET /health` | 公開 | 秘密を含まない死活応答 |
 | `GET /setup` | 公開 | setup code入力フォーム |
-| `POST /setup/session` | CSRF + setup code | 一時OAuth session発行 |
+| `POST /setup/session` | 厳密なOrigin + setup code | 一時OAuth session発行 |
 | `GET /setup/oauth/start` | 一時session | OAuth開始 |
 | `GET /setup/oauth/callback` | 一時session + OAuth state | token・所有者保存 |
 
@@ -1124,13 +1124,15 @@ Session record：
 ```
 
 - 全状態遷移をGCS generation precondition付きで行う。
-- `POST /setup/session`でcodeをCAS消費し、sessionを発行する。
+- `GET /setup`はcookieを発行しない。
+- `POST /setup/session`は公開URLとの厳密なOrigin一致とsetup codeを検証し、
+  codeをCAS消費してからsessionを発行する。Originの欠落、`null`、別originは拒否する。
 - Firebase HostingがCloud Runへ転送するcookieは`__session`だけなので、OAuth setupでは
   この名前以外のcookieを使用しない。
-- `GET /setup`は`__session`へCSRF tokenを`HttpOnly`、`Secure`、
-  `SameSite=Strict`、有効期限10分で設定する。
-- `POST /setup/session`はCSRFとsetup codeの検証成功後、同じ`__session`を
-  不透明なsession IDへ上書きし、`SameSite=Lax`とする。
+- `POST /setup/session`成功後だけ、不透明なsession IDを`__session`へ
+  `HttpOnly`、`Secure`、`SameSite=Lax`、有効期限10分で設定する。
+- schema version 1の`csrf_token_hash`は既存session record互換の内部nonceであり、
+  初回POSTの認証境界には使用しない。次のschema更新時に削除を検討する。
 - PKCE verifierは専用AEAD keyで暗号化する。
 - callback開始時に`CALLBACK_CLAIMED`へCAS遷移して再送を拒否する。
 - token交換とowner照合成功後だけ`COMPLETED`にする。
@@ -1488,7 +1490,7 @@ BigQuery API、dataset、table、IAMは作らない。
 - HEAD CAS
 - lease非依存CAS
 - OAuth session状態遷移
-- Firebase Hosting用`__session` cookie遷移
+- Firebase Hostingでsetup code成功後だけ`__session`を発行する遷移
 - retention参照とaudit参照
 - Notion generation比較
 - SVG pointer CAS

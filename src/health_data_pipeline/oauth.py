@@ -441,7 +441,6 @@ class OAuthSessionService:
         self,
         *,
         setup_code: str,
-        csrf_token: str,
         now: datetime | None = None,
     ) -> IssuedSession:
         current_time = _utc_now() if now is None else now.astimezone(UTC)
@@ -455,7 +454,7 @@ class OAuthSessionService:
             status=SessionStatus.ISSUED,
             issued_at=_timestamp(current_time),
             expires_at=_timestamp(expires_at),
-            csrf_token_hash=_sha256_text(csrf_token),
+            csrf_token_hash=_sha256_text(_token()),
         )
         write_state(
             self._store,

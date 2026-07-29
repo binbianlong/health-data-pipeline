@@ -350,8 +350,9 @@ POST /webhooks/google-health
 
 Firebase Hostingの動的rewriteは60秒でtimeoutするため、これらのhandlerは60秒未満で
 応答します。HostingがCloud Runへ転送するcookieは`__session`だけです。アプリは
-`GET /setup`ではこのcookieをCSRF tokenとして発行し、`POST /setup/session`成功時に
-不透明なOAuth session IDへ上書きします。cookie名を分けたり変更したりしません。
+`GET /setup`ではcookieを発行せず、厳密なOrigin検証と10分で失効する一回限りの
+setup codeで最初のPOSTを保護します。`POST /setup/session`成功時にだけ、不透明な
+OAuth session IDを`__session`へ保存します。
 
 Firebase HostingからのrewriteにはCloud Runの未認証呼出し許可が必要なため、Serviceは
 公式推奨の`invoker_iam_disabled = true`を設定します。Cloud Run IAMはpath単位で制御できないため、
