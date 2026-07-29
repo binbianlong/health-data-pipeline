@@ -11,8 +11,9 @@ from health_data_pipeline.google_health import (
     FetchWindow,
     GoogleHealthClient,
     GoogleHealthWebhookAuthenticator,
-    VerifiedWebhook,
+    VerifiedWebhookBatch,
     WebhookAuthenticationError,
+    WebhookPayloadError,
     data_type_spec,
     identifier_hmac,
 )
@@ -40,8 +41,10 @@ class FakeTransport:
 class AcceptingVerifier:
     def __init__(self, expected: bytes) -> None:
         self.expected = expected
+        self.calls: list[tuple[bytes, bytes]] = []
 
     def verify(self, signature: bytes, payload: bytes) -> bool:
+        self.calls.append((signature, payload))
         return signature == b"signed" and payload == self.expected
 
 
@@ -250,6 +253,98 @@ def test_webhook_authenticates_signature_and_owner() -> None:
         {"data": {"healthUserId": "owner", "dataType": "steps", "intervals": []}}
     ).encode()
     key = b"hmac-key"
+    verifier = AcceptingVerifier(body)
+    authenticator = GoogleHealthWebhookAuthenticator(
+        expected_authorization="Bearer webhook-secret",
+        signature_verifier=verifier,
+        application_hmac_key=key,
+        expected_owner_hmac=identifier_hmac(key, "owner"),
+    )
+
+    batch = authenticator.authenticate(
+        authorization="Bearer webhook-secret",
+        signature_header=base64.b64encode(b"signed").decode(),
+        content_type="application/json; charset=utf-8",
+        raw_body=body,
+    )
+
+    assert isinstance(batch, VerifiedWebhookBatch)
+    assert len(batch.events) == 1
+    event = batch.events[0]
+    assert event.owner_hmac == identifier_hmac(key, "owner")
+    assert b"healthUserId" not in event.raw_body
+    assert b"ownerHmac" in event.raw_body
+    assert verifier.calls == [(b"signed", body)]
+
+
+def test_webhook_authenticates_array_with_one_raw_signature_check() -> None:
+    payload = [
+        {
+            "data": {
+                "healthUserId": "owner",
+                "dataType": "steps",
+                "intervals": [{"startTime": "2026-07-28T00:00:00Z"}],
+            }
+        },
+        {
+            "data": {
+                "healthUserId": "owner",
+                "dataType": "sleep",
+                "intervals": [{"startTime": "2026-07-27T22:00:00Z"}],
+            }
+        },
+    ]
+    body = json.dumps(payload).encode()
+    key = b"hmac-key"
+    verifier = AcceptingVerifier(body)
+    authenticator = GoogleHealthWebhookAuthenticator(
+        expected_authorization="Bearer webhook-secret",
+        signature_verifier=verifier,
+        application_hmac_key=key,
+        expected_owner_hmac=identifier_hmac(key, "owner"),
+    )
+
+    batch = authenticator.authenticate(
+        authorization="Bearer webhook-secret",
+        signature_header=base64.b64encode(b"signed").decode(),
+        content_type="application/json",
+        raw_body=body,
+    )
+
+    assert isinstance(batch, VerifiedWebhookBatch)
+    assert len(batch.events) == 2
+    assert verifier.calls == [(b"signed", body)]
+    assert all(b"healthUserId" not in event.raw_body for event in batch.events)
+    assert all(b"ownerHmac" in event.raw_body for event in batch.events)
+    assert batch.events[0].event_id != batch.events[1].event_id
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        [
+            {"data": {"healthUserId": "owner", "dataType": "steps"}},
+            "not-an-object",
+        ],
+        [
+            {"data": {"healthUserId": "owner", "dataType": "steps"}},
+            {"data": []},
+        ],
+        [
+            {"data": {"healthUserId": "owner", "dataType": "steps"}},
+            {"data": {"dataType": "sleep"}},
+        ],
+        [
+            {"data": {"healthUserId": "owner", "dataType": "steps"}},
+            {"data": {"healthUserId": "owner"}},
+        ],
+        "not-an-object-or-array",
+    ],
+)
+def test_webhook_batch_rejects_invalid_items_atomically(payload: Any) -> None:
+    body = json.dumps(payload).encode()
+    key = b"hmac-key"
     authenticator = GoogleHealthWebhookAuthenticator(
         expected_authorization="Bearer webhook-secret",
         signature_verifier=AcceptingVerifier(body),
@@ -257,17 +352,58 @@ def test_webhook_authenticates_signature_and_owner() -> None:
         expected_owner_hmac=identifier_hmac(key, "owner"),
     )
 
-    event = authenticator.authenticate(
+    with pytest.raises(WebhookPayloadError):
+        authenticator.authenticate(
+            authorization="Bearer webhook-secret",
+            signature_header=base64.b64encode(b"signed").decode(),
+            content_type="application/json",
+            raw_body=body,
+        )
+
+
+def test_webhook_batch_keeps_only_expected_owner_and_deduplicates() -> None:
+    owner_notification = {"data": {"healthUserId": "owner", "dataType": "steps", "intervals": []}}
+    payload = [
+        owner_notification,
+        {"data": {"healthUserId": "other", "dataType": "sleep", "intervals": []}},
+        owner_notification,
+    ]
+    body = json.dumps(payload).encode()
+    key = b"hmac-key"
+    authenticator = GoogleHealthWebhookAuthenticator(
+        expected_authorization="Bearer webhook-secret",
+        signature_verifier=AcceptingVerifier(body),
+        application_hmac_key=key,
+        expected_owner_hmac=identifier_hmac(key, "owner"),
+    )
+
+    batch = authenticator.authenticate(
         authorization="Bearer webhook-secret",
         signature_header=base64.b64encode(b"signed").decode(),
-        content_type="application/json; charset=utf-8",
+        content_type="application/json",
         raw_body=body,
     )
 
-    assert isinstance(event, VerifiedWebhook)
-    assert event.owner_hmac == identifier_hmac(key, "owner")
-    assert b"healthUserId" not in event.raw_body
-    assert b"ownerHmac" in event.raw_body
+    assert isinstance(batch, VerifiedWebhookBatch)
+    assert len(batch.events) == 1
+    assert batch.events[0].payload["data"]["dataType"] == "steps"
+
+    foreign_body = json.dumps(payload[1:2]).encode()
+    foreign_authenticator = GoogleHealthWebhookAuthenticator(
+        expected_authorization="Bearer webhook-secret",
+        signature_verifier=AcceptingVerifier(foreign_body),
+        application_hmac_key=key,
+        expected_owner_hmac=identifier_hmac(key, "owner"),
+    )
+    foreign_batch = foreign_authenticator.authenticate(
+        authorization="Bearer webhook-secret",
+        signature_header=base64.b64encode(b"signed").decode(),
+        content_type="application/json",
+        raw_body=foreign_body,
+    )
+
+    assert isinstance(foreign_batch, VerifiedWebhookBatch)
+    assert foreign_batch.events == ()
 
 
 def test_webhook_rejects_bad_authorization_before_persistence() -> None:

@@ -155,15 +155,18 @@ OAuth redirect URI、GitHub SVGへ登録しない。
 
 1. body sizeとContent-Typeを検証する。
 2. `Authorization` headerをSecret Managerの値とconstant-time比較する。
-3. `GOOGLE-HEALTH-API-SIGNATURE`をTinkでraw bodyに対して検証する。
-4. JSON schemaを検証する。
-5. `healthUserId`をHMAC化して所有者と照合する。
-6. 変更区間を含むイベントをGCSへ不変保存する。
+3. `GOOGLE-HEALTH-API-SIGNATURE`を分割前のraw body全体に対して1回だけTinkで検証する。
+4. 通知objectまたは通知objectの非空arrayとして、全要素の必須構造を検証する。
+5. 各`healthUserId`をHMAC化して所有者と照合し、所有者以外の通知を除外する。
+6. 所有者の変更区間をイベント単位でGCSへ不変保存する。同一batch内の同一イベントは
+   canonical JSONのcontent hashで重複排除する。
 7. GCS保存完了後の時刻を10分bucketへ丸め、次のbucket境界を
-   `schedule_time`とするJob起動Taskを作成する。
+   `schedule_time`とするJob起動Taskをbatchにつき1件作成する。
 8. 保存とTask作成成功後に`204`を返す。
 
 GCS保存またはTask作成失敗時は5xxを返し、Google Health APIの再送に委ねる。
+構造不正は一部を保存せずbatch全体を400とする。署名済みでも所有者以外の通知だけなら、
+保存もTask作成も行わず204とし、他ユーザーのデータを保持しない。
 Taskのbucketは受信開始時刻ではなくGCS保存完了後に取り直した時刻から決める。
 これにより、保存処理が境界をまたいでも、すでにdispatchされた旧bucketのTask名を
 再利用しない。

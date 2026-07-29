@@ -29,7 +29,7 @@ from health_data_pipeline.config import AppConfig
 from health_data_pipeline.google_health import (
     GoogleHealthClient,
     GoogleHealthWebhookAuthenticator,
-    VerifiedWebhook,
+    VerifiedWebhookBatch,
     WebhookPayloadError,
     WebhookSignatureVerifier,
     WebhookVerification,
@@ -102,7 +102,7 @@ class DynamicOwnerWebhookAuthenticator:
         signature_header: str | None,
         content_type: str | None,
         raw_body: bytes,
-    ) -> VerifiedWebhook | WebhookVerification:
+    ) -> VerifiedWebhookBatch | WebhookVerification:
         try:
             expected_owner_hmac = _owner_hmac(self._store)
         except WebhookPayloadError:
