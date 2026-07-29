@@ -507,9 +507,15 @@ class StepsSvgService:
         current = read_state(self._store, STEPS_HEAD_PATH)
         if current is not None:
             pointer = StepsPointer.from_bytes(current.data)
-            if generation <= pointer.generation:
-                return False
-            if pointer.through_date is not None:
+            if pointer.through_date is None:
+                # A legacy pointer has no completed-day cursor. Allow exactly
+                # one same-generation migration; the rewritten pointer then
+                # follows the normal strict generation/date monotonicity.
+                if generation < pointer.generation:
+                    return False
+            else:
+                if generation <= pointer.generation:
+                    return False
                 try:
                     published_through = date.fromisoformat(pointer.through_date)
                 except ValueError as exc:
