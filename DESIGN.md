@@ -701,7 +701,7 @@ GCS上のAPI blobとnormalized `SAMPLE`、`INTERVAL`、`SESSION`、`DAILY`は期
 - API途中失敗またはHEAD CAS失敗時はcursorを進めない
 - 現在データを常に優先する
 - 20分SLOの対象外とする
-- 当月の推定Class A操作が3,000回に達したらbackfillだけを停止し、UTCの翌月に自動再開する。ただし既存のnormalizer versionを更新する整合性修復は、4,000回未満の場合に限り先頭の1 batchだけ実行し、commit後は通常の停止条件へ戻る
+- 当月の推定Class A操作が3,000回に達したらbackfillだけを停止し、UTCの翌月に自動再開する。ただし既存のnormalizer versionを更新する整合性修復は、4,250回未満の場合に限り先頭の1 batchだけ実行し、commit後は通常の停止条件へ戻る
 - 現在同期、Webhook、HEAD commit、Notion／SVG回収はClass A gateで停止しない
 
 ## 15. civil timeと日次処理
@@ -1266,7 +1266,7 @@ Cloud Run JobとService内のGCS `put` / `list`試行を数え、各Jobまたは
 | 3,000以上 | 予告通知、過去backfillだけ停止 |
 | 4,000以上 | 強い警告 |
 
-us-central1のCloud Storage Always FreeはClass A月5,000回である。3,000回で任意の過去処理を止め、開始済みbatchの上振れ、Cloud Storage側との集計差、現在同期に2,000回の余白を残す。UTC月が変わると新しい月次stateを使うため、backfillは自動再開する。4,000回は現在収集の停止条件ではない。object listは1,000件単位のpage数で数え、Webhookはmetadataだけを列挙して未処理objectの本文だけを取得する。
+us-central1のCloud Storage Always FreeはClass A月5,000回である。3,000回で任意の過去処理を止め、開始済みbatchの上振れ、Cloud Storage側との集計差、現在同期に2,000回の余白を残す。normalizer version更新時に限る1回の整合性修復は4,250回未満で開始でき、開始時点で少なくとも750回の余白を残す。UTC月が変わると新しい月次stateを使うため、backfillは自動再開する。4,000回は警告であり、現在収集の停止条件ではない。object listは1,000件単位のpage数で数え、Webhookはmetadataだけを列挙して未処理objectの本文だけを取得する。
 
 - Webhook保存
 - 現在データ取得
