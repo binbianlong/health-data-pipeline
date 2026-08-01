@@ -283,11 +283,11 @@ def test_backfill_gate_uses_only_current_utc_month_state() -> None:
     )
 
 
-def test_normalizer_upgrade_gate_keeps_one_thousand_operation_margin() -> None:
+def test_normalizer_upgrade_gate_keeps_seven_hundred_fifty_operation_margin() -> None:
     store = InMemoryObjectStore(clock=lambda: NOW)
     assert class_a_normalizer_upgrade_allowed(store, now=NOW)
 
-    _write_month_state(store, 3_999)
+    _write_month_state(store, 4_249)
     assert class_a_normalizer_upgrade_allowed(store, now=NOW)
 
     stored = store.get(MONTH_PATH)
@@ -296,7 +296,7 @@ def test_normalizer_upgrade_gate_keeps_one_thousand_operation_margin() -> None:
         ClassAMonthState(
             schema_version=1,
             month="2026-07",
-            estimated_operations=4_000,
+            estimated_operations=4_250,
             updated_at="2026-07-28T12:00:00Z",
         ).to_bytes(),
         if_generation_match=stored.generation,

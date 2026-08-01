@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from health_data_pipeline.budget import ClassAMonthState, class_a_month_state_path
-from health_data_pipeline.commit import CommitCoordinator
+from health_data_pipeline.commit import CommitCoordinator, CommitRequest
 from health_data_pipeline.google_health import DataPointPage, FetchWindow
 from health_data_pipeline.models import CommitKind, ContentReference
 from health_data_pipeline.pipeline import (
@@ -424,6 +424,57 @@ def test_normalizer_upgrade_allows_only_one_bounded_correction_batch() -> None:
     assert _backfill_budget_allows(store, old_version, now=NOW)
     assert not _backfill_budget_allows(store, current_version, now=NOW)
     assert not _backfill_budget_allows(store, {}, now=NOW)
+
+
+def test_normalizer_upgrade_commits_once_then_returns_to_backfill_pause() -> None:
+    store = InMemoryObjectStore(clock=lambda: NOW)
+    health = FakeHealth(values={})
+    pipeline, heads, snapshots = _pipeline(store, health)
+    assert pipeline.run().committed
+
+    coordinator = CommitCoordinator(heads=heads, snapshots=snapshots)
+    coordinator.commit(
+        CommitRequest(
+            daily_rows={},
+            commit_kind=CommitKind.REBUILD,
+            created_at=NOW,
+            backfill_cursors={
+                "_schedule": {
+                    "normalizer_version": "daily-v2",
+                }
+            },
+        ),
+        expected_base=heads.read(),
+    )
+    store.put(
+        class_a_month_state_path("2026-07"),
+        ClassAMonthState(
+            schema_version=1,
+            month="2026-07",
+            estimated_operations=4_034,
+            updated_at="2026-07-28T12:00:00Z",
+        ).to_bytes(),
+        if_generation_match=0,
+        metadata={},
+        content_type="application/json",
+        cache_control="no-store",
+    )
+    initial_request_count = len(health.requests)
+
+    correction = pipeline.run()
+    corrected_request_count = len(health.requests)
+    paused = pipeline.run()
+
+    assert correction.committed
+    assert not paused.committed
+    assert corrected_request_count == initial_request_count + 2
+    assert len(health.requests) == corrected_request_count
+    head = heads.read().head
+    assert head is not None
+    root = snapshots.load_root_snapshot(head.root_snapshot)
+    schedule = root.state.backfill_cursors["_schedule"]
+    assert isinstance(schedule, dict)
+    assert schedule["normalizer_version"] == "daily-v3"
 
 
 def test_backfill_waits_for_notion_without_blocking_the_initial_sync() -> None:

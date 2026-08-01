@@ -22,6 +22,7 @@ CLASS_A_STATE_PREFIX = "state/budget/class-a"
 CLASS_A_NOTICE_THRESHOLD = 3_000
 CLASS_A_WARNING_THRESHOLD = 4_000
 CLASS_A_BACKFILL_PAUSE_THRESHOLD = CLASS_A_NOTICE_THRESHOLD
+CLASS_A_NORMALIZER_UPGRADE_THRESHOLD = 4_250
 DEFAULT_CAS_ATTEMPTS = 4
 
 
@@ -381,11 +382,13 @@ def class_a_normalizer_upgrade_allowed(
     *,
     now: datetime,
 ) -> bool:
-    """Allow one bounded correction batch below the 4,000-operation warning.
+    """Allow one bounded correction batch below the 4,250-operation ceiling.
 
     The pipeline calls this only when a previously recorded normalizer version
     differs from the running version. Once that batch commits, the ordinary
-    3,000-operation backfill pause applies again.
+    3,000-operation backfill pause applies again. The dedicated ceiling leaves
+    at least 750 operations of the monthly free-tier allowance unused when the
+    correction batch starts.
     """
 
     current = _aware_utc(now)
@@ -400,7 +403,7 @@ def class_a_normalizer_upgrade_allowed(
         return False
     if state.month != month:
         return False
-    return state.estimated_operations < CLASS_A_WARNING_THRESHOLD
+    return state.estimated_operations < CLASS_A_NORMALIZER_UPGRADE_THRESHOLD
 
 
 def class_a_month_state_path(month: str) -> str:
