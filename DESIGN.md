@@ -1263,8 +1263,9 @@ Cloud Run JobとService内のGCS `put` / `list`試行を数え、各Jobまたは
 | 当月推定 | 動作 |
 |---:|---|
 | 3,000未満 | 通常 |
-| 3,000以上 | 予告通知、過去backfillだけ停止 |
-| 4,000以上 | 強い警告 |
+| 3,000〜3,999 | 予告通知、過去backfillだけ停止。normalizer更新時の先頭1 batchだけ例外 |
+| 4,000〜4,249 | 強い警告。normalizer更新時の先頭1 batchだけ例外 |
+| 4,250以上 | 強い警告。normalizer更新を含む過去backfillを停止 |
 
 us-central1のCloud Storage Always FreeはClass A月5,000回である。3,000回で任意の過去処理を止め、開始済みbatchの上振れ、Cloud Storage側との集計差、現在同期に2,000回の余白を残す。normalizer version更新時に限る1回の整合性修復は4,250回未満で開始でき、開始時点で少なくとも750回の余白を残す。UTC月が変わると新しい月次stateを使うため、backfillは自動再開する。4,000回は警告であり、現在収集の停止条件ではない。object listは1,000件単位のpage数で数え、Webhookはmetadataだけを列挙して未処理objectの本文だけを取得する。
 

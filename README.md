@@ -396,6 +396,7 @@ Jobs APIの成功はExecution作成成功であり、HEAD commit成功ではあ�
 - 保険のSchedulerは3時間ごとに実行し、Webhookによる通常の最新反映速度は変えません。
 - 当月の推定Class A操作が3,000回に達したら過去バックフィルだけを停止し、UTCの翌月に自動再開します。現在同期、Webhook、Notion回収は停止しません。
 - Class A 4,000回は強い警告です。Cloud Run JobとServiceのGCS書込み・一覧取得を同じ月次stateへ集計し、公式のus-central1無料枠5,000回に対して余白を残します。
+- 保存済みデータの形式更新が必要な場合だけ、4,250回未満なら最新31日分の補正を1回許可します。成功後は通常の3,000回停止へ戻ります。
 - 高容量のraw cacheは30〜365日のGCS lifecycleで削除し、小容量のcanonical／Snapshot／Shardはv1では自動削除しません。健康データbucketが1 GiBを超えたら見直し通知を送ります。
 
 日次long rowの期間は`period_kind`で区別します。
