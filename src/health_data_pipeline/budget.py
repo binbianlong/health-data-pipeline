@@ -376,6 +376,33 @@ def class_a_backfill_allowed(
     return class_a_budget_decision(state.estimated_operations).allows(WorkKind.BACKFILL)
 
 
+def class_a_normalizer_upgrade_allowed(
+    store: ObjectStore,
+    *,
+    now: datetime,
+) -> bool:
+    """Allow one bounded correction batch below the 4,000-operation warning.
+
+    The pipeline calls this only when a previously recorded normalizer version
+    differs from the running version. Once that batch commits, the ordinary
+    3,000-operation backfill pause applies again.
+    """
+
+    current = _aware_utc(now)
+    month = current.strftime("%Y-%m")
+    try:
+        stored = store.get(class_a_month_state_path(month))
+    except ObjectNotFound:
+        return True
+    try:
+        state = ClassAMonthState.from_bytes(stored.data)
+    except ClassAUsageStateError:
+        return False
+    if state.month != month:
+        return False
+    return state.estimated_operations < CLASS_A_WARNING_THRESHOLD
+
+
 def class_a_month_state_path(month: str) -> str:
     try:
         parsed = datetime.strptime(month, "%Y-%m").replace(tzinfo=UTC)

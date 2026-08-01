@@ -15,6 +15,7 @@ from health_data_pipeline.budget import (
     class_a_backfill_allowed,
     class_a_budget_decision,
     class_a_month_state_path,
+    class_a_normalizer_upgrade_allowed,
 )
 from health_data_pipeline.storage import (
     InMemoryObjectStore,
@@ -280,3 +281,27 @@ def test_backfill_gate_uses_only_current_utc_month_state() -> None:
         store,
         now=datetime(2026, 8, 1, tzinfo=UTC),
     )
+
+
+def test_normalizer_upgrade_gate_keeps_one_thousand_operation_margin() -> None:
+    store = InMemoryObjectStore(clock=lambda: NOW)
+    assert class_a_normalizer_upgrade_allowed(store, now=NOW)
+
+    _write_month_state(store, 3_999)
+    assert class_a_normalizer_upgrade_allowed(store, now=NOW)
+
+    stored = store.get(MONTH_PATH)
+    store.put(
+        MONTH_PATH,
+        ClassAMonthState(
+            schema_version=1,
+            month="2026-07",
+            estimated_operations=4_000,
+            updated_at="2026-07-28T12:00:00Z",
+        ).to_bytes(),
+        if_generation_match=stored.generation,
+        metadata={},
+        content_type="application/json",
+        cache_control="no-store",
+    )
+    assert not class_a_normalizer_upgrade_allowed(store, now=NOW)

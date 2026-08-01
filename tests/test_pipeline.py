@@ -18,6 +18,7 @@ from health_data_pipeline.pipeline import (
     IncrementalSyncPipeline,
     IngestedQuery,
     _advance_backfill_cursors_many,
+    _backfill_budget_allows,
     _interval_dates,
     _reconciliation_fetch_start,
     _reopen_backfill_gaps,
@@ -272,7 +273,7 @@ def test_each_idle_run_backfills_next_sleep_and_exercise_interval() -> None:
     )
     assert root.state.backfill_cursors["_schedule"] == {
         "last_completed_civil_date": "2026-07-28",
-        "normalizer_version": "daily-v2",
+        "normalizer_version": "daily-v3",
         "next_data_type_index": 0,
         "policy_version": 2,
     }
@@ -338,7 +339,7 @@ def test_session_backfill_materializes_sleep_stages_and_exercise_minutes() -> No
         "sleep_minutes": 420,
         "sleep_rem_minutes": 90,
     }
-    assert all(row["logic_version"] == "daily-v2" for row in observed.values())
+    assert all(row["logic_version"] == "daily-v3" for row in observed.values())
 
 
 def test_backfill_failure_leaves_cursor_and_head_unchanged() -> None:
@@ -398,6 +399,31 @@ def test_backfill_pauses_at_class_a_notice_and_resumes_next_utc_month() -> None:
         "sleep",
         "exercise",
     ]
+
+
+def test_normalizer_upgrade_allows_only_one_bounded_correction_batch() -> None:
+    store = InMemoryObjectStore(clock=lambda: NOW)
+    state = ClassAMonthState(
+        schema_version=1,
+        month="2026-07",
+        estimated_operations=3_894,
+        updated_at="2026-07-28T12:00:00Z",
+    )
+    store.put(
+        class_a_month_state_path("2026-07"),
+        state.to_bytes(),
+        if_generation_match=0,
+        metadata={},
+        content_type="application/json",
+        cache_control="no-store",
+    )
+
+    old_version: dict[str, Any] = {"_schedule": {"normalizer_version": "daily-v2"}}
+    current_version: dict[str, Any] = {"_schedule": {"normalizer_version": "daily-v3"}}
+
+    assert _backfill_budget_allows(store, old_version, now=NOW)
+    assert not _backfill_budget_allows(store, current_version, now=NOW)
+    assert not _backfill_budget_allows(store, {}, now=NOW)
 
 
 def test_backfill_waits_for_notion_without_blocking_the_initial_sync() -> None:
@@ -654,7 +680,7 @@ def test_new_normalizer_reopens_recent_sleep_and_exercise_together() -> None:
     )
     assert advanced["_schedule"] == {
         "last_completed_civil_date": "2026-07-28",
-        "normalizer_version": "daily-v2",
+        "normalizer_version": "daily-v3",
         "next_data_type_index": 0,
         "policy_version": 2,
     }
@@ -665,7 +691,7 @@ def test_completed_priority_backfill_resumes_legacy_round_robin() -> None:
     cursors: dict[str, Any] = {
         "_schedule": {
             "last_completed_civil_date": "2026-07-27",
-            "normalizer_version": "daily-v2",
+            "normalizer_version": "daily-v3",
             "next_data_type_index": 0,
             "policy_version": 2,
         },
