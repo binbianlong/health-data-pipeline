@@ -118,6 +118,20 @@ resource "google_monitoring_alert_policy" "class_a_warning" {
     }
   }
 
+  notification_channels = var.notification_email == "" ? [] : [
+    google_monitoring_notification_channel.email[0].name,
+  ]
+
+  alert_strategy {
+    auto_close = "86400s"
+  }
+}
+
+resource "google_monitoring_alert_policy" "class_a_warning_service" {
+  project      = var.project_id
+  display_name = "Health pipeline GCS Class A warning from Service"
+  combiner     = "OR"
+
   conditions {
     display_name = "Class A warning emitted by Service"
 

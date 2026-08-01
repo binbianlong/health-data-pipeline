@@ -191,6 +191,8 @@ def test_class_a_warning_covers_job_and_service_usage() -> None:
         'jsonPayload.event=\\"class_a_warning\\"'
     )
     assert metric_filter in logging
+    assert 'resource "google_monitoring_alert_policy" "class_a_warning"' in monitoring
+    assert 'resource "google_monitoring_alert_policy" "class_a_warning_service"' in monitoring
     assert 'resource.type = \\"cloud_run_job\\"' in monitoring
     assert 'resource.type = \\"cloud_run_revision\\"' in monitoring
 
