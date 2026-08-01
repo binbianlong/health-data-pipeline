@@ -7,6 +7,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from itertools import pairwise
 from typing import Any, Literal
 
 from health_data_pipeline.daily import Observation
@@ -132,6 +133,11 @@ _SLEEP_STAGE_METRICS: Mapping[str, str] = {
     "LIGHT": "sleep_light_minutes",
     "AWAKE": "sleep_awake_minutes",
 }
+_SLEEPING_STAGE_METRICS = (
+    "sleep_rem_minutes",
+    "sleep_deep_minutes",
+    "sleep_light_minutes",
+)
 
 
 def normalize_daily_observations(
@@ -144,6 +150,7 @@ def normalize_daily_observations(
         list[Decimal],
     ] = defaultdict(list)
     sources: dict[tuple[date, str], set[str]] = defaultdict(set)
+    incomplete_sleep_stage_dates: set[date] = set()
 
     by_field: dict[str, list[MetricExtractor]] = defaultdict(list)
     for extractor in EXTRACTORS:
@@ -159,7 +166,16 @@ def normalize_daily_observations(
         metric_date = _metric_date(field, payload)
         if metric_date is None:
             continue
-        for extractor in by_field[field]:
+        additional_metrics = _additional_daily_metrics(field, payload)
+        incomplete_sleep_stage_dates.update(
+            _incomplete_sleep_stage_date(field, metric_date, additional_metrics)
+        )
+        primary_extractors = (
+            extractor
+            for extractor in by_field[field]
+            if extractor.metric_name not in additional_metrics
+        )
+        for extractor in primary_extractors:
             raw_value = _nested(payload, extractor.value_path)
             numeric = _decimal_value(raw_value, duration=field == "exercise")
             if numeric is None:
@@ -173,7 +189,7 @@ def normalize_daily_observations(
             )
             values[key].append(numeric * extractor.scale)
             sources[(metric_date, extractor.metric_name)].add(_kebab_case(field))
-        for metric_name, minutes in _additional_daily_metrics(field, payload).items():
+        for metric_name, minutes in additional_metrics.items():
             key = (
                 metric_date,
                 metric_name,
@@ -203,17 +219,45 @@ def normalize_daily_observations(
         )
     resolved: dict[date, list[Observation]] = {}
     for day, items in result.items():
-        by_metric: dict[str, Observation] = {}
-        for item in sorted(
+        resolved[day] = _resolve_daily_observations(
             items,
-            key=lambda observation: (
-                _aggregation_priority(observation.aggregation),
-                observation.metric_name,
-            ),
-        ):
-            by_metric[item.metric_name] = item
-        resolved[day] = [by_metric[name] for name in sorted(by_metric)]
+            omit_sleeping_stages=day in incomplete_sleep_stage_dates,
+        )
     return resolved
+
+
+def _incomplete_sleep_stage_date(
+    field: str,
+    metric_date: date,
+    additional_metrics: Mapping[str, Decimal],
+) -> tuple[date, ...]:
+    if field != "sleep":
+        return ()
+    if all(metric_name in additional_metrics for metric_name in _SLEEPING_STAGE_METRICS):
+        return ()
+    return (metric_date,)
+
+
+def _resolve_daily_observations(
+    items: Sequence[Observation],
+    *,
+    omit_sleeping_stages: bool,
+) -> list[Observation]:
+    selected = (
+        [item for item in items if item.metric_name not in _SLEEPING_STAGE_METRICS]
+        if omit_sleeping_stages
+        else items
+    )
+    by_metric: dict[str, Observation] = {}
+    for item in sorted(
+        selected,
+        key=lambda observation: (
+            _aggregation_priority(observation.aggregation),
+            observation.metric_name,
+        ),
+    ):
+        by_metric[item.metric_name] = item
+    return [by_metric[name] for name in sorted(by_metric)]
 
 
 def _metric_date(field: str, payload: Mapping[str, Any]) -> date | None:
@@ -302,7 +346,22 @@ def _additional_daily_metrics(
 def _sleep_stage_minutes(payload: Mapping[str, Any]) -> dict[str, Decimal]:
     summary = _nested(payload, ("summary", "stagesSummary"))
     summarized = _summarized_sleep_stage_minutes(summary)
-    result = summarized or _detailed_sleep_stage_minutes(payload.get("stages"))
+    detailed = _detailed_sleep_stage_minutes(payload.get("stages"))
+    if detailed and _sleep_stage_totals_match_summary(payload, detailed):
+        result = {
+            **detailed,
+            "sleep_minutes": sum(
+                (detailed.get(metric_name, Decimal(0)) for metric_name in _SLEEPING_STAGE_METRICS),
+                Decimal(0),
+            ),
+        }
+    elif summarized and _sleep_stage_totals_match_summary(payload, summarized):
+        result = summarized
+    else:
+        result = {}
+    if result:
+        for metric_name in (*_SLEEPING_STAGE_METRICS, "sleep_awake_minutes"):
+            result.setdefault(metric_name, Decimal(0))
     minutes_awake = _decimal_value(
         _nested(payload, ("summary", "minutesAwake")),
         duration=False,
@@ -315,7 +374,7 @@ def _sleep_stage_minutes(payload: Mapping[str, Any]) -> dict[str, Decimal]:
 def _summarized_sleep_stage_minutes(value: Any) -> dict[str, Decimal]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         return {}
-    result: dict[str, Decimal] = defaultdict(Decimal)
+    candidates: dict[str, set[Decimal]] = defaultdict(set)
     for item in value:
         if not isinstance(item, Mapping):
             continue
@@ -323,25 +382,78 @@ def _summarized_sleep_stage_minutes(value: Any) -> dict[str, Decimal]:
         minutes = _decimal_value(item.get("minutes"), duration=False)
         if metric_name is None or minutes is None or minutes < 0:
             continue
-        result[metric_name] += minutes
-    return dict(result)
+        candidates[metric_name].add(minutes)
+    if any(len(minutes) != 1 for minutes in candidates.values()):
+        return {}
+    return {metric_name: next(iter(minutes)) for metric_name, minutes in candidates.items()}
 
 
 def _detailed_sleep_stage_minutes(value: Any) -> dict[str, Decimal]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         return {}
-    result: dict[str, Decimal] = defaultdict(Decimal)
+    intervals: list[tuple[datetime, datetime, str]] = []
+    seen_intervals: set[tuple[datetime, datetime, str]] = set()
+    if not value:
+        return {}
     for item in value:
         if not isinstance(item, Mapping):
-            continue
+            return {}
         metric_name = _sleep_stage_metric(item.get("type"))
         start = _rfc3339_datetime(item.get("startTime"))
         end = _rfc3339_datetime(item.get("endTime"))
         if metric_name is None or start is None or end is None or end <= start:
-            continue
+            return {}
+        interval = (start, end, metric_name)
+        if interval not in seen_intervals:
+            seen_intervals.add(interval)
+            intervals.append(interval)
+
+    intervals.sort(key=lambda interval: (interval[0], interval[1], interval[2]))
+    if any(current[0] < previous[1] for previous, current in pairwise(intervals)):
+        return {}
+
+    result: dict[str, Decimal] = defaultdict(Decimal)
+    for start, end, metric_name in intervals:
         seconds = Decimal(str((end - start).total_seconds()))
         result[metric_name] += seconds / Decimal(60)
     return dict(result)
+
+
+def _sleep_stage_totals_match_summary(
+    payload: Mapping[str, Any],
+    stages: Mapping[str, Decimal],
+) -> bool:
+    """Reject partial or duplicated stage totals before publishing daily metrics."""
+
+    tolerance = Decimal(1)
+    reported_asleep = _decimal_value(
+        _nested(payload, ("summary", "minutesAsleep")),
+        duration=False,
+    )
+    computed_asleep = sum(
+        (stages.get(metric_name, Decimal(0)) for metric_name in _SLEEPING_STAGE_METRICS),
+        Decimal(0),
+    )
+    if reported_asleep is not None and abs(computed_asleep - reported_asleep) > tolerance:
+        return False
+
+    reported_awake = _decimal_value(
+        _nested(payload, ("summary", "minutesAwake")),
+        duration=False,
+    )
+    computed_awake = stages.get("sleep_awake_minutes", Decimal(0))
+    if reported_awake is not None and abs(computed_awake - reported_awake) > tolerance:
+        return False
+
+    reported_period = _decimal_value(
+        _nested(payload, ("summary", "minutesInSleepPeriod")),
+        duration=False,
+    )
+    if reported_period is not None:
+        computed_period = computed_asleep + computed_awake
+        if abs(computed_period - reported_period) > tolerance:
+            return False
+    return True
 
 
 def _sleep_stage_metric(value: Any) -> str | None:

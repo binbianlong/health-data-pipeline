@@ -13,7 +13,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import JsonValue
 
-from health_data_pipeline.budget import class_a_backfill_allowed
+from health_data_pipeline.budget import (
+    class_a_backfill_allowed,
+    class_a_normalizer_upgrade_allowed,
+)
 from health_data_pipeline.canonical import (
     canonical_json_bytes,
     canonical_ndjson_bytes,
@@ -89,7 +92,7 @@ _RECONCILIATION_MAX_DAYS = 90
 _BACKFILL_TIME_ZONE = ZoneInfo("Asia/Tokyo")
 _BACKFILL_META_KEY = "_schedule"
 _BACKFILL_POLICY_VERSION = 2
-_NORMALIZER_VERSION = "daily-v2"
+_NORMALIZER_VERSION = "daily-v3"
 _PRIORITY_BACKFILL_DATA_TYPES = ("sleep", "exercise")
 _HIGH_FREQUENCY_DATA_TYPES = frozenset(
     {
@@ -236,7 +239,11 @@ class IncrementalSyncPipeline:
             if (
                 idle_root is not None
                 and self._backfill_ready(idle_root.generation)
-                and class_a_backfill_allowed(self._store, now=now)
+                and _backfill_budget_allows(
+                    self._store,
+                    idle_root.state.backfill_cursors,
+                    now=now,
+                )
             )
             else ()
         )
@@ -783,6 +790,21 @@ def _select_backfill_chunk(
 
     chunks = _select_backfill_chunks(cursors, today=today)
     return chunks[0] if chunks else None
+
+
+def _backfill_budget_allows(
+    store: ObjectStore,
+    cursors: Mapping[str, JsonValue],
+    *,
+    now: datetime,
+) -> bool:
+    if class_a_backfill_allowed(store, now=now):
+        return True
+    schedule = cursors.get(_BACKFILL_META_KEY)
+    schedule_mapping = schedule if isinstance(schedule, Mapping) else {}
+    previous_version = schedule_mapping.get("normalizer_version")
+    upgrade_pending = isinstance(previous_version, str) and previous_version != _NORMALIZER_VERSION
+    return upgrade_pending and class_a_normalizer_upgrade_allowed(store, now=now)
 
 
 def _select_backfill_chunks(

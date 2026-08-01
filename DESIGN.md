@@ -701,7 +701,7 @@ GCS上のAPI blobとnormalized `SAMPLE`、`INTERVAL`、`SESSION`、`DAILY`は期
 - API途中失敗またはHEAD CAS失敗時はcursorを進めない
 - 現在データを常に優先する
 - 20分SLOの対象外とする
-- 当月の推定Class A操作が3,000回に達したらbackfillだけを停止し、UTCの翌月に自動再開する
+- 当月の推定Class A操作が3,000回に達したらbackfillだけを停止し、UTCの翌月に自動再開する。ただし既存のnormalizer versionを更新する整合性修復は、4,000回未満の場合に限り先頭の1 batchだけ実行し、commit後は通常の停止条件へ戻る
 - 現在同期、Webhook、HEAD commit、Notion／SVG回収はClass A gateで停止しない
 
 ## 15. civil timeと日次処理
@@ -793,7 +793,7 @@ daily-canonical/
   "time_zone": "Asia/Tokyo",
   "physical_day_start": "2026-07-27T15:00:00Z",
   "physical_day_end": "2026-07-28T15:00:00Z",
-  "logic_version": "daily-v2"
+  "logic_version": "daily-v3"
 }
 ```
 
