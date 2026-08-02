@@ -44,6 +44,7 @@ class CommitRequest:
     raw_replacements: tuple[JsonValue, ...] = ()
     ingestion_manifests: tuple[ContentReference, ...] = ()
     references: SnapshotReferences | None = None
+    daily_schema_version: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +92,7 @@ class CommitCoordinator:
                 metric_date,
                 rows,
                 source_generation=next_generation,
+                schema_version=request.daily_schema_version,
             )
             replacements_by_year[metric_date.year][metric_date] = reference
 

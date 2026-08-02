@@ -99,6 +99,25 @@ def test_daily_revision_rejects_commit_metadata_and_duplicate_keys() -> None:
         )
 
 
+def test_daily_v2_uses_record_kind_in_its_unique_key() -> None:
+    repository, _ = _repository()
+    metric = {**_daily_row(), "record_kind": "METRIC"}
+    session = {
+        **_daily_row(),
+        "record_kind": "SLEEP_SESSION",
+    }
+
+    reference = repository.publish_daily_revision(
+        "2026-07-28",
+        [metric, session],
+        source_generation=2,
+        schema_version=2,
+    )
+
+    assert reference.schema_version == 2
+    assert "schema_version=2" in reference.uri
+
+
 def test_equal_daily_content_keeps_original_source_generation() -> None:
     repository, _ = _repository()
     original = repository.publish_daily_revision(

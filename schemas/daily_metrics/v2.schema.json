@@ -1,0 +1,192 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://health-data-pipeline.local/schemas/daily_metrics/v2.schema.json",
+  "title": "DailyMetricV2",
+  "description": "One long-form metric, sleep-session, or sleep-session-state row. metric_date is carried by the GCS partition path.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "record_kind",
+    "metric_name",
+    "statistic",
+    "period_kind",
+    "dimension_key",
+    "value_num",
+    "value_text",
+    "unit",
+    "aggregation",
+    "period_start",
+    "period_end",
+    "sample_count",
+    "expected_count",
+    "coverage_ratio",
+    "data_status",
+    "quality_flags",
+    "source_data_types",
+    "fitbit_last_sync_time",
+    "time_zone",
+    "physical_day_start",
+    "physical_day_end",
+    "logic_version",
+    "session_start_time",
+    "session_end_time",
+    "session_start_utc_offset_seconds",
+    "session_end_utc_offset_seconds",
+    "session_is_main",
+    "session_is_nap"
+  ],
+  "properties": {
+    "record_kind": {
+      "type": "string",
+      "description": "METRIC is an aggregate metric row; SLEEP_SESSION is one sleep session.",
+      "enum": ["METRIC", "SLEEP_SESSION"]
+    },
+    "metric_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9_]*$"
+    },
+    "statistic": {
+      "type": "string",
+      "enum": [
+        "observed",
+        "mean",
+        "delta",
+        "delta_percent",
+        "min",
+        "max",
+        "coverage"
+      ]
+    },
+    "period_kind": {
+      "type": "string",
+      "description": "DAY is one civil day; SESSION is one sleep session assigned to its civil end date; CALENDAR_WEEK is Monday through metric_date; CALENDAR_MONTH is the first day of the month through metric_date.",
+      "enum": ["DAY", "SESSION", "CALENDAR_WEEK", "CALENDAR_MONTH"]
+    },
+    "dimension_key": {
+      "type": ["string", "null"],
+      "maxLength": 256
+    },
+    "value_num": {
+      "type": ["number", "null"]
+    },
+    "value_text": {
+      "type": ["string", "null"],
+      "maxLength": 2048
+    },
+    "unit": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "aggregation": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "period_start": {
+      "type": "string",
+      "format": "date",
+      "description": "Inclusive civil start date. CALENDAR_WEEK always starts on Monday."
+    },
+    "period_end": {
+      "type": "string",
+      "format": "date",
+      "description": "Inclusive civil end date. A Sunday CALENDAR_WEEK row is the finalized weekly value."
+    },
+    "sample_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "expected_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "coverage_ratio": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "maximum": 1
+    },
+    "data_status": {
+      "type": "string",
+      "enum": [
+        "PROVISIONAL",
+        "CANONICAL_SYNCED",
+        "CANONICAL_STALE",
+        "MISSING",
+        "INSUFFICIENT_DATA"
+      ]
+    },
+    "quality_flags": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
+      },
+      "uniqueItems": true
+    },
+    "source_data_types": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256
+      },
+      "uniqueItems": true
+    },
+    "fitbit_last_sync_time": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "time_zone": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "physical_day_start": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "physical_day_end": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "logic_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "session_start_time": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "Physical start instant for a SLEEP_SESSION row; null for other record kinds."
+    },
+    "session_end_time": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "Physical end instant for a SLEEP_SESSION row; null for other record kinds."
+    },
+    "session_start_utc_offset_seconds": {
+      "type": ["integer", "null"],
+      "minimum": -64800,
+      "maximum": 64800,
+      "description": "UTC offset at the session start edge in seconds."
+    },
+    "session_end_utc_offset_seconds": {
+      "type": ["integer", "null"],
+      "minimum": -64800,
+      "maximum": 64800,
+      "description": "UTC offset at the session end edge in seconds."
+    },
+    "session_is_main": {
+      "type": ["boolean", "null"],
+      "description": "True for the deterministically selected explicit main sleep. A fallback selection is identified by MAIN_SLEEP_INFERRED in quality_flags."
+    },
+    "session_is_nap": {
+      "type": ["boolean", "null"],
+      "description": "Google Health nap flag for a SLEEP_SESSION row."
+    }
+  }
+}

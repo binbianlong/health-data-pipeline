@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -55,6 +56,25 @@ def test_normalized_lifecycle_covers_every_generated_record_kind() -> None:
         f"{_NORMALIZED_PREFIX}SESSION/",
     }
     assert generated_prefixes == ninety_day_prefixes | year_prefixes
+
+
+def test_sleep_session_canonical_schema_is_typed_and_not_lifecycle_deleted() -> None:
+    terraform = _STORAGE_TERRAFORM.read_text(encoding="utf-8")
+    assert '"daily-canonical/' not in terraform
+    assert '"manifests/snapshot-shards/' not in terraform
+    schema = json.loads(
+        (_PROJECT_ROOT / "schemas/daily_metrics/v2.schema.json").read_text(encoding="utf-8")
+    )
+    assert schema["properties"]["record_kind"]["enum"] == ["METRIC", "SLEEP_SESSION"]
+    for field in (
+        "session_start_time",
+        "session_end_time",
+        "session_start_utc_offset_seconds",
+        "session_end_utc_offset_seconds",
+        "session_is_main",
+        "session_is_nap",
+    ):
+        assert field in schema["required"]
 
 
 def test_google_providers_override_the_user_adc_quota_project() -> None:

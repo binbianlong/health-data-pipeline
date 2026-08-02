@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable, Mapping, Sequence
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from math import isfinite
 from typing import Any, cast
 from zoneinfo import ZoneInfo
@@ -20,6 +20,7 @@ from health_data_pipeline.views import (
     DailyView,
     NotionGateway,
     NotionPage,
+    SleepSessionView,
     StepSample,
 )
 
@@ -357,7 +358,10 @@ class SnapshotViewSource:
         return tuple(
             row
             for row in self._daily_rows(root, metric_date)
-            if row.get("period_kind") == "DAY" and row.get("statistic") == "observed"
+            if row.get("period_kind") == "DAY"
+            and row.get("statistic") == "observed"
+            and row.get("dimension_key") is None
+            and row.get("record_kind", "METRIC") == "METRIC"
         )
 
     def _root_for_generation(self, generation: int) -> RootSnapshot:
@@ -408,18 +412,29 @@ class SnapshotViewSource:
         observed = {
             str(row["metric_name"]): row
             for row in rows
-            if row.get("statistic") == "observed" and row.get("period_kind") == "DAY"
+            if row.get("statistic") == "observed"
+            and row.get("period_kind") == "DAY"
+            and row.get("dimension_key") is None
+            and row.get("record_kind", "METRIC") == "METRIC"
         }
         weekly = {
             str(row["metric_name"]): row
             for row in rows
-            if row.get("statistic") == "mean" and row.get("period_kind") == "CALENDAR_WEEK"
+            if row.get("statistic") == "mean"
+            and row.get("period_kind") == "CALENDAR_WEEK"
+            and row.get("dimension_key") is None
+            and row.get("record_kind", "METRIC") == "METRIC"
         }
         monthly = {
             str(row["metric_name"]): row
             for row in rows
-            if row.get("statistic") == "mean" and row.get("period_kind") == "CALENDAR_MONTH"
+            if row.get("statistic") == "mean"
+            and row.get("period_kind") == "CALENDAR_MONTH"
+            and row.get("dimension_key") is None
+            and row.get("record_kind", "METRIC") == "METRIC"
         }
+        session_rows = tuple(row for row in rows if row.get("record_kind") == "SLEEP_SESSION")
+        sleep_sessions = tuple(_sleep_session_view(row) for row in session_rows)
         metrics = tuple(
             DailyMetric(
                 metric_name=name,
@@ -437,6 +452,7 @@ class SnapshotViewSource:
             for name, row in sorted(observed.items())
         )
         statuses = {metric.status for metric in metrics}
+        statuses.update(str(row.get("data_status", "UNKNOWN")) for row in session_rows)
         data_status = (
             next(iter(statuses)) if len(statuses) == 1 else ("MISSING" if not statuses else "MIXED")
         )
@@ -446,6 +462,8 @@ class SnapshotViewSource:
             data_status=data_status,
             fitbit_last_sync_time=root.state.fitbit_last_sync_time,
             metrics=metrics,
+            sleep_sessions=sleep_sessions,
+            sleep_sessions_available=bool(session_rows),
         )
 
     def _step_count(self, root: RootSnapshot, metric_date: date) -> int | None:
@@ -454,10 +472,52 @@ class SnapshotViewSource:
                 row.get("metric_name") == "steps"
                 and row.get("statistic") == "observed"
                 and row.get("period_kind") == "DAY"
+                and row.get("dimension_key") is None
+                and row.get("record_kind", "METRIC") == "METRIC"
             ):
                 value = _optional_number(row.get("value_num"))
                 return None if value is None else round(value)
         return None
+
+
+def _sleep_session_view(row: Mapping[str, Any]) -> SleepSessionView:
+    start = _required_aware_datetime(row.get("session_start_time"), "session_start_time")
+    end = _required_aware_datetime(row.get("session_end_time"), "session_end_time")
+    if end <= start:
+        raise ValueError("sleep session end must be after start")
+    start_offset = _required_utc_offset(row.get("session_start_utc_offset_seconds"))
+    end_offset = _required_utc_offset(row.get("session_end_utc_offset_seconds"))
+    is_main = row.get("session_is_main")
+    is_nap = row.get("session_is_nap")
+    if not isinstance(is_main, bool) or not isinstance(is_nap, bool):
+        raise TypeError("sleep session classification must be boolean")
+    return SleepSessionView(
+        start_time=start.astimezone(timezone(timedelta(seconds=start_offset))),
+        end_time=end.astimezone(timezone(timedelta(seconds=end_offset))),
+        is_main=is_main or "MAIN_SLEEP_INFERRED" in row.get("quality_flags", ()),
+        is_nap=is_nap,
+        minutes_asleep=_optional_number(row.get("value_num")),
+    )
+
+
+def _required_aware_datetime(value: Any, field: str) -> datetime:
+    if not isinstance(value, str):
+        raise TypeError(f"sleep session {field} must be a timestamp")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"sleep session {field} is invalid") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"sleep session {field} must be timezone-aware")
+    return parsed
+
+
+def _required_utc_offset(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("sleep session UTC offset must be an integer")
+    if abs(value) >= 24 * 60 * 60:
+        raise ValueError("sleep session UTC offset is outside the supported range")
+    return cast(int, value)
 
 
 def _date_properties(metric_date: date) -> dict[str, Any]:

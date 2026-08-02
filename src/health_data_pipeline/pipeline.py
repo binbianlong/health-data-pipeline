@@ -29,6 +29,7 @@ from health_data_pipeline.daily import (
     Observation,
     affected_metric_dates,
     build_daily_rows,
+    build_sleep_session_rows,
 )
 from health_data_pipeline.google_health import (
     DataPointPage,
@@ -39,6 +40,7 @@ from health_data_pipeline.job import SyncOutcome
 from health_data_pipeline.lease import LeaseRepository
 from health_data_pipeline.models import CommitKind, ContentReference, RootSnapshot
 from health_data_pipeline.normalization import normalize_daily_observations
+from health_data_pipeline.sleep_sessions import SleepSession, normalize_sleep_sessions
 from health_data_pipeline.snapshot import SnapshotRepository
 from health_data_pipeline.storage import (
     ContentAddressedStore,
@@ -92,7 +94,8 @@ _RECONCILIATION_MAX_DAYS = 90
 _BACKFILL_TIME_ZONE = ZoneInfo("Asia/Tokyo")
 _BACKFILL_META_KEY = "_schedule"
 _BACKFILL_POLICY_VERSION = 2
-_NORMALIZER_VERSION = "daily-v3"
+_NORMALIZER_VERSION = "daily-v4"
+_DAILY_SCHEMA_VERSION = 2
 _PRIORITY_BACKFILL_DATA_TYPES = ("sleep", "exercise")
 _HIGH_FREQUENCY_DATA_TYPES = frozenset(
     {
@@ -292,6 +295,8 @@ class IncrementalSyncPipeline:
             for query in ingested
             for point_date in normalize_daily_observations(query.data_points)
         )
+        changed_sleep_sessions = self._merge_changed_sleep_sessions(ingested)
+        changed_dates.update(changed_sleep_sessions)
         if not changed_dates:
             changed_dates.add(today)
         current_observations = self._merge_changed_observations(root, ingested)
@@ -300,6 +305,7 @@ class IncrementalSyncPipeline:
             root,
             targets,
             current_observations,
+            changed_sleep_sessions,
             zone=zone,
             now=now,
             fitbit_last_sync=fitbit_last_sync,
@@ -353,6 +359,7 @@ class IncrementalSyncPipeline:
                     ingestion_manifests=_unique_manifest_references(
                         item.manifest for item in ingested
                     ),
+                    daily_schema_version=_DAILY_SCHEMA_VERSION,
                 ),
                 expected_base=base,
             )
@@ -440,6 +447,9 @@ class IncrementalSyncPipeline:
         raw_references = tuple(self._publish_api_page(page) for page in pages)
         points = tuple(point for page in pages for point in page.data_points)
         normalized = normalize_daily_observations(points)
+        normalized_sleep_sessions = normalize_sleep_sessions(points) if data_type == "sleep" else {}
+        sleep_session_count = sum(len(sessions) for sessions in normalized_sleep_sessions.values())
+        sleep_source_count = sum(1 for point in points if isinstance(point.get("sleep"), Mapping))
         normalized_reference = self._publish_normalized_source(
             data_type,
             spec.record_kind,
@@ -496,9 +506,10 @@ class IncrementalSyncPipeline:
             "normalized_source": normalized_reference,
             "source_count": len(points),
             "normalized_count": sum(len(values) for values in normalized.values()),
-            "deduplicate_count": 0,
-            "schema_version_daily": 1,
+            "deduplicate_count": max(0, sleep_source_count - sleep_session_count),
+            "schema_version_daily": _DAILY_SCHEMA_VERSION,
             "normalizer_version": _NORMALIZER_VERSION,
+            "sleep_session_count": sleep_session_count,
             "expected_head_generation": expected_generation,
             "validation_result": "VALID",
         }
@@ -520,7 +531,10 @@ class IncrementalSyncPipeline:
         else:
             requested_dates = set(ordered_dates)
             for point in points:
-                for point_date in normalize_daily_observations((point,)):
+                point_dates = set(normalize_daily_observations((point,)))
+                if data_type == "sleep":
+                    point_dates.update(normalize_sleep_sessions((point,)))
+                for point_date in point_dates:
                     if point_date not in requested_dates:
                         raise ValueError("normalized observation falls outside replacement scope")
                     points_by_date[point_date].append(point)
@@ -639,11 +653,35 @@ class IncrementalSyncPipeline:
             result[metric_date] = tuple(existing[name] for name in sorted(existing))
         return result
 
+    def _merge_changed_sleep_sessions(
+        self,
+        ingested: Sequence[IngestedQuery],
+    ) -> dict[date, tuple[SleepSession, ...]]:
+        """Return full replacements only for explicitly queried sleep days."""
+
+        points_by_date: dict[date, list[Mapping[str, Any]]] = defaultdict(list)
+        queried_dates: set[date] = set()
+        for item in ingested:
+            if item.data_type != "sleep":
+                continue
+            queried_dates.add(item.metric_date)
+            points_by_date[item.metric_date].extend(item.data_points)
+
+        result: dict[date, tuple[SleepSession, ...]] = {}
+        for metric_date in sorted(queried_dates):
+            normalized = normalize_sleep_sessions(tuple(points_by_date[metric_date]))
+            unexpected_dates = set(normalized).difference({metric_date})
+            if unexpected_dates:
+                raise ValueError("sleep session falls outside its replacement day")
+            result[metric_date] = normalized.get(metric_date, ())
+        return result
+
     def _recalculate_rows(
         self,
         root: RootSnapshot | None,
         targets: Sequence[date],
         changed: Mapping[date, Sequence[Observation]],
+        changed_sleep_sessions: Mapping[date, Sequence[SleepSession]],
         *,
         zone: ZoneInfo,
         now: datetime,
@@ -680,10 +718,6 @@ class IncrementalSyncPipeline:
                 for observation in history.get(metric_date, ())
             )
             history[metric_date] = observations
-            if not observations:
-                if metric_date in changed:
-                    rows[metric_date] = None
-                continue
             start = datetime.combine(metric_date, time.min, tzinfo=zone).astimezone(UTC)
             end = datetime.combine(
                 metric_date + timedelta(days=1),
@@ -698,31 +732,54 @@ class IncrementalSyncPipeline:
                 physical_day_end=end,
                 logic_version=_NORMALIZER_VERSION,
             )
-            rows[metric_date] = build_daily_rows(context, observations, history)
+            metric_rows = build_daily_rows(context, observations, history) if observations else []
+            session_rows: list[Mapping[str, object]]
+            if metric_date in changed_sleep_sessions:
+                session_rows = list(
+                    build_sleep_session_rows(
+                        context,
+                        changed_sleep_sessions[metric_date],
+                        data_status=_data_status(
+                            metric_date,
+                            zone=zone,
+                            now=now,
+                            fitbit_last_sync=fitbit_last_sync,
+                        ),
+                    )
+                )
+            else:
+                session_rows = list(self._sleep_session_rows_for_date(root, metric_date))
+            combined_rows = [*metric_rows, *session_rows]
+            if combined_rows:
+                rows[metric_date] = combined_rows
+            elif metric_date in changed or metric_date in changed_sleep_sessions:
+                rows[metric_date] = None
         return rows
+
+    def _sleep_session_rows_for_date(
+        self,
+        root: RootSnapshot | None,
+        metric_date: date,
+    ) -> tuple[Mapping[str, object], ...]:
+        return tuple(
+            cast(Mapping[str, object], row)
+            for row in self._daily_rows_for_date(root, metric_date)
+            if row.get("record_kind") == "SLEEP_SESSION"
+        )
 
     def _observations_for_date(
         self,
         root: RootSnapshot | None,
         metric_date: date,
     ) -> tuple[Observation, ...]:
-        if root is None:
-            return ()
-        shard_reference = root.state.daily_year_shards.get(f"{metric_date.year:04d}")
-        if shard_reference is None:
-            return ()
-        shard = self._snapshots.load_year_shard(shard_reference)
-        revision = shard.daily_revisions.get(metric_date.isoformat())
-        if revision is None:
-            return ()
-        payload = self._snapshots.read_daily_revision(revision)
         result: list[Observation] = []
-        for line in payload.splitlines():
-            row = json.loads(line)
+        for row in self._daily_rows_for_date(root, metric_date):
             if (
                 not isinstance(row, Mapping)
                 or row.get("period_kind") != "DAY"
                 or row.get("statistic") != "observed"
+                or row.get("dimension_key") is not None
+                or row.get("record_kind", "METRIC") != "METRIC"
             ):
                 continue
             value = row.get("value_num")
@@ -741,6 +798,29 @@ class IncrementalSyncPipeline:
                 )
             )
         return tuple(result)
+
+    def _daily_rows_for_date(
+        self,
+        root: RootSnapshot | None,
+        metric_date: date,
+    ) -> tuple[Mapping[str, Any], ...]:
+        if root is None:
+            return ()
+        shard_reference = root.state.daily_year_shards.get(f"{metric_date.year:04d}")
+        if shard_reference is None:
+            return ()
+        shard = self._snapshots.load_year_shard(shard_reference)
+        revision = shard.daily_revisions.get(metric_date.isoformat())
+        if revision is None:
+            return ()
+        payload = self._snapshots.read_daily_revision(revision)
+        rows: list[Mapping[str, Any]] = []
+        for line in payload.splitlines():
+            row = json.loads(line)
+            if not isinstance(row, Mapping):
+                raise TypeError("daily revision row is not an object")
+            rows.append(cast(Mapping[str, Any], row))
+        return tuple(rows)
 
     def _current_generation(self) -> int | None:
         current = self._heads.read().head

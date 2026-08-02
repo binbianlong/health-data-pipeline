@@ -57,12 +57,25 @@ class DailyMetric:
 
 
 @dataclass(frozen=True, slots=True)
+class SleepSessionView:
+    """One committed sleep interval rendered with its edge-specific offsets."""
+
+    start_time: datetime
+    end_time: datetime
+    is_main: bool
+    is_nap: bool
+    minutes_asleep: int | float | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class DailyView:
     metric_date: date
     source_generation: int
     data_status: str
     fitbit_last_sync_time: datetime | None
     metrics: tuple[DailyMetric, ...]
+    sleep_sessions: tuple[SleepSessionView, ...] = ()
+    sleep_sessions_available: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,6 +234,56 @@ def _notion_metric_sort_key(metric: DailyMetric) -> tuple[int, int | str, str]:
     return (1, metric.metric_name, metric.statistic)
 
 
+def _format_session_time(value: datetime) -> str:
+    return value.isoformat(timespec="minutes")
+
+
+def _format_sleep_session(label: str, session: SleepSessionView) -> str:
+    duration = (
+        ""
+        if session.minutes_asleep is None
+        else f" / 睡眠時間: {_format_value(session.minutes_asleep)}分"
+    )
+    return (
+        f"- {label}: 就寝時刻 {_format_session_time(session.start_time)} / "
+        f"起床時刻 {_format_session_time(session.end_time)}{duration}"
+    )
+
+
+def _sleep_session_lines(view: DailyView) -> list[str]:
+    if not view.sleep_sessions_available:
+        return ["## 睡眠セッション", "主睡眠: 未取得", "昼寝: 未取得", ""]
+
+    ordered = tuple(sorted(view.sleep_sessions, key=lambda item: (item.start_time, item.end_time)))
+    main = tuple(session for session in ordered if session.is_main)
+    naps = tuple(session for session in ordered if session.is_nap and not session.is_main)
+    unknown = tuple(session for session in ordered if not session.is_main and not session.is_nap)
+    lines = ["## 睡眠セッション"]
+    if main:
+        lines.extend(
+            _format_sleep_session(
+                "主睡眠" if len(main) == 1 else f"主睡眠 {index}",
+                session,
+            )
+            for index, session in enumerate(main, start=1)
+        )
+    else:
+        lines.append("主睡眠: 未取得")
+    if naps:
+        lines.extend(
+            _format_sleep_session(f"昼寝 {index}", session)
+            for index, session in enumerate(naps, start=1)
+        )
+    else:
+        lines.append("昼寝: なし")
+    lines.extend(
+        _format_sleep_session(f"未分類の睡眠 {index}", session)
+        for index, session in enumerate(unknown, start=1)
+    )
+    lines.append("")
+    return lines
+
+
 def render_notion_body(view: DailyView) -> str:
     """Render a stable, compact table intended for ChatGPT consumption."""
 
@@ -249,6 +312,7 @@ def render_notion_body(view: DailyView) -> str:
             else "unknown"
         ),
         "",
+        *_sleep_session_lines(view),
         (
             "| Metric | Value | Unit | Calendar week avg "
             "(Mon-date; final Sun) | Week coverage | "
