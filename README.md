@@ -4,7 +4,7 @@ Fitbit Sense 2のGoogle Health APIデータをGCSへ保存し、日次値・月�
 
 BigQueryは使用しません。HEAD、Root Snapshot、年単位Shard、content-addressedな日次revisionにより、将来BigQueryを追加しても取得・日次計算を作り直さない構造です。詳細設計は[DESIGN.md](DESIGN.md)を参照してください。
 
-Notionには歩数、心拍、HRV、SpO2などに加え、主睡眠だけから計算した睡眠時間、REM睡眠、深い睡眠、浅い睡眠、覚醒時間、運動時間を日次long形式で表示します。主睡眠の就寝・起床時刻と昼寝の各sessionは分けて表示します。各項目にはその日の値、月曜始まりの暦週平均、暦月の月初来平均を含め、取得できなかった値は0ではなく`欠損`と明示します。
+Notionには歩数、心拍、HRV、SpO2などに加え、主睡眠だけから計算した睡眠時間、REM睡眠、深い睡眠、浅い睡眠、覚醒時間、運動時間を日次long形式で表示します。主睡眠の就寝・起床時刻と昼寝の各sessionは分けて表示します。各項目にはその日の値、月曜始まりの暦週平均、暦月の月初来平均を含めます。取得できなかった値は0ではなく`欠損`とその理由を明示し、実際に0だった日と区別します。
 
 ## 構成
 
@@ -286,6 +286,7 @@ ADCのquota project設定には`serviceusage.services.use`も必要です。権�
    | Property | Notion type |
    |---|---|
    | `Date` | Title |
+   | `Metric date` | Date |
    | `Source HEAD generation` | Number |
    | `Content SHA-256` | Rich text |
    | `Data status` | Select |
@@ -384,9 +385,13 @@ Jobs APIの成功はExecution作成成功であり、HEAD commit成功ではあ�
 
 - `state/data-head.json`のGCS generation付きCAS更新だけがcommit pointです。
 - prefix列挙や最大generation探索では現行データを決めません。
-- API原本とnormalized cacheは期限付きの非権威cacheです。`SAMPLE`と`INTERVAL`は90日、
+- API原本とflattened-source cacheは期限付きの非権威cacheです。`SAMPLE`と`INTERVAL`は90日、
   `SESSION`と`DAILY`は365日で削除します。
-- HEADから到達する日次revisionは正式な長期状態です。`daily-canonical` schema v2には全睡眠sessionの開始・終了時刻、両端のUTC offset、主睡眠・昼寝flagを保存し、raw cache削除後も長期保持します。
+- HEADから到達する日次revisionは正式な長期状態です。`daily-canonical` schema v3は`METRIC`、`SLEEP_SESSION`、`SOURCE_STATUS`の3種類を明示的に区別します。全睡眠sessionの開始・終了時刻とUTC offsetに加え、主睡眠・昼寝の判定根拠、処理状態、手動編集、睡眠種別、作成・更新時刻、sessionごとのsummaryとstage別値を保存します。
+- `SOURCE_STATUS`と`missing_reason`により、「照会して記録なし」「処理中」「未照会」を区別します。`coverage_kind`はcoverageの分母が観測数、civil日数、不明、対象外のどれかを示します。
+- Fitbit最終同期時刻が不明な場合は架空の時刻で埋めず`null`で保存します。civil dateに使ったtime zoneは、Google Health settings由来か設定値へのfallbackかも保存します。
+- sourceのdeduplicate・正規化・取得日範囲検証後に作るcontent-addressedなingestion Manifestは上書きせず、小容量の監査記録として保持します。daily canonical schemaはその後、daily revisionを公開する直前に厳密検証します。Manifestが参照するAPI原本とflattened-sourceの保持期限は延長しません。
+- 健康データbucketはobject versioningを有効にし、HEADなど同名objectの旧versionは7日後に削除します。長期状態の正規な選択は、version一覧ではなくHEADからの到達可能性で決めます。
 - CAS失敗時は同じJob内で再試行せず、objectも即時削除しません。
 - Notionは適用済みHEAD generationを比較し、古い値へ逆行しません。SVGは公開済みの最終日付とHEAD generationを比較し、前日までの7日分を1日1回だけ更新します。
 - BigQuery API、dataset、table、client dependencyは含みません。
@@ -397,7 +402,7 @@ Jobs APIの成功はExecution作成成功であり、HEAD commit成功ではあ�
 - 当月の推定Class A操作が3,000回に達したら過去バックフィルだけを停止し、UTCの翌月に自動再開します。現在同期、Webhook、Notion回収は停止しません。
 - Class A 4,000回は強い警告です。Cloud Run JobとServiceのGCS書込み・一覧取得を同じ月次stateへ集計し、公式のus-central1無料枠5,000回に対して余白を残します。
 - 保存済みデータの形式更新が必要な場合だけ、4,250回未満なら最新31日分の補正を1回許可します。成功後は通常の3,000回停止へ戻ります。
-- schema v2への移行中はClass A予算内で日付単位にbackfillするため、HEADから到達するrevisionにv1とv2が混在します。将来のBigQuery loaderはprefixを直接読まず、HEADとYear Shardが日付ごとに指す最新revisionだけを読みます。
+- schema v3への移行中はClass A予算内で日付単位にbackfillするため、HEADから到達するrevisionにv1、v2、v3が混在し得ます。将来のBigQuery loaderはprefixを直接読まず、HEADとYear Shardが日付ごとに指すcurrent revisionだけを選択し、v1・v2をv3へ変換してからloadします。
 - 高容量のraw cacheは30〜365日のGCS lifecycleで削除し、小容量のcanonical／Snapshot／Shardは現行実装では自動削除しません。健康データbucketが1 GiBを超えたら見直し通知を送ります。
 
 日次long rowの期間は`period_kind`で区別します。
@@ -407,7 +412,7 @@ Jobs APIの成功はExecution作成成功であり、HEAD commit成功ではあ�
 - `CALENDAR_WEEK`: 対象週の月曜日から対象日までを含む週初来値。日曜日rowがその週の確定値
 - `CALENDAR_MONTH`: 対象月の月初から対象日までを含む月初来値。月末rowがその月の確定値
 
-schema v2の一意keyは`record_kind + metric_name + statistic + period_kind + dimension_key`です。旧`window_days`や固定日数の月間rollingは使用しません。
+schema v3の一意keyは`record_kind + metric_name + statistic + period_kind + dimension_key`です。旧`window_days`や固定日数の月間rollingは使用しません。
 
 ## License
 

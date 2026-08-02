@@ -2,8 +2,8 @@
 
 | 項目 | 内容 |
 |---|---|
-| 文書バージョン | 3.2 |
-| 更新日 | 2026-07-29 |
+| 文書バージョン | 3.3 |
+| 更新日 | 2026-08-02 |
 | 対象 | Fitbit Sense 2を使う単一所有者 |
 | 実行基盤 | Google Cloud |
 | 実装言語 | Python 3.13 |
@@ -26,7 +26,7 @@
 
 `state/data-head.json`のcompare-and-swap（CAS）更新だけを唯一のcommit pointとする。Blob、Manifest、Snapshot、lease、Notion、SVGの更新はcommit pointではない。
 
-詳細rawデータは期限付きの非権威キャッシュとする。長期保存する正式な日次状態は、HEADが指すRoot SnapshotとYear Shardから到達できる`daily-canonical`である。
+詳細rawデータは期限付きの非権威キャッシュとする。長期保存する正式な日次状態は、HEADが指すRoot SnapshotとYear Shardから到達できる`daily-canonical`である。schema v3は指標、睡眠session、source照会結果を型付きrowとして保存し、欠損とtrue zero、未照会と照会済み空結果を区別する。
 
 ## 2. 目的
 
@@ -53,6 +53,8 @@
 8. audit参照はpayloadの保持を延長しない。
 9. 健康値、OAuth情報、Webhook秘密情報をログへ出さない。
 10. GCS prefixの最大generation探索を正規の読取方法にしない。
+11. 不明なFitbit最終同期時刻は架空のtimestampで埋めず`null`で保存する。
+12. coverageは分母の意味を`coverage_kind`で指定し、分母不明時は比率を作らない。
 
 ## 4. 対象外
 
@@ -292,8 +294,8 @@ Notion更新はJobまたは内部View更新Taskへ分離する。
 3. Sense 2の最終同期時刻とGoogle Health settingsを取得する。
 4. HEAD cursor以降のWebhookイベントを回収する。
 5. data type cursorを含むcivil dateから現在日までを、最大直近90日に制限して日単位で再照合する。
-6. API原本、normalized blob、ingestion Manifestを保存する。
-7. 影響日、同じ暦週と暦月の途中平均を再計算する。
+6. API原本、deduplicate後のflattened-source blobを保存し、source正規化を検証してingestion Manifestを保存する。
+7. 影響日、同じ暦週と暦月の途中平均を再計算し、daily canonical schemaを検証する。
 8. 影響年のYear Shardを作成する。
 9. Root Snapshotを作成する。
 10. HEADをCAS更新する。
@@ -320,7 +322,7 @@ gs://<health-bucket>/
   webhook-events/
   blobs/
     api-pages/
-    normalized/
+    flattened/
   manifests/
     ingestion/
     snapshots/
@@ -344,8 +346,8 @@ gs://<health-bucket>/
 | 種別 | 上書き | 役割 |
 |---|---|---|
 | API blob | しない | Google Health APIのレスポンス原本 |
-| Normalized blob | しない | 期限付きraw cache |
-| Ingestion Manifest | しない | 取得条件と検証結果 |
+| Flattened-source blob | しない | deduplicate後の期限付きraw cache |
+| Ingestion Manifest | しない | 取得条件と検証結果を残す小容量の監査記録 |
 | Daily revision | しない | 正式な日次longデータ |
 | Year Shard | しない | 1年分の現行daily revision map |
 | Root Snapshot | しない | 全年参照、cursor、commit差分 |
@@ -538,7 +540,7 @@ manifests/snapshot-shards/
   "year": 2026,
   "daily_revisions": {
     "2026-07-28": {
-      "uri": "daily-canonical/schema_version=2/metric_date=2026-07-28/canonicalization=fhcj-1/encoding=gzip-v1/sha256=<canonical-sha256>.ndjson.gz",
+      "uri": "daily-canonical/schema_version=3/metric_date=2026-07-28/canonicalization=fhcj-1/encoding=gzip-v1/sha256=<canonical-sha256>.ndjson.gz",
       "canonical_sha256": "...",
       "object_sha256": "...",
       "row_count": 42,
@@ -556,17 +558,19 @@ manifests/snapshot-shards/
 
 Root Snapshotと全Year Shardを合わせて日次の完全状態と定義する。
 
-## 13. 原本とnormalized cache
+## 13. 原本とflattened-source cache
 
 ### 13.1 保存順序
 
 ```text
 Google Health API
   → API原本blob
-  → 正規化
-  → 検証
-  → normalized blob
+  → page跨ぎのduplicate解決
+  → flattened-source blob
+  → source正規化・取得範囲検証
   → ingestion Manifest
+  → 日次正規化
+  → daily canonical schema検証
   → daily revision
   → Year Shard
   → Root Snapshot
@@ -579,10 +583,10 @@ API原本保存前に日次値、Notion、SVGを更新しない。
 
 ```text
 blobs/api-pages/canonicalization=fhcj-1/encoding=gzip-v1/sha256/ab/<hash>.json.gz
-blobs/normalized/record_kind=SAMPLE/data_type=heart-rate/canonicalization=fhcj-1/encoding=gzip-v1/sha256/cd/<hash>.ndjson.gz
-blobs/normalized/record_kind=INTERVAL/data_type=steps/canonicalization=fhcj-1/encoding=gzip-v1/sha256/de/<hash>.ndjson.gz
-blobs/normalized/record_kind=SESSION/data_type=sleep/canonicalization=fhcj-1/encoding=gzip-v1/sha256/ef/<hash>.ndjson.gz
-blobs/normalized/record_kind=DAILY/data_type=daily-resting-heart-rate/canonicalization=fhcj-1/encoding=gzip-v1/sha256/01/<hash>.ndjson.gz
+blobs/flattened/record_kind=SAMPLE/data_type=heart-rate/canonicalization=fhcj-1/encoding=gzip-v1/sha256/cd/<hash>.ndjson.gz
+blobs/flattened/record_kind=INTERVAL/data_type=steps/canonicalization=fhcj-1/encoding=gzip-v1/sha256/de/<hash>.ndjson.gz
+blobs/flattened/record_kind=SESSION/data_type=sleep/canonicalization=fhcj-1/encoding=gzip-v1/sha256/ef/<hash>.ndjson.gz
+blobs/flattened/record_kind=DAILY/data_type=daily-resting-heart-rate/canonicalization=fhcj-1/encoding=gzip-v1/sha256/01/<hash>.ndjson.gz
 ```
 
 - 同じcanonical contentは同じobjectを再利用する。
@@ -592,7 +596,9 @@ blobs/normalized/record_kind=DAILY/data_type=daily-resting-heart-rate/canonicali
 
 ### 13.3 Ingestion Manifest
 
-正規化検証後だけ作成する。
+sourceのdeduplicate、正規化、取得日範囲の検証後だけ作成する。日次revisionの
+schema検証はその後のcommit構築時に行い、失敗した場合はManifestがHEADから参照されない
+orphanとして残る。無効な日次revisionをHEADから参照することはない。
 
 ```text
 manifests/ingestion/date=YYYY-MM-DD/
@@ -608,20 +614,23 @@ manifests/ingestion/date=YYYY-MM-DD/
 - replacement scope
 - page数
 - API blob参照
-- normalized blob参照
+- flattened-source blob参照
 - source件数
-- normalized件数
-- deduplicate件数
-- schema version
+- flattened-source件数
+- duplicateとして除外した件数
+- daily schema version
 - normalizer version
+- source照会結果
 - expected HEAD generation
-- validation result
+- source normalization validation result
+
+Manifestはsource正規化と取得日範囲の検証が成功した取得単位だけに対して作る。content-addressed URIへ`ifGenerationMatch=0`で保存し、後から上書きしない。Manifest自体は取得条件、件数、hash、検証結果を追跡する小容量の監査記録として保持する。ただし、Manifestからの参照はAPI原本やflattened-source payloadの保持期限を延長しない。daily canonical schemaの成否はdaily revision公開時に別途検証する。
 
 ### 13.4 非権威キャッシュ
 
 Fitbit／Google Healthクラウドを詳細rawデータの上流sourceとする。
 
-GCS上のAPI blobとnormalized `SAMPLE`、`INTERVAL`、`SESSION`、`DAILY`は期限付き非権威キャッシュである。
+GCS上のAPI blobとflattened-source `SAMPLE`、`INTERVAL`、`SESSION`、`DAILY`は期限付き非権威キャッシュである。flattened-sourceはGoogle Healthのunion data pointを正確に再序列化した層であり、日次値の意味まで変換した層ではない。
 
 - cacheの期限切れはHEAD commitを無効にしない
 - cache indexは`state/raw-partitions/`へ置く
@@ -667,7 +676,7 @@ GCS上のAPI blobとnormalized `SAMPLE`、`INTERVAL`、`SESSION`、`DAILY`は期
 - 全page取得済み
 - API errorなし
 - queryとreplacementの境界規則が一致
-- normalized rowがscope外を含まない
+- flattened-sourceと日次正規化結果がscope外を含まない
 - conflicting duplicateなし
 
 汎用`record_id`は作らない。
@@ -720,10 +729,12 @@ Cloud RunのUTC日付を健康データの日付として使わない。
 日`D`は、対象time zoneにおける`D+1 04:05`以降の最初のJobでcanonical化する。
 
 - DSTをIANA time zoneで解決する。
-- 日ごとにtime zoneと物理開始・終了を保存する。
+- 日ごとにtime zone、その出典、物理開始・終了を保存する。`time_zone_source`はGoogle Health settingsの`GOOGLE_HEALTH_SETTINGS`、設定値へのfallbackを示す`CONFIG_DEFAULT`、旧schema変換時の`LEGACY_UNKNOWN`のいずれかとする。
+- Fitbit最終同期時刻を取得できない場合は`fitbit_last_sync_time=null`とし、1970年などの代替timestampを作らない。
 - 睡眠はcivil end dateへ帰属させる。
 - 睡眠の日次合計とstage別合計は`mainSleep=true`の主睡眠sessionだけから計算し、昼寝を加算しない。
-- 全睡眠sessionの開始・終了時刻、両端のUTC offset、`mainSleep`／`nap` flagは日次合計と別rowで保存する。
+- 全睡眠sessionの開始・終了時刻、両端のUTC offset、roleとその判定根拠、処理状態、stage状態、手動編集、睡眠種別、作成・更新時刻を日次合計と別rowで保存する。
+- sourceが持つsession summaryとstage summaryは、同じsession IDを`dimension_key`に持つlong-form `METRIC`として保存する。
 - 運動はcivil start dateへ帰属させる。
 
 | Status | 条件 |
@@ -762,16 +773,26 @@ Cloud RunのUTC日付を健康データの日付として使わない。
 
 ```text
 daily-canonical/
-  schema_version=2/
+  schema_version=3/
   metric_date=2026-07-28/
   canonicalization=fhcj-1/
   encoding=gzip-v1/
   sha256=<canonical-sha256>.ndjson.gz
 ```
 
-`schema_version`と`metric_date`は将来のBigQuery Hive partitioningに使用できる。v2は日次指標に加えて睡眠sessionを正式な長期状態として保持する。raw cacheのlifecycleとは独立し、HEAD、Root Snapshot、Year Shardから到達するrevisionを削除しない。
+`schema_version`と`metric_date`は将来のBigQuery Hive partitioningに使用できる。v3は日次指標に加えて、睡眠sessionとsource照会結果を正式な長期状態として保持する。raw cacheのlifecycleとは独立し、HEAD、Root Snapshot、Year Shardから到達するrevisionを削除しない。
 
-### 16.2 Row
+### 16.2 Tagged row
+
+各rowは`record_kind`で厳密に型を切り替える。未知のfieldや未対応のschema versionは受け入れない。
+
+| `record_kind` | 役割 |
+|---|---|
+| `METRIC` | 日次値、暦週・暦月平均、sessionごとのsummary・stage値 |
+| `SLEEP_SESSION` | 1睡眠sessionの時間境界、role、source metadata |
+| `SOURCE_STATUS` | 1 data type・1 civil日の照会結果 |
+
+`METRIC`の例：
 
 ```json
 {
@@ -787,26 +808,92 @@ daily-canonical/
   "period_start": "2026-07-28",
   "period_end": "2026-07-28",
   "sample_count": 1,
-  "expected_count": 1,
-  "coverage_ratio": 1.0,
+  "expected_count": null,
+  "coverage_ratio": null,
+  "coverage_kind": "UNKNOWN",
   "data_status": "CANONICAL_SYNCED",
+  "missing_reason": null,
   "quality_flags": [],
   "source_data_types": ["steps"],
   "fitbit_last_sync_time": "2026-07-28T00:00:00Z",
   "time_zone": "Asia/Tokyo",
+  "time_zone_source": "GOOGLE_HEALTH_SETTINGS",
   "physical_day_start": "2026-07-27T15:00:00Z",
   "physical_day_end": "2026-07-28T15:00:00Z",
-  "logic_version": "daily-v4",
+  "logic_version": "daily-v5",
   "session_start_time": null,
   "session_end_time": null,
   "session_start_utc_offset_seconds": null,
   "session_end_utc_offset_seconds": null,
   "session_is_main": null,
-  "session_is_nap": null
+  "session_is_nap": null,
+  "session_role": null,
+  "session_role_source": null,
+  "session_processed": null,
+  "session_manually_edited": null,
+  "session_stages_status": null,
+  "session_sleep_type": null,
+  "session_create_time": null,
+  "session_update_time": null
 }
 ```
 
-睡眠session rowは`record_kind=SLEEP_SESSION`、`period_kind=SESSION`とし、sessionごとに一意な`dimension_key`を持つ。`session_start_time`と`session_end_time`は物理時刻、UTC offsetは各edgeのcivil time復元用とする。`session_is_main`は日次値に採用した明示的な主睡眠、`session_is_nap`はGoogle Healthの昼寝flagを表す。主睡眠flagがない場合は決定的に1件を選び、`quality_flags`へ`MAIN_SLEEP_INFERRED`を付ける。METRIC rowではsession専用fieldをnullにする。
+### 16.3 欠損とcoverage
+
+`METRIC`は値がない場合もrow自体を省略せず、`value_num=null`、`data_status=MISSING`、`missing_reason`を保存する。使用する理由コードは次のとおり。
+
+- `NO_SOURCE_VALUE`: 対応sourceをすべて照会したが値がない
+- `SOURCE_PROCESSING`: source側が処理中
+- `INVALID_SOURCE`: sourceが有効な値として扱えない
+- `NOT_QUERIED`: 代替sourceを含む必要な照会がまだ揃っていない
+- `SESSION_VALUE_UNAVAILABLE`: 睡眠sessionの時間境界はあるがsummary値がない
+
+`coverage_ratio`だけでは分母の意味を判断できないため、`coverage_kind`を必須にする。
+
+| `coverage_kind` | `expected_count` / `coverage_ratio` | 意味 |
+|---|---|---|
+| `UNKNOWN` | 両方`null` | sourceから期待観測数を決められない |
+| `OBSERVATION_COUNT` | 定義済み | 期待観測数に対する取得数 |
+| `CALENDAR_DAYS` | 定義済み | 暦週・暦月の対象civil日数に対する有効日数 |
+| `NOT_APPLICABLE` | 両方`null` | session envelopeやsource照会結果など比率が対象外 |
+
+暦週・暦月の`sample_count`は有効日数、`expected_count`は対象civil日数とする。欠損日は0として平均に入れず、`PARTIAL_COVERAGE`とcoverageで不足を明示する。
+
+### 16.4 睡眠session
+
+`SLEEP_SESSION`は`period_kind=SESSION`、`metric_name=sleep_session`とし、sessionごとに一意な`dimension_key`を持つ。`session_start_time`と`session_end_time`は物理時刻、UTC offsetは各edgeのcivil time復元用とする。
+
+- `session_role`: `MAIN`、`NAP`、`UNCLASSIFIED`
+- `session_role_source`: source flagによる`SOURCE_FLAG`、決定的推定の`INFERRED`、未分類の`UNCLASSIFIED`
+- `session_processed`、`session_stages_status`、`session_manually_edited`、`session_sleep_type`: Google Healthが返す処理・品質・種別metadata
+- `session_create_time`、`session_update_time`: source recordの作成・更新時刻
+
+明示的な主睡眠が完全なsessionとして使えない場合、保存できるsession集合から決定的に1件を選び、`session_role=MAIN`、`session_role_source=INFERRED`、`MAIN_SLEEP_INFERRED`を保存する。日次睡眠合計も必ずその同sessionを使い、session envelopeと異なる候補から計算しない。
+
+session summaryとstage summaryは、`record_kind=METRIC`、`period_kind=SESSION`、同じ`dimension_key`のlong rowとする。実装するsummary指標は次のとおり。
+
+- `sleep_session_minutes_asleep`
+- `sleep_session_minutes_in_sleep_period`
+- `sleep_session_minutes_awake`
+- `sleep_session_minutes_to_fall_asleep`
+- `sleep_session_minutes_after_wake_up`
+- `sleep_session_stage_<stage>_minutes`
+- `sleep_session_stage_<stage>_count`
+
+sessionの開始・終了時刻とmetadataは`SLEEP_SESSION`にだけ持たせ、session指標の`METRIC`では重複させない。
+
+### 16.5 Source status
+
+`SOURCE_STATUS`はdata type名を`dimension_key`に持ち、`value_num`をsource件数、`sample_count`を日次値とmaterializeできたsessionの件数とする。`value_text`は次のいずれかとする。
+
+- `SUCCESS_WITH_DATA`
+- `SUCCESS_EMPTY`
+- `SOURCE_PROCESSING`
+- `INVALID_SOURCE`
+
+このrowにより、daily metricがないのが「sourceを照会して記録がなかった」ためか、「処理中」または「未照会」のためかを後から判断できる。
+
+### 16.6 共通fieldと一意key
 
 Daily rowには次を入れない。
 
@@ -816,7 +903,7 @@ Daily rowには次を入れない。
 - Snapshot URI
 - 任意構造の巨大JSON
 
-一意key：
+v3の一意keyは次のとおり。
 
 ```text
 record_kind
@@ -843,7 +930,7 @@ record_kind
 - `CALENDAR_WEEK`: 月曜日から対象日までの暦週平均。日曜日rowが確定値
 - `CALENDAR_MONTH`: 月初から対象日までの暦月平均
 
-### 16.3 Schema version
+### 16.7 Schema version
 
 ```text
 schemas/
@@ -852,12 +939,14 @@ schemas/
     v1.bigquery.json
     v2.schema.json
     v2.bigquery.json
+    v3.schema.json
+    v3.bigquery.json
 ```
 
-- v1は変更しない。v2は`record_kind`と型付き睡眠session fieldを必須fieldとして追加する。
-- schema v2移行backfillはClass A予算gateに従い、日付単位で進める。完了まではHEADから到達するdaily revisionにv1とv2が混在する。
+- v1とv2は不変の互換契約として残す。v3は厳密なtagged union、明示的な欠損・coverage、source status、睡眠metadataとsession指標を追加する。
+- schema v3移行backfillはClass A予算gateに従い、日付単位で進める。完了まではHEADから到達するdaily revisionにv1、v2、v3が混在し得る。
 - 古いpartitionを自動で書き換えない。
-- 将来のBigQuery loaderはv1 rowへv2の追加fieldを補うconverterを持つ。
+- 将来のBigQuery loaderはv1・v2 rowをv3へ変換するconverterを持つ。旧schemaに出典がないtime zoneは`LEGACY_UNKNOWN`、判定不能なfieldは`null`とし、推測値を作らない。
 
 ## 17. Leaseと並行実行
 
@@ -888,13 +977,15 @@ leaseはAPI取得とGCS操作の重複を減らす最適化である。
 |---|---:|
 | `webhook-events/` | 30日 |
 | `blobs/api-pages/` | 30日 |
-| `blobs/normalized/record_kind=SAMPLE/` | 90日 |
-| `blobs/normalized/record_kind=INTERVAL/` | 90日 |
-| `blobs/normalized/record_kind=SESSION/` | 365日 |
-| `blobs/normalized/record_kind=DAILY/` | 365日 |
-| `manifests/ingestion/` | 365日 |
+| `blobs/flattened/record_kind=SAMPLE/` | 90日 |
+| `blobs/flattened/record_kind=INTERVAL/` | 90日 |
+| `blobs/flattened/record_kind=SESSION/` | 365日 |
+| `blobs/flattened/record_kind=DAILY/` | 365日 |
+| `manifests/ingestion/` | 無期限（小容量の監査記録） |
 | OAuth一時session | 失効後24時間 |
 | 一時処理履歴 | 90日 |
+
+旧versionが書き込んだ`blobs/normalized/`にも、record kindごとに同じ90日・365日のlifecycleを残す。新規書込みは`blobs/flattened/`だけに行う。
 
 ### 18.2 v1の長期保持と将来GC
 
@@ -908,7 +999,9 @@ Snapshot、Year Shard、daily revisionには単純なprefix lifecycleを設定�
 - 各日付の現行daily revision: 無期限
 - 未commit orphan: v1では自動削除しない
 
-高容量になり得るAPI原本とnormalized cacheは18.1の固定lifecycleで削除する。content-addressedなcanonical、Snapshot、Year Shardは同じ内容を重複保存せず、個人利用では小容量のため、v1は誤削除を避けて保持する。CAS失敗直後にもobjectを削除しない。
+高容量になり得るAPI原本とflattened-source cacheは18.1の固定lifecycleで削除する。content-addressedなcanonical、ingestion Manifest、Snapshot、Year Shardは同じ内容を重複保存せず、個人利用では小容量のため、v1は誤削除を避けて保持する。CAS失敗直後にもobjectを削除しない。
+
+健康データbucketはobject versioningを有効にする。HEADなど同名objectの上書きで生じたnoncurrent versionは7日間保持し、その後`ARCHIVED`をlifecycle削除する。versioningは誤更新からの短期復旧用であり、正式な現行状態の選択は引き続きHEADからの到達可能性だけで行う。soft deleteは無効とする。
 
 `gc.py`は将来の到達可能性GCに使う純粋な判定器であり、v1のJobは列挙・削除を実行しない。健康データbucketが1 GiBを超えたら警告し、実測に基づいてactive GCの導入を判断する。
 
@@ -958,6 +1051,7 @@ Snapshot、Year Shard、daily revisionには単純なprefix lifecycleを設定�
 非公開Notion databaseの専用data sourceへ日付ごとに1ページ作る。
 
 - Date
+- Metric date（Notion Date型）
 - Data status
 - Source HEAD generation
 - Fitbit last sync time
@@ -978,15 +1072,17 @@ Snapshot、Year Shard、daily revisionには単純なprefix lifecycleを設定�
 - 運動時間
 - 各指標の暦週平均（月曜〜対象日、日曜確定）
 - 各指標の暦月平均
-- coverageとquality flag
+- missing reason、coverage kind、coverage、quality flag
+- source照会結果とtime zoneの出典
 
-Notion本文にはChatGPTが読みやすい固定順の短い表を生成する。主睡眠の就寝・起床時刻と昼寝sessionを別の表示欄にし、日付とUTC offsetを含むcivil timeで示す。睡眠時間、REM睡眠、深い睡眠、浅い睡眠、覚醒時間の日次値は主睡眠だけから計算する。保存上の`metric_name`はそれぞれ`sleep_minutes`、`sleep_rem_minutes`、`sleep_deep_minutes`、`sleep_light_minutes`、`sleep_awake_minutes`とし、運動時間は`exercise_minutes`とする。値が取得できない項目も表から省略せず`欠損`と表示し、0とは区別する。API原本や高頻度sampleは書かない。
+Notion本文にはChatGPTが読みやすい固定順の短い表を生成する。主睡眠の就寝・起床時刻と昼寝sessionを別の表示欄にし、日付とUTC offsetを含むcivil timeで示す。睡眠時間、REM睡眠、深い睡眠、浅い睡眠、覚醒時間の日次値は主睡眠だけから計算する。保存上の`metric_name`はそれぞれ`sleep_minutes`、`sleep_rem_minutes`、`sleep_deep_minutes`、`sleep_light_minutes`、`sleep_awake_minutes`とし、運動時間は`exercise_minutes`とする。値が取得できない項目も表から省略せず`欠損`と`missing_reason`を表示し、0とは区別する。分母不明のcoverageを100%と表示しない。API原本や高頻度sampleは書かない。
 
 初回はtitleプロパティを1つ持つ空のdata sourceを作成し、integrationへ共有する。`make notion-configure`はNotion API `2026-03-11`を使い、次のschemaを冪等に作成または修復する。
 
 | Property | Notion type | 用途 |
 |---|---|---|
 | `Date` | Title | civil dateとページ回収key |
+| `Metric date` | Date | 日付としてfilter・sortできるcivil date |
 | `Source HEAD generation` | Number | generation逆行防止 |
 | `Content SHA-256` | Rich text | 内容一致時の更新省略 |
 | `Data status` | Select | 日次データ状態 |
@@ -1215,7 +1311,7 @@ active versionは各secret 5以内とする。古いversionはrotation確認後�
 
 - 健康値
 - API原本
-- normalized row
+- flattened-source rowとdaily canonical row
 - OAuth token、code、state、nonce、PKCE
 - Authorization header
 - Webhook本文
@@ -1255,7 +1351,7 @@ OR
 
 ## 25. Fitbit最終同期
 
-Root Snapshotへ`fitbit_last_sync_time`を保存する。
+Root Snapshotへ`fitbit_last_sync_time`を保存する。Google Healthから時刻を取得できない場合は`null`とし、古い時刻やUnix epochで不明を代替しない。日次rowにも同じnullable値を保存する。
 
 Jobは最終同期からの経過秒数をCloud Monitoring metricとして出力する。
 
@@ -1273,7 +1369,7 @@ Jobは最終同期からの経過秒数をCloud Monitoring metricとして出力
 
 ## 26. Class A操作と費用
 
-健康データGCSはStandard storage、soft delete無効、object versioning無効、Autoclass無効とする。
+健康データGCSはStandard storage、soft delete無効、object versioning有効、Autoclass無効とする。noncurrent versionは7日で削除し、長期の容量増加を抑える。
 
 Cloud Run JobとService内のGCS `put` / `list`試行を数え、各JobまたはHTTP request終了時にUTC月単位のstateへCAS加算する。`get`と無料操作である`delete`は推定対象外とする。Serviceでは同一instance内の集計更新をlockで直列化し、instance間の競合はGCS CASで解決する。月次state自身の書込試行とCAS競合時の再試行も推定値へ含めるが、推定stateの更新失敗によって、すでに成功した健康データのcommitやHTTP処理を失敗扱いにはしない。bucket全体の容量警告とCloud Billing Budgetも併用する。
 
@@ -1354,11 +1450,12 @@ rebuildは手動実行とする。Cloud Billing Budgetも別に設定する。�
 2. HEADが指すRoot Snapshotを取得する。
 3. canonical hashとschemaを検証する。
 4. `state.daily_year_shards`から必要年を取得する。
-5. Year Shardが日付ごとに指す最新daily revision URIだけをloadする。v1/v2混在時はschema versionを判定し、v1 rowをcurrent schemaへ変換する。
-6. staging tableへloadする。
-7. 対象日のpartitionをDELETEする。
-8. stagingからINSERTする。
-9. 全件成功後だけloaded HEAD generationを更新する。
+5. Year Shardが日付ごとに指すcurrent daily revision URIだけをloadする。prefix上の更新時刻や最大object generationでrevisionを選ばない。
+6. revisionごとのschema versionを判定する。v1・v2はv3 converterを通し、v3はそのまま厳密検証する。変換後は`METRIC`、`SLEEP_SESSION`、`SOURCE_STATUS`のtag制約を満たすることを確認する。
+7. staging tableへloadする。
+8. 対象日のpartitionをDELETEする。
+9. stagingからINSERTする。
+10. 全件成功後だけloaded HEAD generationを更新する。
 
 増分loadは、前回loaded Snapshotから現行Snapshotまでの`changed_metric_dates`をunionする。親Snapshotが保持期限切れの場合はYear Shard同士を比較するか、全日付を再loadする。
 
@@ -1376,7 +1473,7 @@ rebuildは手動実行とする。Cloud Billing Budgetも別に設定する。�
 - partition: `metric_date`
 - cluster: `metric_name`, `statistic`
 - require partition filter
-- GCS schema v2と同じ列。`record_kind`とsessionのTIMESTAMP、INTEGER、BOOLEAN列を含む
+- GCS schema v3と同じ列。`record_kind`、`missing_reason`、`coverage_kind`、`time_zone_source`、sessionのTIMESTAMP、INTEGER、BOOLEAN、role・状態列を含む
 
 BigQuery client libraryは現在のdependencyへ入れない。
 
@@ -1517,7 +1614,12 @@ BigQuery API、dataset、table、IAMは作らない。
 - duplicate conflict
 - civil time / DST
 - 暦週・暦月再計算
-- long row schema
+- schema v1・v2・v3の厳密検証とv3 tagged union
+- explicit missing reasonとcoverage kind
+- source statusによる空結果・処理中・未照会の区別
+- 主睡眠の日次値とsession envelopeの同一候補性
+- session summary・stage summaryのlong row
+- nullableなFitbit最終同期時刻とtime zone出典
 - daily rowへのgeneration混入禁止
 - Year Shard生成
 - 複数年Shard更新
@@ -1538,6 +1640,8 @@ BigQuery API、dataset、table、IAMは作らない。
 - Firebase Hostingの公開7 pathだけがCloud Runへrewriteされること
 - immutable content-addressed object
 - API原本からingestion Manifest
+- ingestion Manifestをauditとして残し、期限切れpayloadはpinしないこと
+- health bucketのobject versioningとnoncurrent versionの7日lifecycle
 - Year ShardからRoot Snapshot
 - HEAD precondition failure
 - CAS失敗後にobject削除なし
@@ -1563,6 +1667,9 @@ BigQuery API、dataset、table、IAMは作らない。
 - Notionが古いgenerationへ逆行せず、SVGが古いgenerationまたは公開済み日付へ逆行しない。
 - Notion障害中もHEAD commitが進む。
 - raw cache期限切れ後もdaily-canonicalを読める。
+- v3の欠損rowがtrue zeroと区別され、分母不明のcoverageが100%にならない。
+- Fitbit最終同期が不明な日に`null`とtime zone出典が保存される。
+- 将来loaderがYear Shardのcurrent revisionだけを選び、v1・v2をv3へ変換できる。
 - audit参照がraw payloadを永久保持しない。
 - callback code、state、queryが`_Default` log bucketへ残らない。
 - Class A 3,000回到達後はbackfillだけ停止し、現在データ収集が継続する。
@@ -1583,7 +1690,7 @@ BigQuery API、dataset、table、IAMは作らない。
 4. Canonical JSON、NDJSON、gzip、content hash
 5. OAuth setup code、session状態機械、owner識別
 6. Google Health adapter、paging、replacement strategy
-7. API blob、normalized cache、ingestion Manifest
+7. API blob、flattened-source cache、ingestion Manifest
 8. Daily long schema、civil time、暦週・暦月平均
 9. Year Shard、Root Snapshot、HEAD CAS
 10. Webhook保存、Cloud TasksからJobs API起動
