@@ -1,0 +1,408 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://health-data-pipeline.local/schemas/daily_metrics/v3.schema.json",
+  "title": "DailyMetricV3",
+  "description": "One strictly tagged metric, sleep-session, or source-status row. metric_date is carried by the GCS partition path.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "record_kind",
+    "metric_name",
+    "statistic",
+    "period_kind",
+    "dimension_key",
+    "value_num",
+    "value_text",
+    "unit",
+    "aggregation",
+    "period_start",
+    "period_end",
+    "sample_count",
+    "expected_count",
+    "coverage_ratio",
+    "coverage_kind",
+    "data_status",
+    "missing_reason",
+    "quality_flags",
+    "source_data_types",
+    "fitbit_last_sync_time",
+    "time_zone",
+    "time_zone_source",
+    "physical_day_start",
+    "physical_day_end",
+    "logic_version",
+    "session_start_time",
+    "session_end_time",
+    "session_start_utc_offset_seconds",
+    "session_end_utc_offset_seconds",
+    "session_is_main",
+    "session_is_nap",
+    "session_role",
+    "session_role_source",
+    "session_processed",
+    "session_manually_edited",
+    "session_stages_status",
+    "session_sleep_type",
+    "session_create_time",
+    "session_update_time"
+  ],
+  "properties": {
+    "record_kind": {
+      "type": "string",
+      "enum": ["METRIC", "SLEEP_SESSION", "SOURCE_STATUS"]
+    },
+    "metric_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9_]*$"
+    },
+    "statistic": {
+      "type": "string",
+      "enum": ["observed", "mean", "delta", "delta_percent", "min", "max", "coverage"]
+    },
+    "period_kind": {
+      "type": "string",
+      "enum": ["DAY", "SESSION", "CALENDAR_WEEK", "CALENDAR_MONTH"]
+    },
+    "dimension_key": {
+      "type": ["string", "null"],
+      "maxLength": 256
+    },
+    "value_num": {
+      "type": ["number", "null"]
+    },
+    "value_text": {
+      "type": ["string", "null"],
+      "maxLength": 2048
+    },
+    "unit": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "aggregation": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "period_start": {
+      "type": "string",
+      "format": "date"
+    },
+    "period_end": {
+      "type": "string",
+      "format": "date"
+    },
+    "sample_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "expected_count": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "coverage_ratio": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "maximum": 1
+    },
+    "coverage_kind": {
+      "type": "string",
+      "enum": ["UNKNOWN", "OBSERVATION_COUNT", "CALENDAR_DAYS", "NOT_APPLICABLE"]
+    },
+    "data_status": {
+      "type": "string",
+      "enum": [
+        "PROVISIONAL",
+        "CANONICAL_SYNCED",
+        "CANONICAL_STALE",
+        "MISSING",
+        "INSUFFICIENT_DATA"
+      ]
+    },
+    "missing_reason": {
+      "type": ["string", "null"],
+      "maxLength": 2048
+    },
+    "quality_flags": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1, "maxLength": 128},
+      "uniqueItems": true
+    },
+    "source_data_types": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1, "maxLength": 256},
+      "uniqueItems": true
+    },
+    "fitbit_last_sync_time": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "time_zone": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "time_zone_source": {
+      "type": "string",
+      "enum": ["GOOGLE_HEALTH_SETTINGS", "CONFIG_DEFAULT", "LEGACY_UNKNOWN"]
+    },
+    "physical_day_start": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "physical_day_end": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "logic_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "session_start_time": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "session_end_time": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "session_start_utc_offset_seconds": {
+      "type": ["integer", "null"],
+      "minimum": -64800,
+      "maximum": 64800
+    },
+    "session_end_utc_offset_seconds": {
+      "type": ["integer", "null"],
+      "minimum": -64800,
+      "maximum": 64800
+    },
+    "session_is_main": {
+      "type": ["boolean", "null"]
+    },
+    "session_is_nap": {
+      "type": ["boolean", "null"]
+    },
+    "session_role": {
+      "type": ["string", "null"],
+      "enum": ["MAIN", "NAP", "UNCLASSIFIED", null]
+    },
+    "session_role_source": {
+      "type": ["string", "null"],
+      "enum": ["SOURCE_FLAG", "INFERRED", "UNCLASSIFIED", null]
+    },
+    "session_processed": {
+      "type": ["boolean", "null"]
+    },
+    "session_manually_edited": {
+      "type": ["boolean", "null"]
+    },
+    "session_stages_status": {
+      "type": ["string", "null"],
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "session_sleep_type": {
+      "type": ["string", "null"],
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "session_create_time": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "session_update_time": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "coverage_kind": {"enum": ["UNKNOWN", "NOT_APPLICABLE"]}
+        }
+      },
+      "then": {
+        "properties": {
+          "expected_count": {"type": "null"},
+          "coverage_ratio": {"type": "null"}
+        }
+      },
+      "else": {
+        "properties": {
+          "expected_count": {"type": "integer", "minimum": 0}
+        }
+      }
+    }
+  ],
+  "oneOf": [
+    {
+      "title": "MetricRowV3",
+      "properties": {
+        "record_kind": {"const": "METRIC"},
+        "metric_name": {"not": {"const": "source_status"}},
+        "session_start_time": {"type": "null"},
+        "session_end_time": {"type": "null"},
+        "session_start_utc_offset_seconds": {"type": "null"},
+        "session_end_utc_offset_seconds": {"type": "null"},
+        "session_is_main": {"type": "null"},
+        "session_is_nap": {"type": "null"},
+        "session_role": {"type": "null"},
+        "session_role_source": {"type": "null"},
+        "session_processed": {"type": "null"},
+        "session_manually_edited": {"type": "null"},
+        "session_stages_status": {"type": "null"},
+        "session_sleep_type": {"type": "null"},
+        "session_create_time": {"type": "null"},
+        "session_update_time": {"type": "null"}
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "period_kind": {"enum": ["CALENDAR_WEEK", "CALENDAR_MONTH"]}
+            }
+          },
+          "then": {
+            "properties": {"coverage_kind": {"const": "CALENDAR_DAYS"}}
+          }
+        },
+        {
+          "if": {"properties": {"period_kind": {"const": "SESSION"}}},
+          "then": {
+            "properties": {
+              "dimension_key": {"type": "string", "minLength": 1, "maxLength": 256}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"data_status": {"const": "MISSING"}}},
+          "then": {
+            "properties": {
+              "value_num": {"type": "null"},
+              "value_text": {"type": "null"},
+              "missing_reason": {"type": "string", "minLength": 1, "maxLength": 2048}
+            }
+          }
+        }
+      ]
+    },
+    {
+      "title": "SleepSessionRowV3",
+      "properties": {
+        "record_kind": {"const": "SLEEP_SESSION"},
+        "metric_name": {"const": "sleep_session"},
+        "statistic": {"const": "observed"},
+        "period_kind": {"const": "SESSION"},
+        "dimension_key": {"type": "string", "minLength": 1, "maxLength": 256},
+        "value_num": {"type": ["number", "null"], "minimum": 0},
+        "unit": {"const": "min"},
+        "aggregation": {"const": "session_value"},
+        "expected_count": {"type": "null"},
+        "coverage_ratio": {"type": "null"},
+        "coverage_kind": {"const": "NOT_APPLICABLE"},
+        "session_start_time": {"type": "string", "format": "date-time"},
+        "session_end_time": {"type": "string", "format": "date-time"},
+        "session_start_utc_offset_seconds": {
+          "type": "integer",
+          "minimum": -64800,
+          "maximum": 64800
+        },
+        "session_end_utc_offset_seconds": {
+          "type": "integer",
+          "minimum": -64800,
+          "maximum": 64800
+        },
+        "session_is_main": {"type": "boolean"},
+        "session_is_nap": {"type": "boolean"},
+        "session_role": {"enum": ["MAIN", "NAP", "UNCLASSIFIED"]},
+        "session_role_source": {"enum": ["SOURCE_FLAG", "INFERRED", "UNCLASSIFIED"]}
+      }
+    },
+    {
+      "title": "SourceStatusRowV3",
+      "properties": {
+        "record_kind": {"const": "SOURCE_STATUS"},
+        "metric_name": {"const": "source_status"},
+        "statistic": {"const": "observed"},
+        "period_kind": {"const": "DAY"},
+        "dimension_key": {"type": "string", "minLength": 1, "maxLength": 256},
+        "value_num": {"type": "number", "minimum": 0, "multipleOf": 1},
+        "value_text": {
+          "enum": [
+            "SUCCESS_WITH_DATA",
+            "SUCCESS_EMPTY",
+            "SOURCE_PROCESSING",
+            "INVALID_SOURCE"
+          ]
+        },
+        "unit": {"const": "records"},
+        "aggregation": {"const": "query_result"},
+        "source_data_types": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1, "maxLength": 256},
+          "minItems": 1,
+          "maxItems": 1,
+          "uniqueItems": true
+        },
+        "expected_count": {"type": "null"},
+        "coverage_ratio": {"type": "null"},
+        "coverage_kind": {"const": "NOT_APPLICABLE"},
+        "session_start_time": {"type": "null"},
+        "session_end_time": {"type": "null"},
+        "session_start_utc_offset_seconds": {"type": "null"},
+        "session_end_utc_offset_seconds": {"type": "null"},
+        "session_is_main": {"type": "null"},
+        "session_is_nap": {"type": "null"},
+        "session_role": {"type": "null"},
+        "session_role_source": {"type": "null"},
+        "session_processed": {"type": "null"},
+        "session_manually_edited": {"type": "null"},
+        "session_stages_status": {"type": "null"},
+        "session_sleep_type": {"type": "null"},
+        "session_create_time": {"type": "null"},
+        "session_update_time": {"type": "null"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"value_text": {"const": "SUCCESS_EMPTY"}}},
+          "then": {
+            "properties": {
+              "value_num": {"const": 0},
+              "sample_count": {"const": 0}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"value_text": {"const": "SUCCESS_WITH_DATA"}}},
+          "then": {
+            "properties": {
+              "value_num": {"type": "number", "exclusiveMinimum": 0, "multipleOf": 1},
+              "sample_count": {"type": "integer", "minimum": 1}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"value_text": {"const": "SOURCE_PROCESSING"}}},
+          "then": {
+            "properties": {
+              "value_num": {"type": "number", "exclusiveMinimum": 0, "multipleOf": 1}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"value_text": {"const": "INVALID_SOURCE"}}},
+          "then": {
+            "properties": {
+              "value_num": {"type": "number", "exclusiveMinimum": 0, "multipleOf": 1},
+              "sample_count": {"const": 0}
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

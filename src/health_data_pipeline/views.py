@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime
 from typing import Any, Protocol
 
+from health_data_pipeline.metrics import METRIC_DEFINITIONS
 from health_data_pipeline.oauth import read_state, write_state
 from health_data_pipeline.storage import (
     ObjectNotFound,
@@ -25,13 +26,9 @@ STEPS_HEAD_PATH = "state/views/steps-head.json"
 STEPS_SVG_CANONICALIZATION = "fhcj-3"
 
 _NOTION_METRIC_LABELS = {
-    "sleep_minutes": "睡眠時間",
-    "sleep_rem_minutes": "REM睡眠",
-    "sleep_deep_minutes": "深い睡眠",
-    "sleep_light_minutes": "浅い睡眠",
-    "sleep_awake_minutes": "覚醒時間",
-    "exercise_minutes": "運動時間",
+    definition.name: definition.notion_label for definition in METRIC_DEFINITIONS
 }
+_NOTION_METRIC_UNITS = {definition.name: definition.unit for definition in METRIC_DEFINITIONS}
 _NOTION_METRIC_ORDER = {
     metric_name: index for index, metric_name in enumerate(_NOTION_METRIC_LABELS)
 }
@@ -54,6 +51,12 @@ class DailyMetric:
     weekly_coverage: float | None = None
     monthly_coverage: float | None = None
     quality_flags: tuple[str, ...] = ()
+    missing_reason: str | None = None
+    coverage_kind: str = "UNKNOWN"
+    weekly_status: str | None = None
+    monthly_status: str | None = None
+    weekly_quality_flags: tuple[str, ...] = ()
+    monthly_quality_flags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +68,10 @@ class SleepSessionView:
     is_main: bool
     is_nap: bool
     minutes_asleep: int | float | None = None
+    role_source: str | None = None
+    processed: bool | None = None
+    stages_status: str | None = None
+    manually_edited: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,8 +81,13 @@ class DailyView:
     data_status: str
     fitbit_last_sync_time: datetime | None
     metrics: tuple[DailyMetric, ...]
+    time_zone: str | None = None
+    time_zone_source: str | None = None
+    physical_day_start: datetime | None = None
+    physical_day_end: datetime | None = None
     sleep_sessions: tuple[SleepSessionView, ...] = ()
     sleep_sessions_available: bool = False
+    sleep_source_status: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,14 +256,28 @@ def _format_sleep_session(label: str, session: SleepSessionView) -> str:
         if session.minutes_asleep is None
         else f" / 睡眠時間: {_format_value(session.minutes_asleep)}分"
     )
+    details: list[str] = []
+    if session.role_source == "INFERRED":
+        details.append("主睡眠判定: 推定")
+    if session.processed is False:
+        details.append("Fitbit処理中")
+    if session.stages_status:
+        details.append(f"睡眠ステージ状態: {session.stages_status}")
+    if session.manually_edited is True:
+        details.append("手動編集あり")
+    suffix = "" if not details else " / " + " / ".join(details)
     return (
         f"- {label}: 就寝時刻 {_format_session_time(session.start_time)} / "
-        f"起床時刻 {_format_session_time(session.end_time)}{duration}"
+        f"起床時刻 {_format_session_time(session.end_time)}{duration}{suffix}"
     )
 
 
 def _sleep_session_lines(view: DailyView) -> list[str]:
     if not view.sleep_sessions_available:
+        if view.sleep_source_status == "SUCCESS_EMPTY":
+            return ["## 睡眠セッション", "主睡眠: 記録なし", "昼寝: なし", ""]
+        if view.sleep_source_status == "SOURCE_PROCESSING":
+            return ["## 睡眠セッション", "主睡眠: Fitbit処理中", "昼寝: 判定待ち", ""]
         return ["## 睡眠セッション", "主睡眠: 未取得", "昼寝: 未取得", ""]
 
     ordered = tuple(sorted(view.sleep_sessions, key=lambda item: (item.start_time, item.end_time)))
@@ -294,8 +320,9 @@ def render_notion_body(view: DailyView) -> str:
             metric_name=metric_name,
             statistic="value",
             value=None,
-            unit="min",
+            unit=_NOTION_METRIC_UNITS[metric_name],
             status="MISSING",
+            missing_reason="NOT_QUERIED",
         )
         for metric_name in _NOTION_METRIC_LABELS
         if (metric_name, "value") not in present
@@ -311,23 +338,41 @@ def render_notion_body(view: DailyView) -> str:
             if view.fitbit_last_sync_time is not None
             else "unknown"
         ),
+        f"Time zone: {view.time_zone or 'unknown'}",
+        f"Time zone source: {view.time_zone_source or 'unknown'}",
+        "Physical day: "
+        + (
+            f"{view.physical_day_start.isoformat()} / {view.physical_day_end.isoformat()}"
+            if view.physical_day_start is not None and view.physical_day_end is not None
+            else "unknown"
+        ),
         "",
         *_sleep_session_lines(view),
         (
             "| Metric | Value | Unit | Calendar week avg "
-            "(Mon-date; final Sun) | Week coverage | "
-            "Calendar month avg (1st-date) | Month coverage | Status | Daily coverage |"
+            "(Mon-date; final Sun) | Week coverage | Week status | "
+            "Calendar month avg (1st-date) | Month coverage | Month status | "
+            "Daily status | Daily coverage |"
         ),
-        "|---|---:|---|---:|---:|---:|---:|---|---:|",
+        "|---|---:|---|---:|---:|---|---:|---:|---|---|---:|",
     ]
     for metric in sorted(metrics, key=_notion_metric_sort_key):
         metric_label = _NOTION_METRIC_LABELS.get(metric.metric_name, metric.metric_name)
         label = (
             metric_label if metric.statistic == "value" else f"{metric_label} ({metric.statistic})"
         )
-        coverage = _format_coverage(metric.coverage)
+        coverage = f"{_format_coverage(metric.coverage)} ({metric.coverage_kind})"
         flags = ",".join(sorted(metric.quality_flags))
-        status = metric.status if not flags else f"{metric.status}; {flags}"
+        missing = "" if metric.missing_reason is None else f"; {metric.missing_reason}"
+        status = metric.status + missing if not flags else f"{metric.status}{missing}; {flags}"
+        weekly_flags = ",".join(sorted(metric.weekly_quality_flags))
+        weekly_status = metric.weekly_status or "unknown"
+        if weekly_flags:
+            weekly_status += f"; {weekly_flags}"
+        monthly_flags = ",".join(sorted(metric.monthly_quality_flags))
+        monthly_status = metric.monthly_status or "unknown"
+        if monthly_flags:
+            monthly_status += f"; {monthly_flags}"
         lines.append(
             "| "
             + " | ".join(
@@ -337,8 +382,10 @@ def render_notion_body(view: DailyView) -> str:
                     metric.unit or "",
                     _format_value(metric.weekly_average),
                     _format_coverage(metric.weekly_coverage),
+                    weekly_status,
                     _format_value(metric.monthly_average),
                     _format_coverage(metric.monthly_coverage),
+                    monthly_status,
                     status,
                     coverage,
                 )

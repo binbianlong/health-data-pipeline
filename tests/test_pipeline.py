@@ -10,6 +10,7 @@ import pytest
 
 from health_data_pipeline.budget import ClassAMonthState, class_a_month_state_path
 from health_data_pipeline.commit import CommitCoordinator, CommitRequest
+from health_data_pipeline.daily import SourceQueryStatus
 from health_data_pipeline.google_health import DataPointPage, FetchWindow
 from health_data_pipeline.models import CommitKind, ContentReference
 from health_data_pipeline.pipeline import (
@@ -19,10 +20,12 @@ from health_data_pipeline.pipeline import (
     IngestedQuery,
     _advance_backfill_cursors_many,
     _backfill_budget_allows,
+    _deduplicate_data_points,
     _interval_dates,
     _reconciliation_fetch_start,
     _reopen_backfill_gaps,
     _select_backfill_chunks,
+    _time_zone,
     _unique_manifest_references,
 )
 from health_data_pipeline.snapshot import SnapshotRepository
@@ -210,9 +213,27 @@ def test_initial_sync_commits_civil_days_and_calendar_periods() -> None:
         if window.civil_start is not None
     )
     rows = _daily_rows(heads, snapshots, today)
-    observed = next(row for row in rows if row["period_kind"] == "DAY")
-    weekly = next(row for row in rows if row["period_kind"] == "CALENDAR_WEEK")
-    monthly = next(row for row in rows if row["period_kind"] == "CALENDAR_MONTH")
+    observed = next(
+        row
+        for row in rows
+        if row["record_kind"] == "METRIC"
+        and row["metric_name"] == "steps"
+        and row["period_kind"] == "DAY"
+    )
+    weekly = next(
+        row
+        for row in rows
+        if row["record_kind"] == "METRIC"
+        and row["metric_name"] == "steps"
+        and row["period_kind"] == "CALENDAR_WEEK"
+    )
+    monthly = next(
+        row
+        for row in rows
+        if row["record_kind"] == "METRIC"
+        and row["metric_name"] == "steps"
+        and row["period_kind"] == "CALENDAR_MONTH"
+    )
     assert observed["value_num"] == 8_000
     assert weekly["period_start"] == "2026-07-27"
     assert weekly["period_end"] == "2026-07-28"
@@ -221,9 +242,51 @@ def test_initial_sync_commits_civil_days_and_calendar_periods() -> None:
     head = heads.read().head
     assert head is not None
     root = snapshots.load_root_snapshot(head.root_snapshot)
+    source_statuses = {
+        row["dimension_key"]: row for row in rows if row["record_kind"] == "SOURCE_STATUS"
+    }
+    assert set(source_statuses) == set(SUPPORTED_DATA_TYPES)
+    assert source_statuses["steps"]["value_text"] == "SUCCESS_WITH_DATA"
+    assert source_statuses["steps"]["value_num"] == 1
+    assert source_statuses["sleep"]["value_text"] == "SUCCESS_EMPTY"
+    assert source_statuses["sleep"]["value_num"] == 0
+    assert all(row["coverage_kind"] == "NOT_APPLICABLE" for row in source_statuses.values())
+    missing_sleep = next(
+        row
+        for row in rows
+        if row["record_kind"] == "METRIC"
+        and row["metric_name"] == "sleep_minutes"
+        and row["period_kind"] == "DAY"
+    )
+    assert missing_sleep["value_num"] is None
+    assert missing_sleep["missing_reason"] == "NO_SOURCE_VALUE"
+    assert missing_sleep["data_status"] == "MISSING"
     assert root.state.data_type_cursors["steps"] == {
         "reconciled_through_date": "2026-07-28",
         "reconciled_at": "2026-07-28T12:00:00Z",
+    }
+    content = ContentAddressedStore(store)
+    manifests = [
+        json.loads(content.read(reference)) for reference in root.change_set.ingestion_manifests
+    ]
+    steps_manifest = next(
+        manifest
+        for manifest in manifests
+        if manifest["data_type"] == "steps"
+        and manifest["query_window"]["civil_start"] == today.isoformat()
+    )
+    assert steps_manifest["schema_version"] == 3
+    assert steps_manifest["schema_version_daily"] == 3
+    assert steps_manifest["normalizer_version"] == "daily-v5"
+    assert "normalized_source" not in steps_manifest
+    assert "blobs/flattened/" in steps_manifest["flattened_source"]["uri"]
+    assert steps_manifest["source_stream_row_count"] == 1
+    assert steps_manifest["flattened_source_row_count"] == 1
+    assert steps_manifest["duplicate_source_row_count"] == 0
+    assert steps_manifest["source_query_statuses"][today.isoformat()] == {
+        "status": "SUCCESS_WITH_DATA",
+        "source_count": 1,
+        "normalized_count": 1,
     }
 
 
@@ -300,7 +363,7 @@ def test_each_idle_run_backfills_next_sleep_and_exercise_interval() -> None:
     )
     assert root.state.backfill_cursors["_schedule"] == {
         "last_completed_civil_date": "2026-07-28",
-        "normalizer_version": "daily-v4",
+        "normalizer_version": "daily-v5",
         "next_data_type_index": 0,
         "policy_version": 2,
     }
@@ -356,7 +419,9 @@ def test_session_backfill_materializes_sleep_stages_and_exercise_minutes() -> No
     observed = {
         row["metric_name"]: row
         for row in rows
-        if row["period_kind"] == "DAY" and row["statistic"] == "observed"
+        if row["record_kind"] == "METRIC"
+        and row["period_kind"] == "DAY"
+        and row["statistic"] == "observed"
     }
     assert {metric_name: row["value_num"] for metric_name, row in observed.items()} == {
         "exercise_minutes": 30,
@@ -366,7 +431,7 @@ def test_session_backfill_materializes_sleep_stages_and_exercise_minutes() -> No
         "sleep_minutes": 420,
         "sleep_rem_minutes": 90,
     }
-    assert all(row["logic_version"] == "daily-v4" for row in observed.values())
+    assert all(row["logic_version"] == "daily-v5" for row in observed.values())
     sessions = [row for row in rows if row.get("record_kind") == "SLEEP_SESSION"]
     assert len(sessions) == 1
     assert sessions[0]["session_start_time"] == "2026-07-09T16:00:00Z"
@@ -375,7 +440,7 @@ def test_session_backfill_materializes_sleep_stages_and_exercise_minutes() -> No
     assert head is not None
     root = snapshots.load_root_snapshot(head.root_snapshot)
     shard = snapshots.load_year_shard(root.state.daily_year_shards["2026"])
-    assert shard.daily_revisions[metric_date.isoformat()].schema_version == 2
+    assert shard.daily_revisions[metric_date.isoformat()].schema_version == 3
 
 
 def test_sleep_uses_main_session_for_totals_and_retains_main_and_nap_boundaries() -> None:
@@ -528,7 +593,15 @@ def test_empty_sleep_replacement_removes_stale_sessions_but_keeps_other_metrics(
 
     rows = _daily_rows(heads, snapshots, metric_date)
     assert not any(row.get("record_kind") == "SLEEP_SESSION" for row in rows)
-    assert not any(row.get("metric_name") == "sleep_minutes" for row in rows)
+    sleep_total = next(
+        row
+        for row in rows
+        if row.get("record_kind") == "METRIC"
+        and row.get("metric_name") == "sleep_minutes"
+        and row.get("period_kind") == "DAY"
+    )
+    assert sleep_total["value_num"] is None
+    assert sleep_total["missing_reason"] == "NO_SOURCE_VALUE"
     assert any(row.get("metric_name") == "steps" for row in rows)
 
 
@@ -609,7 +682,7 @@ def test_normalizer_upgrade_allows_only_one_bounded_correction_batch() -> None:
     )
 
     old_version: dict[str, Any] = {"_schedule": {"normalizer_version": "daily-v2"}}
-    current_version: dict[str, Any] = {"_schedule": {"normalizer_version": "daily-v4"}}
+    current_version: dict[str, Any] = {"_schedule": {"normalizer_version": "daily-v5"}}
 
     assert _backfill_budget_allows(store, old_version, now=NOW)
     assert not _backfill_budget_allows(store, current_version, now=NOW)
@@ -633,6 +706,7 @@ def test_normalizer_upgrade_commits_once_then_returns_to_backfill_pause() -> Non
                     "normalizer_version": "daily-v2",
                 }
             },
+            preserve_fitbit_last_sync_time=True,
         ),
         expected_base=heads.read(),
     )
@@ -664,7 +738,7 @@ def test_normalizer_upgrade_commits_once_then_returns_to_backfill_pause() -> Non
     root = snapshots.load_root_snapshot(head.root_snapshot)
     schedule = root.state.backfill_cursors["_schedule"]
     assert isinstance(schedule, dict)
-    assert schedule["normalizer_version"] == "daily-v4"
+    assert schedule["normalizer_version"] == "daily-v5"
 
 
 def test_backfill_waits_for_notion_without_blocking_the_initial_sync() -> None:
@@ -845,8 +919,24 @@ def test_partial_detail_ingestion_cannot_replace_existing_daily_summary() -> Non
                     "data_type": "heart-rate-variability",
                     "metric_date": metric_date.isoformat(),
                 },
+                source_status=SourceQueryStatus(
+                    data_type="heart-rate-variability",
+                    status="SUCCESS_WITH_DATA",
+                    source_count=1,
+                    normalized_count=1,
+                ),
             ),
         ),
+        source_statuses={
+            metric_date: (
+                SourceQueryStatus(
+                    data_type="heart-rate-variability",
+                    status="SUCCESS_WITH_DATA",
+                    source_count=1,
+                    normalized_count=1,
+                ),
+            )
+        },
     )
 
     hrv = next(
@@ -921,7 +1011,7 @@ def test_new_normalizer_reopens_recent_sleep_and_exercise_together() -> None:
     )
     assert advanced["_schedule"] == {
         "last_completed_civil_date": "2026-07-28",
-        "normalizer_version": "daily-v4",
+        "normalizer_version": "daily-v5",
         "next_data_type_index": 0,
         "policy_version": 2,
     }
@@ -932,7 +1022,7 @@ def test_completed_priority_backfill_resumes_legacy_round_robin() -> None:
     cursors: dict[str, Any] = {
         "_schedule": {
             "last_completed_civil_date": "2026-07-27",
-            "normalizer_version": "daily-v4",
+            "normalizer_version": "daily-v5",
             "next_data_type_index": 0,
             "policy_version": 2,
         },
@@ -1024,6 +1114,113 @@ def test_manifest_references_are_deduplicated_by_uri() -> None:
     )
 
     assert _unique_manifest_references((reference, reference)) == (reference,)
+
+
+def test_named_non_sleep_data_points_drop_exact_page_overlap() -> None:
+    metric_date = date(2026, 7, 28)
+    point = {
+        "dataPointName": "users/me/dataPoints/steps-1",
+        **_steps_point(metric_date, 8_000),
+    }
+
+    selected, duplicate_count = _deduplicate_data_points(
+        "steps",
+        (point, json.loads(json.dumps(point))),
+    )
+
+    assert selected == (point,)
+    assert duplicate_count == 1
+
+
+def test_named_non_sleep_data_points_reject_conflicting_page_overlap() -> None:
+    metric_date = date(2026, 7, 28)
+    first = {
+        "dataPointName": "users/me/dataPoints/steps-1",
+        **_steps_point(metric_date, 8_000),
+    }
+    conflicting = {
+        "dataPointName": "users/me/dataPoints/steps-1",
+        **_steps_point(metric_date, 8_001),
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="reconciled data point identity has conflicting payloads",
+    ):
+        _deduplicate_data_points("steps", (first, conflicting))
+
+
+def test_sleep_named_revisions_keep_the_latest_update() -> None:
+    metric_date = date(2026, 7, 28)
+    older: dict[str, Any] = json.loads(
+        json.dumps(
+            _sleep_point(
+                metric_date,
+                data_point_name="users/me/dataPoints/sleep-1",
+                start_time="2026-07-27T14:30:00Z",
+                end_time="2026-07-27T22:30:00Z",
+                minutes_asleep=400,
+                main_sleep=True,
+                nap=False,
+            )
+        )
+    )
+    newer: dict[str, Any] = json.loads(
+        json.dumps(
+            _sleep_point(
+                metric_date,
+                data_point_name="users/me/dataPoints/sleep-1",
+                start_time="2026-07-27T14:30:00Z",
+                end_time="2026-07-27T22:30:00Z",
+                minutes_asleep=420,
+                main_sleep=True,
+                nap=False,
+            )
+        )
+    )
+    older["sleep"]["updateTime"] = "2026-07-28T10:00:00Z"
+    newer["sleep"]["updateTime"] = "2026-07-28T11:00:00Z"
+
+    selected, duplicate_count = _deduplicate_data_points(
+        "sleep",
+        (older, newer),
+    )
+
+    assert selected == (newer,)
+    assert duplicate_count == 1
+
+
+def test_sleep_anonymous_exact_page_overlap_is_reconciled_once() -> None:
+    point: dict[str, Any] = json.loads(
+        json.dumps(
+            _sleep_point(
+                date(2026, 7, 28),
+                data_point_name="users/me/dataPoints/sleep-1",
+                start_time="2026-07-27T14:30:00Z",
+                end_time="2026-07-27T22:30:00Z",
+                minutes_asleep=420,
+                main_sleep=True,
+                nap=False,
+            )
+        )
+    )
+    point.pop("dataPointName")
+
+    selected, duplicate_count = _deduplicate_data_points(
+        "sleep",
+        (point, json.loads(json.dumps(point))),
+    )
+
+    assert selected == (point,)
+    assert duplicate_count == 1
+
+
+def test_time_zone_records_whether_google_settings_or_default_was_used() -> None:
+    assert _time_zone({}, "Asia/Tokyo") == ("Asia/Tokyo", "CONFIG_DEFAULT")
+    assert _time_zone({"timeZone": "America/New_York"}, "Asia/Tokyo") == (
+        "America/New_York",
+        "GOOGLE_HEALTH_SETTINGS",
+    )
 
 
 def test_api_failure_keeps_head_uncommitted() -> None:

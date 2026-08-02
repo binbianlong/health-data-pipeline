@@ -255,6 +255,7 @@ class GoogleHealthClient:
         page_number = 0
         for chunk in split_fetch_window(window, spec.max_window):
             page_token: str | None = None
+            seen_page_tokens: set[str] = set()
             while True:
                 if spec.record_kind in {"daily", "session"}:
                     start_value = (chunk.civil_start or chunk.start.date()).isoformat()
@@ -294,6 +295,10 @@ class GoogleHealthClient:
                 if raw_next is not None and not isinstance(raw_next, str):
                     raise GoogleHealthError("nextPageToken must be a string")
                 page_token = raw_next or None
+                if page_token is not None:
+                    if page_token in seen_page_tokens:
+                        raise GoogleHealthError("nextPageToken repeated within one query window")
+                    seen_page_tokens.add(page_token)
                 yield DataPointPage(
                     data_type=data_type,
                     window=chunk,

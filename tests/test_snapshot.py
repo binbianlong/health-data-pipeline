@@ -42,6 +42,7 @@ def _daily_row(
     period_kind: str = "DAY",
     value: int = 8432,
 ) -> dict[str, object]:
+    metric_date = date(2026, 7, 28)
     return {
         "metric_name": "steps",
         "statistic": statistic,
@@ -51,6 +52,19 @@ def _daily_row(
         "value_text": None,
         "unit": "count",
         "aggregation": "daily_sum",
+        "period_start": date(2026, 7, 1) if period_kind == "CALENDAR_MONTH" else metric_date,
+        "period_end": metric_date,
+        "sample_count": 1,
+        "expected_count": 1,
+        "coverage_ratio": Decimal(1),
+        "data_status": "CANONICAL_SYNCED",
+        "quality_flags": [],
+        "source_data_types": ["steps"],
+        "fitbit_last_sync_time": NOW,
+        "time_zone": "UTC",
+        "physical_day_start": datetime(2026, 7, 28, tzinfo=UTC),
+        "physical_day_end": datetime(2026, 7, 29, tzinfo=UTC),
+        "logic_version": "daily-v1",
     }
 
 
@@ -101,10 +115,19 @@ def test_daily_revision_rejects_commit_metadata_and_duplicate_keys() -> None:
 
 def test_daily_v2_uses_record_kind_in_its_unique_key() -> None:
     repository, _ = _repository()
-    metric = {**_daily_row(), "record_kind": "METRIC"}
+    session_fields = {
+        "session_start_time": None,
+        "session_end_time": None,
+        "session_start_utc_offset_seconds": None,
+        "session_end_utc_offset_seconds": None,
+        "session_is_main": None,
+        "session_is_nap": None,
+    }
+    metric = {**_daily_row(), "record_kind": "METRIC", **session_fields}
     session = {
         **_daily_row(),
         "record_kind": "SLEEP_SESSION",
+        **session_fields,
     }
 
     reference = repository.publish_daily_revision(
@@ -513,3 +536,24 @@ def test_snapshot_repository_rejects_wrong_reference_shape_and_row_count() -> No
         repository.load_root_snapshot(
             root_reference.model_copy(update={"uri": "other/root.json.gz"})
         )
+
+
+def test_daily_reference_uri_is_bound_to_partition_schema_and_hash() -> None:
+    repository, _ = _repository()
+    daily = repository.publish_daily_revision(
+        "2026-07-28",
+        [_daily_row()],
+        source_generation=1,
+    )
+    wrong_uris = (
+        daily.uri.replace("metric_date=2026-07-28", "metric_date=2026-07-29"),
+        daily.uri.replace("schema_version=1", "schema_version=2"),
+        daily.uri.replace(daily.canonical_sha256, "f" * 64),
+    )
+
+    for wrong_uri in wrong_uris:
+        invalid = daily.model_copy(update={"uri": wrong_uri})
+        with pytest.raises(SnapshotValidationError, match="metric date, schema version, or hash"):
+            build_year_shard(2026, replacements={"2026-07-28": invalid})
+        with pytest.raises(StorageIntegrityError, match="metric date, schema version, or hash"):
+            repository.read_daily_revision(invalid, metric_date="2026-07-28")

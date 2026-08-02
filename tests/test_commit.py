@@ -24,8 +24,22 @@ def _rows(value: int) -> list[dict[str, object]]:
             "period_kind": "DAY",
             "dimension_key": None,
             "value_num": Decimal(value),
+            "value_text": None,
+            "unit": "count",
+            "aggregation": "daily_sum",
             "period_start": date(2026, 7, 28),
             "period_end": date(2026, 7, 28),
+            "sample_count": 1,
+            "expected_count": 1,
+            "coverage_ratio": Decimal(1),
+            "data_status": "CANONICAL_SYNCED",
+            "quality_flags": [],
+            "source_data_types": ["steps"],
+            "fitbit_last_sync_time": NOW,
+            "time_zone": "UTC",
+            "physical_day_start": NOW,
+            "physical_day_end": datetime(2026, 7, 29, tzinfo=UTC),
+            "logic_version": "daily-v1",
         }
     ]
 
@@ -114,3 +128,42 @@ def test_stale_commit_cannot_adopt_and_overwrite_a_newer_head() -> None:
     assert current is not None
     root = snapshots.load_root_snapshot(current.root_snapshot)
     assert root.generation == 1
+
+
+def test_commit_can_clear_or_explicitly_preserve_last_sync_time() -> None:
+    coordinator, heads, _ = _coordinator()
+    first = coordinator.commit(
+        CommitRequest(
+            daily_rows={},
+            commit_kind=CommitKind.SCHEDULED,
+            created_at=NOW,
+            fitbit_last_sync_time=NOW,
+            time_zone="UTC",
+        ),
+        expected_base=heads.read(),
+    )
+    assert first.root_snapshot.state.fitbit_last_sync_time == NOW
+
+    preserved = coordinator.commit(
+        CommitRequest(
+            daily_rows={},
+            commit_kind=CommitKind.BACKFILL,
+            created_at=NOW,
+            preserve_fitbit_last_sync_time=True,
+            time_zone="UTC",
+        ),
+        expected_base=heads.read(),
+    )
+    assert preserved.root_snapshot.state.fitbit_last_sync_time == NOW
+
+    cleared = coordinator.commit(
+        CommitRequest(
+            daily_rows={},
+            commit_kind=CommitKind.SCHEDULED,
+            created_at=NOW,
+            fitbit_last_sync_time=None,
+            time_zone="UTC",
+        ),
+        expected_base=heads.read(),
+    )
+    assert cleared.root_snapshot.state.fitbit_last_sync_time is None
