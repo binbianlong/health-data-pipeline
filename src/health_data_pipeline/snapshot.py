@@ -37,6 +37,8 @@ DAILY_UNIQUE_KEY = (
     "period_kind",
     "dimension_key",
 )
+DAILY_UNIQUE_KEY_V2 = ("record_kind", *DAILY_UNIQUE_KEY)
+DAILY_SCHEMA_V2 = 2
 _FORBIDDEN_DAILY_COMMIT_FIELDS = frozenset(
     {
         "commit_generation",
@@ -245,8 +247,12 @@ class SnapshotRepository:
         *,
         source_generation: int,
         schema_version: int = 1,
-        unique_key_fields: Sequence[str] = DAILY_UNIQUE_KEY,
+        unique_key_fields: Sequence[str] | None = None,
     ) -> DailyRevisionReference:
+        if unique_key_fields is None:
+            unique_key_fields = (
+                DAILY_UNIQUE_KEY_V2 if schema_version >= DAILY_SCHEMA_V2 else DAILY_UNIQUE_KEY
+            )
         materialized_rows = [_mapping_row(row) for row in rows]
         _validate_daily_rows(materialized_rows, unique_key_fields)
         canonical_content = canonical_ndjson_bytes(

@@ -57,6 +57,33 @@ def _steps_point(value: date, count: int) -> Mapping[str, Any]:
     }
 
 
+def _sleep_point(
+    metric_date: date,
+    *,
+    data_point_name: str,
+    start_time: str,
+    end_time: str,
+    minutes_asleep: int,
+    main_sleep: bool,
+    nap: bool,
+) -> Mapping[str, Any]:
+    return {
+        "dataPointName": data_point_name,
+        "sleep": {
+            "interval": {
+                "civilEndTime": {"date": _civil_date(metric_date)},
+                "startTime": start_time,
+                "startUtcOffset": "32400s",
+                "endTime": end_time,
+                "endUtcOffset": "32400s",
+            },
+            "metadata": {"mainSleep": main_sleep, "nap": nap},
+            "summary": {"minutesAsleep": str(minutes_asleep)},
+            "updateTime": "2026-07-28T11:00:00Z",
+        },
+    }
+
+
 class FakeHealth:
     def __init__(
         self,
@@ -273,7 +300,7 @@ def test_each_idle_run_backfills_next_sleep_and_exercise_interval() -> None:
     )
     assert root.state.backfill_cursors["_schedule"] == {
         "last_completed_civil_date": "2026-07-28",
-        "normalizer_version": "daily-v3",
+        "normalizer_version": "daily-v4",
         "next_data_type_index": 0,
         "policy_version": 2,
     }
@@ -284,28 +311,28 @@ def test_each_idle_run_backfills_next_sleep_and_exercise_interval() -> None:
 def test_session_backfill_materializes_sleep_stages_and_exercise_minutes() -> None:
     store = InMemoryObjectStore(clock=lambda: NOW)
     metric_date = date(2026, 7, 10)
+    sleep = _sleep_point(
+        metric_date,
+        data_point_name="users/me/dataPoints/sleep-main",
+        start_time="2026-07-09T16:00:00Z",
+        end_time="2026-07-09T23:00:00Z",
+        minutes_asleep=420,
+        main_sleep=True,
+        nap=False,
+    )
+    sleep["sleep"]["summary"] = {
+        "minutesAsleep": "420",
+        "stagesSummary": [
+            {"type": "REM", "minutes": "90"},
+            {"type": "DEEP", "minutes": "60"},
+            {"type": "LIGHT", "minutes": "270"},
+            {"type": "AWAKE", "minutes": "30"},
+        ],
+    }
     health = FakeHealth(
         values={},
         data_points={
-            ("sleep", metric_date): (
-                {
-                    "sleep": {
-                        "interval": {
-                            "endTime": "2026-07-09T23:00:00Z",
-                            "endUtcOffset": "32400s",
-                        },
-                        "summary": {
-                            "minutesAsleep": "420",
-                            "stagesSummary": [
-                                {"type": "REM", "minutes": "90"},
-                                {"type": "DEEP", "minutes": "60"},
-                                {"type": "LIGHT", "minutes": "270"},
-                                {"type": "AWAKE", "minutes": "30"},
-                            ],
-                        },
-                    }
-                },
-            ),
+            ("sleep", metric_date): (sleep,),
             ("exercise", metric_date): (
                 {
                     "exercise": {
@@ -339,7 +366,170 @@ def test_session_backfill_materializes_sleep_stages_and_exercise_minutes() -> No
         "sleep_minutes": 420,
         "sleep_rem_minutes": 90,
     }
-    assert all(row["logic_version"] == "daily-v3" for row in observed.values())
+    assert all(row["logic_version"] == "daily-v4" for row in observed.values())
+    sessions = [row for row in rows if row.get("record_kind") == "SLEEP_SESSION"]
+    assert len(sessions) == 1
+    assert sessions[0]["session_start_time"] == "2026-07-09T16:00:00Z"
+    assert sessions[0]["session_end_time"] == "2026-07-09T23:00:00Z"
+    head = heads.read().head
+    assert head is not None
+    root = snapshots.load_root_snapshot(head.root_snapshot)
+    shard = snapshots.load_year_shard(root.state.daily_year_shards["2026"])
+    assert shard.daily_revisions[metric_date.isoformat()].schema_version == 2
+
+
+def test_sleep_uses_main_session_for_totals_and_retains_main_and_nap_boundaries() -> None:
+    store = InMemoryObjectStore(clock=lambda: NOW)
+    metric_date = date(2026, 7, 28)
+    main = _sleep_point(
+        metric_date,
+        data_point_name="users/me/dataPoints/main",
+        start_time="2026-07-27T14:30:00Z",
+        end_time="2026-07-27T22:30:00Z",
+        minutes_asleep=420,
+        main_sleep=True,
+        nap=False,
+    )
+    nap = _sleep_point(
+        metric_date,
+        data_point_name="users/me/dataPoints/nap",
+        start_time="2026-07-28T05:00:00Z",
+        end_time="2026-07-28T05:30:00Z",
+        minutes_asleep=25,
+        main_sleep=False,
+        nap=True,
+    )
+    health = FakeHealth(
+        values={},
+        data_points={("sleep", metric_date): (main, nap)},
+    )
+    pipeline, heads, snapshots = _pipeline(store, health)
+
+    assert pipeline.run().committed
+
+    rows = _daily_rows(heads, snapshots, metric_date)
+    sleep_total = next(
+        row for row in rows if row["metric_name"] == "sleep_minutes" and row["period_kind"] == "DAY"
+    )
+    sessions = [row for row in rows if row.get("record_kind") == "SLEEP_SESSION"]
+    assert sleep_total["value_num"] == 420
+    assert len(sessions) == 2
+    assert {row["session_is_main"] for row in sessions} == {False, True}
+    assert {row["session_is_nap"] for row in sessions} == {False, True}
+    assert all("users/me" not in str(row["dimension_key"]) for row in sessions)
+
+
+def test_sleep_boundary_only_correction_changes_the_daily_revision() -> None:
+    store = InMemoryObjectStore(clock=lambda: NOW)
+    metric_date = date(2026, 7, 28)
+    point = _sleep_point(
+        metric_date,
+        data_point_name="users/me/dataPoints/main",
+        start_time="2026-07-27T14:30:00Z",
+        end_time="2026-07-27T22:30:00Z",
+        minutes_asleep=420,
+        main_sleep=True,
+        nap=False,
+    )
+    health = FakeHealth(values={}, data_points={("sleep", metric_date): (point,)})
+    pipeline, heads, snapshots = _pipeline(store, health)
+    assert pipeline.run().committed
+    first_head = heads.read().head
+    assert first_head is not None
+    first_root = snapshots.load_root_snapshot(first_head.root_snapshot)
+    first_shard = snapshots.load_year_shard(first_root.state.daily_year_shards["2026"])
+    first_revision = first_shard.daily_revisions[metric_date.isoformat()]
+
+    health.data_points[("sleep", metric_date)] = (
+        _sleep_point(
+            metric_date,
+            data_point_name="users/me/dataPoints/main",
+            start_time="2026-07-27T14:35:00Z",
+            end_time="2026-07-27T22:30:00Z",
+            minutes_asleep=420,
+            main_sleep=True,
+            nap=False,
+        ),
+    )
+    _store_webhook_event(store, data_type="sleep", metric_date=metric_date)
+
+    assert pipeline.run().committed
+
+    second_head = heads.read().head
+    assert second_head is not None
+    second_root = snapshots.load_root_snapshot(second_head.root_snapshot)
+    second_shard = snapshots.load_year_shard(second_root.state.daily_year_shards["2026"])
+    second_revision = second_shard.daily_revisions[metric_date.isoformat()]
+    assert second_revision.canonical_sha256 != first_revision.canonical_sha256
+    assert second_root.change_set.changed_metric_dates == (metric_date,)
+
+
+def test_non_sleep_recalculation_preserves_committed_sleep_sessions() -> None:
+    store = InMemoryObjectStore(clock=lambda: NOW)
+    metric_date = date(2026, 7, 28)
+    point = _sleep_point(
+        metric_date,
+        data_point_name="users/me/dataPoints/main",
+        start_time="2026-07-27T14:30:00Z",
+        end_time="2026-07-27T22:30:00Z",
+        minutes_asleep=420,
+        main_sleep=True,
+        nap=False,
+    )
+    health = FakeHealth(
+        values={metric_date: 8_000},
+        data_points={("sleep", metric_date): (point,)},
+    )
+    pipeline, heads, snapshots = _pipeline(store, health)
+    assert pipeline.run().committed
+    before = [
+        row
+        for row in _daily_rows(heads, snapshots, metric_date)
+        if row.get("record_kind") == "SLEEP_SESSION"
+    ]
+
+    health.values[metric_date] = 8_100
+    _store_webhook_event(store, data_type="steps", metric_date=metric_date)
+    assert pipeline.run().committed
+
+    after = [
+        row
+        for row in _daily_rows(heads, snapshots, metric_date)
+        if row.get("record_kind") == "SLEEP_SESSION"
+    ]
+    assert after == before
+
+
+def test_empty_sleep_replacement_removes_stale_sessions_but_keeps_other_metrics() -> None:
+    store = InMemoryObjectStore(clock=lambda: NOW)
+    metric_date = date(2026, 7, 28)
+    health = FakeHealth(
+        values={metric_date: 8_000},
+        data_points={
+            ("sleep", metric_date): (
+                _sleep_point(
+                    metric_date,
+                    data_point_name="users/me/dataPoints/main",
+                    start_time="2026-07-27T14:30:00Z",
+                    end_time="2026-07-27T22:30:00Z",
+                    minutes_asleep=420,
+                    main_sleep=True,
+                    nap=False,
+                ),
+            )
+        },
+    )
+    pipeline, heads, snapshots = _pipeline(store, health)
+    assert pipeline.run().committed
+    health.data_points[("sleep", metric_date)] = ()
+    _store_webhook_event(store, data_type="sleep", metric_date=metric_date)
+
+    assert pipeline.run().committed
+
+    rows = _daily_rows(heads, snapshots, metric_date)
+    assert not any(row.get("record_kind") == "SLEEP_SESSION" for row in rows)
+    assert not any(row.get("metric_name") == "sleep_minutes" for row in rows)
+    assert any(row.get("metric_name") == "steps" for row in rows)
 
 
 def test_backfill_failure_leaves_cursor_and_head_unchanged() -> None:
@@ -419,7 +609,7 @@ def test_normalizer_upgrade_allows_only_one_bounded_correction_batch() -> None:
     )
 
     old_version: dict[str, Any] = {"_schedule": {"normalizer_version": "daily-v2"}}
-    current_version: dict[str, Any] = {"_schedule": {"normalizer_version": "daily-v3"}}
+    current_version: dict[str, Any] = {"_schedule": {"normalizer_version": "daily-v4"}}
 
     assert _backfill_budget_allows(store, old_version, now=NOW)
     assert not _backfill_budget_allows(store, current_version, now=NOW)
@@ -474,7 +664,7 @@ def test_normalizer_upgrade_commits_once_then_returns_to_backfill_pause() -> Non
     root = snapshots.load_root_snapshot(head.root_snapshot)
     schedule = root.state.backfill_cursors["_schedule"]
     assert isinstance(schedule, dict)
-    assert schedule["normalizer_version"] == "daily-v3"
+    assert schedule["normalizer_version"] == "daily-v4"
 
 
 def test_backfill_waits_for_notion_without_blocking_the_initial_sync() -> None:
@@ -731,7 +921,7 @@ def test_new_normalizer_reopens_recent_sleep_and_exercise_together() -> None:
     )
     assert advanced["_schedule"] == {
         "last_completed_civil_date": "2026-07-28",
-        "normalizer_version": "daily-v3",
+        "normalizer_version": "daily-v4",
         "next_data_type_index": 0,
         "policy_version": 2,
     }
@@ -742,7 +932,7 @@ def test_completed_priority_backfill_resumes_legacy_round_robin() -> None:
     cursors: dict[str, Any] = {
         "_schedule": {
             "last_completed_civil_date": "2026-07-27",
-            "normalizer_version": "daily-v3",
+            "normalizer_version": "daily-v4",
             "next_data_type_index": 0,
             "policy_version": 2,
         },

@@ -4,7 +4,7 @@ Fitbit Sense 2のGoogle Health APIデータをGCSへ保存し、日次値・月�
 
 BigQueryは使用しません。HEAD、Root Snapshot、年単位Shard、content-addressedな日次revisionにより、将来BigQueryを追加しても取得・日次計算を作り直さない構造です。詳細設計は[DESIGN.md](DESIGN.md)を参照してください。
 
-Notionには歩数、心拍、HRV、SpO2などに加え、睡眠時間、REM睡眠、深い睡眠、浅い睡眠、覚醒時間、運動時間を日次long形式で表示します。各項目にはその日の値、月曜始まりの暦週平均、暦月の月初来平均を含め、取得できなかった値は0ではなく`欠損`と明示します。
+Notionには歩数、心拍、HRV、SpO2などに加え、主睡眠だけから計算した睡眠時間、REM睡眠、深い睡眠、浅い睡眠、覚醒時間、運動時間を日次long形式で表示します。主睡眠の就寝・起床時刻と昼寝の各sessionは分けて表示します。各項目にはその日の値、月曜始まりの暦週平均、暦月の月初来平均を含め、取得できなかった値は0ではなく`欠損`と明示します。
 
 ## 構成
 
@@ -386,7 +386,7 @@ Jobs APIの成功はExecution作成成功であり、HEAD commit成功ではあ�
 - prefix列挙や最大generation探索では現行データを決めません。
 - API原本とnormalized cacheは期限付きの非権威cacheです。`SAMPLE`と`INTERVAL`は90日、
   `SESSION`と`DAILY`は365日で削除します。
-- HEADから到達する日次revisionは正式な長期状態です。
+- HEADから到達する日次revisionは正式な長期状態です。`daily-canonical` schema v2には全睡眠sessionの開始・終了時刻、両端のUTC offset、主睡眠・昼寝flagを保存し、raw cache削除後も長期保持します。
 - CAS失敗時は同じJob内で再試行せず、objectも即時削除しません。
 - Notionは適用済みHEAD generationを比較し、古い値へ逆行しません。SVGは公開済みの最終日付とHEAD generationを比較し、前日までの7日分を1日1回だけ更新します。
 - BigQuery API、dataset、table、client dependencyは含みません。
@@ -397,15 +397,17 @@ Jobs APIの成功はExecution作成成功であり、HEAD commit成功ではあ�
 - 当月の推定Class A操作が3,000回に達したら過去バックフィルだけを停止し、UTCの翌月に自動再開します。現在同期、Webhook、Notion回収は停止しません。
 - Class A 4,000回は強い警告です。Cloud Run JobとServiceのGCS書込み・一覧取得を同じ月次stateへ集計し、公式のus-central1無料枠5,000回に対して余白を残します。
 - 保存済みデータの形式更新が必要な場合だけ、4,250回未満なら最新31日分の補正を1回許可します。成功後は通常の3,000回停止へ戻ります。
-- 高容量のraw cacheは30〜365日のGCS lifecycleで削除し、小容量のcanonical／Snapshot／Shardはv1では自動削除しません。健康データbucketが1 GiBを超えたら見直し通知を送ります。
+- schema v2への移行中はClass A予算内で日付単位にbackfillするため、HEADから到達するrevisionにv1とv2が混在します。将来のBigQuery loaderはprefixを直接読まず、HEADとYear Shardが日付ごとに指す最新revisionだけを読みます。
+- 高容量のraw cacheは30〜365日のGCS lifecycleで削除し、小容量のcanonical／Snapshot／Shardは現行実装では自動削除しません。健康データbucketが1 GiBを超えたら見直し通知を送ります。
 
 日次long rowの期間は`period_kind`で区別します。
 
 - `DAY`: `period_start = period_end = metric_date`
+- `SESSION`: civil end dateへ帰属する1睡眠session
 - `CALENDAR_WEEK`: 対象週の月曜日から対象日までを含む週初来値。日曜日rowがその週の確定値
 - `CALENDAR_MONTH`: 対象月の月初から対象日までを含む月初来値。月末rowがその月の確定値
 
-一意keyは`metric_name + statistic + period_kind + dimension_key`です。旧`window_days`や固定日数の月間rollingは使用しません。
+schema v2の一意keyは`record_kind + metric_name + statistic + period_kind + dimension_key`です。旧`window_days`や固定日数の月間rollingは使用しません。
 
 ## License
 

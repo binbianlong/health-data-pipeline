@@ -11,6 +11,7 @@ from itertools import pairwise
 from typing import Any, Literal
 
 from health_data_pipeline.daily import Observation
+from health_data_pipeline.sleep_sessions import select_main_sleep_points
 
 Reducer = Literal["sum", "mean"]
 
@@ -145,6 +146,11 @@ def normalize_daily_observations(
 ) -> dict[date, list[Observation]]:
     """Extract supported daily metrics while preserving unknown raw fields elsewhere."""
 
+    non_sleep_points = tuple(
+        point for point in data_points if not isinstance(point.get("sleep"), Mapping)
+    )
+    selected_points = (*non_sleep_points, *select_main_sleep_points(data_points))
+
     values: dict[
         tuple[date, str, str, str, Reducer],
         list[Decimal],
@@ -156,7 +162,7 @@ def normalize_daily_observations(
     for extractor in EXTRACTORS:
         by_field[extractor.data_field].append(extractor)
 
-    for point in data_points:
+    for point in selected_points:
         field = next((name for name in by_field if isinstance(point.get(name), Mapping)), None)
         if field is None:
             continue

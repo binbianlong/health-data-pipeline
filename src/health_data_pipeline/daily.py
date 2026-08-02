@@ -13,6 +13,8 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Final
 
+from health_data_pipeline.sleep_sessions import SleepSession
+
 INSUFFICIENT_DATA: Final = "INSUFFICIENT_DATA"
 DECEMBER: Final = 12
 
@@ -135,6 +137,54 @@ def build_daily_rows(
     return sorted(rows, key=_row_sort_key)
 
 
+def build_sleep_session_rows(
+    context: DayContext,
+    sessions: Sequence[SleepSession],
+    *,
+    data_status: str,
+) -> list[dict[str, Any]]:
+    """Build one typed long-form v2 row for each validated sleep session."""
+
+    rows: list[dict[str, Any]] = []
+    for session in sessions:
+        if session.metric_date != context.metric_date:
+            raise ValueError("sleep session metric date does not match its daily revision")
+        has_minutes = session.minutes_asleep is not None
+        rows.append(
+            {
+                "record_kind": "SLEEP_SESSION",
+                "metric_name": "sleep_session",
+                "statistic": "observed",
+                "period_kind": "SESSION",
+                "dimension_key": session.dimension_key,
+                "value_num": session.minutes_asleep,
+                "value_text": None,
+                "unit": "min",
+                "aggregation": "session_value",
+                "period_start": context.metric_date,
+                "period_end": context.metric_date,
+                "sample_count": 1 if has_minutes else 0,
+                "expected_count": 1,
+                "coverage_ratio": Decimal(1) if has_minutes else Decimal(0),
+                "data_status": data_status,
+                "quality_flags": ["MAIN_SLEEP_INFERRED"] if session.main_inferred else [],
+                "source_data_types": ["sleep"],
+                "fitbit_last_sync_time": context.fitbit_last_sync_time,
+                "time_zone": context.time_zone,
+                "physical_day_start": context.physical_day_start,
+                "physical_day_end": context.physical_day_end,
+                "logic_version": context.logic_version,
+                "session_start_time": session.start_time,
+                "session_end_time": session.end_time,
+                "session_start_utc_offset_seconds": session.start_utc_offset_seconds,
+                "session_end_utc_offset_seconds": session.end_utc_offset_seconds,
+                "session_is_main": session.is_main,
+                "session_is_nap": session.is_nap,
+            }
+        )
+    return sorted(rows, key=_row_sort_key)
+
+
 def _baseline_values(
     metric_name: str,
     start: date,
@@ -218,6 +268,7 @@ def _base_row(
     data_status: str,
 ) -> dict[str, Any]:
     return {
+        "record_kind": "METRIC",
         "metric_name": observation.metric_name,
         "statistic": statistic,
         "period_kind": period_kind,
@@ -239,6 +290,12 @@ def _base_row(
         "physical_day_start": context.physical_day_start,
         "physical_day_end": context.physical_day_end,
         "logic_version": context.logic_version,
+        "session_start_time": None,
+        "session_end_time": None,
+        "session_start_utc_offset_seconds": None,
+        "session_end_utc_offset_seconds": None,
+        "session_is_main": None,
+        "session_is_nap": None,
     }
 
 

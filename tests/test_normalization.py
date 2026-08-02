@@ -66,6 +66,29 @@ def test_sleep_uses_civil_end_date() -> None:
     assert date(2026, 7, 27) not in result
 
 
+def test_sleep_daily_totals_exclude_a_separate_nap_session() -> None:
+    main = {
+        "dataPointName": "main",
+        "sleep": {
+            "interval": {"civilEndTime": _civil(28)},
+            "metadata": {"mainSleep": True, "nap": False},
+            "summary": {"minutesAsleep": "400"},
+        },
+    }
+    nap = {
+        "dataPointName": "nap",
+        "sleep": {
+            "interval": {"civilEndTime": _civil(28)},
+            "metadata": {"mainSleep": False, "nap": True},
+            "summary": {"minutesAsleep": "30"},
+        },
+    }
+
+    observations = normalize_daily_observations([main, nap])[date(2026, 7, 28)]
+
+    assert {item.metric_name: item.value for item in observations}["sleep_minutes"] == Decimal(400)
+
+
 def test_sleep_prefers_civil_end_date_over_physical_end_date() -> None:
     point = {
         "sleep": {
@@ -291,7 +314,7 @@ def test_sleep_stages_fall_back_to_detailed_intervals() -> None:
     assert by_name["sleep_light_minutes"].value == Decimal(30)
 
 
-def test_sleep_stage_details_sum_multiple_sessions_without_summary_duplication() -> None:
+def test_sleep_stage_details_use_only_the_selected_main_session() -> None:
     duplicated_first_summary = [
         {"type": "AWAKE", "minutes": "21"},
         {"type": "LIGHT", "minutes": "229"},
@@ -382,11 +405,11 @@ def test_sleep_stage_details_sum_multiple_sessions_without_summary_duplication()
     observations = normalize_daily_observations(points)[date(2026, 8, 1)]
     by_name = {item.metric_name: item for item in observations}
 
-    assert by_name["sleep_minutes"].value == Decimal(445)
-    assert by_name["sleep_rem_minutes"].value == Decimal(106)
-    assert by_name["sleep_deep_minutes"].value == Decimal("57.5")
-    assert by_name["sleep_light_minutes"].value == Decimal("281.5")
-    assert by_name["sleep_awake_minutes"].value == Decimal(88)
+    assert by_name["sleep_minutes"].value == Decimal(372)
+    assert by_name["sleep_rem_minutes"].value == Decimal("88.5")
+    assert by_name["sleep_deep_minutes"].value == Decimal(54)
+    assert by_name["sleep_light_minutes"].value == Decimal("229.5")
+    assert by_name["sleep_awake_minutes"].value == Decimal(21)
 
 
 def test_sleep_awake_minutes_fall_back_to_summary_total() -> None:
@@ -452,7 +475,7 @@ def test_classic_sleep_does_not_invent_rem_deep_or_light_stages() -> None:
     assert "sleep_light_minutes" not in by_name
 
 
-def test_classic_session_suppresses_partial_stage_breakdown_for_day() -> None:
+def test_main_session_selection_does_not_mix_classic_and_staged_sleep() -> None:
     staged = {
         "sleep": {
             "interval": {
@@ -492,7 +515,7 @@ def test_classic_session_suppresses_partial_stage_breakdown_for_day() -> None:
     observations = normalize_daily_observations([staged, classic])[date(2026, 7, 29)]
     by_name = {item.metric_name: item for item in observations}
 
-    assert by_name["sleep_minutes"].value == Decimal(160)
+    assert by_name["sleep_minutes"].value == Decimal(100)
     assert by_name["sleep_awake_minutes"].value == Decimal(10)
     assert "sleep_rem_minutes" not in by_name
     assert "sleep_deep_minutes" not in by_name
