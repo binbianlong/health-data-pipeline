@@ -538,7 +538,7 @@ manifests/snapshot-shards/
   "year": 2026,
   "daily_revisions": {
     "2026-07-28": {
-      "uri": "daily-canonical/schema_version=1/metric_date=2026-07-28/canonicalization=fhcj-1/encoding=gzip-v1/sha256=<canonical-sha256>.ndjson.gz",
+      "uri": "daily-canonical/schema_version=2/metric_date=2026-07-28/canonicalization=fhcj-1/encoding=gzip-v1/sha256=<canonical-sha256>.ndjson.gz",
       "canonical_sha256": "...",
       "object_sha256": "...",
       "row_count": 42,
@@ -722,6 +722,8 @@ Cloud RunのUTC日付を健康データの日付として使わない。
 - DSTをIANA time zoneで解決する。
 - 日ごとにtime zoneと物理開始・終了を保存する。
 - 睡眠はcivil end dateへ帰属させる。
+- 睡眠の日次合計とstage別合計は`mainSleep=true`の主睡眠sessionだけから計算し、昼寝を加算しない。
+- 全睡眠sessionの開始・終了時刻、両端のUTC offset、`mainSleep`／`nap` flagは日次合計と別rowで保存する。
 - 運動はcivil start dateへ帰属させる。
 
 | Status | 条件 |
@@ -760,19 +762,20 @@ Cloud RunのUTC日付を健康データの日付として使わない。
 
 ```text
 daily-canonical/
-  schema_version=1/
+  schema_version=2/
   metric_date=2026-07-28/
   canonicalization=fhcj-1/
   encoding=gzip-v1/
   sha256=<canonical-sha256>.ndjson.gz
 ```
 
-`schema_version`と`metric_date`は将来のBigQuery Hive partitioningに使用できる。
+`schema_version`と`metric_date`は将来のBigQuery Hive partitioningに使用できる。v2は日次指標に加えて睡眠sessionを正式な長期状態として保持する。raw cacheのlifecycleとは独立し、HEAD、Root Snapshot、Year Shardから到達するrevisionを削除しない。
 
 ### 16.2 Row
 
 ```json
 {
+  "record_kind": "METRIC",
   "metric_name": "steps",
   "statistic": "observed",
   "period_kind": "DAY",
@@ -793,9 +796,17 @@ daily-canonical/
   "time_zone": "Asia/Tokyo",
   "physical_day_start": "2026-07-27T15:00:00Z",
   "physical_day_end": "2026-07-28T15:00:00Z",
-  "logic_version": "daily-v3"
+  "logic_version": "daily-v4",
+  "session_start_time": null,
+  "session_end_time": null,
+  "session_start_utc_offset_seconds": null,
+  "session_end_utc_offset_seconds": null,
+  "session_is_main": null,
+  "session_is_nap": null
 }
 ```
+
+睡眠session rowは`record_kind=SLEEP_SESSION`、`period_kind=SESSION`とし、sessionごとに一意な`dimension_key`を持つ。`session_start_time`と`session_end_time`は物理時刻、UTC offsetは各edgeのcivil time復元用とする。`session_is_main`は日次値に採用した明示的な主睡眠、`session_is_nap`はGoogle Healthの昼寝flagを表す。主睡眠flagがない場合は決定的に1件を選び、`quality_flags`へ`MAIN_SLEEP_INFERRED`を付ける。METRIC rowではsession専用fieldをnullにする。
 
 Daily rowには次を入れない。
 
@@ -808,7 +819,8 @@ Daily rowには次を入れない。
 一意key：
 
 ```text
-metric_name
+record_kind
++ metric_name
 + statistic
 + period_kind
 + dimension_key
@@ -827,6 +839,7 @@ metric_name
 `period_kind`：
 
 - `DAY`: 当日値
+- `SESSION`: civil end dateへ帰属する1睡眠session
 - `CALENDAR_WEEK`: 月曜日から対象日までの暦週平均。日曜日rowが確定値
 - `CALENDAR_MONTH`: 月初から対象日までの暦月平均
 
@@ -837,12 +850,14 @@ schemas/
   daily_metrics/
     v1.schema.json
     v1.bigquery.json
+    v2.schema.json
+    v2.bigquery.json
 ```
 
-- 後方互換field追加は同versionで許可する。
-- 型、意味、一意keyの変更は`schema_version=2`とする。
+- v1は変更しない。v2は`record_kind`と型付き睡眠session fieldを必須fieldとして追加する。
+- schema v2移行backfillはClass A予算gateに従い、日付単位で進める。完了まではHEADから到達するdaily revisionにv1とv2が混在する。
 - 古いpartitionを自動で書き換えない。
-- `v1 → current` converterをコード内に用意する。
+- 将来のBigQuery loaderはv1 rowへv2の追加fieldを補うconverterを持つ。
 
 ## 17. Leaseと並行実行
 
@@ -947,6 +962,8 @@ Snapshot、Year Shard、daily revisionには単純なprefix lifecycleを設定�
 - Source HEAD generation
 - Fitbit last sync time
 - 睡眠時間
+- 主睡眠の就寝時刻・起床時刻
+- 昼寝sessionごとの開始時刻・終了時刻
 - REM睡眠
 - 深い睡眠
 - 浅い睡眠
@@ -963,7 +980,7 @@ Snapshot、Year Shard、daily revisionには単純なprefix lifecycleを設定�
 - 各指標の暦月平均
 - coverageとquality flag
 
-Notion本文にはChatGPTが読みやすい固定順の短い表を生成する。睡眠時間、REM睡眠、深い睡眠、浅い睡眠、覚醒時間、運動時間の保存上の`metric_name`はそれぞれ`sleep_minutes`、`sleep_rem_minutes`、`sleep_deep_minutes`、`sleep_light_minutes`、`sleep_awake_minutes`、`exercise_minutes`とし、schemaはlong形式のv1を維持する。値が取得できない項目も表から省略せず`欠損`と表示し、0とは区別する。API原本や高頻度sampleは書かない。
+Notion本文にはChatGPTが読みやすい固定順の短い表を生成する。主睡眠の就寝・起床時刻と昼寝sessionを別の表示欄にし、日付とUTC offsetを含むcivil timeで示す。睡眠時間、REM睡眠、深い睡眠、浅い睡眠、覚醒時間の日次値は主睡眠だけから計算する。保存上の`metric_name`はそれぞれ`sleep_minutes`、`sleep_rem_minutes`、`sleep_deep_minutes`、`sleep_light_minutes`、`sleep_awake_minutes`とし、運動時間は`exercise_minutes`とする。値が取得できない項目も表から省略せず`欠損`と表示し、0とは区別する。API原本や高頻度sampleは書かない。
 
 初回はtitleプロパティを1つ持つ空のdata sourceを作成し、integrationへ共有する。`make notion-configure`はNotion API `2026-03-11`を使い、次のschemaを冪等に作成または修復する。
 
@@ -1337,7 +1354,7 @@ rebuildは手動実行とする。Cloud Billing Budgetも別に設定する。�
 2. HEADが指すRoot Snapshotを取得する。
 3. canonical hashとschemaを検証する。
 4. `state.daily_year_shards`から必要年を取得する。
-5. Year Shard記載のdaily revision URIだけをloadする。
+5. Year Shardが日付ごとに指す最新daily revision URIだけをloadする。v1/v2混在時はschema versionを判定し、v1 rowをcurrent schemaへ変換する。
 6. staging tableへloadする。
 7. 対象日のpartitionをDELETEする。
 8. stagingからINSERTする。
@@ -1359,7 +1376,7 @@ rebuildは手動実行とする。Cloud Billing Budgetも別に設定する。�
 - partition: `metric_date`
 - cluster: `metric_name`, `statistic`
 - require partition filter
-- GCS schema v1と同じ列
+- GCS schema v2と同じ列。`record_kind`とsessionのTIMESTAMP、INTEGER、BOOLEAN列を含む
 
 BigQuery client libraryは現在のdependencyへ入れない。
 
