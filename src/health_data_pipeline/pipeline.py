@@ -846,7 +846,9 @@ class IncrementalSyncPipeline:
                 role_source = "INFERRED" if inferred else "SOURCE_FLAG"
             elif is_nap:
                 role = "NAP"
-                role_source = "SOURCE_FLAG"
+                # v2 combined an explicit nap flag with REJECTED_NAP inference,
+                # so the original provenance cannot be reconstructed.
+                role_source = "UNCLASSIFIED"
             else:
                 role = "UNCLASSIFIED"
                 role_source = "UNCLASSIFIED"

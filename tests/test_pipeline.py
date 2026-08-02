@@ -290,6 +290,27 @@ def test_initial_sync_commits_civil_days_and_calendar_periods() -> None:
     }
 
 
+def test_legacy_nap_keeps_unknown_role_provenance(monkeypatch: pytest.MonkeyPatch) -> None:
+    store = InMemoryObjectStore(clock=lambda: NOW)
+    pipeline, _, _ = _pipeline(store, FakeHealth(values={}))
+    legacy_row = {
+        "record_kind": "SLEEP_SESSION",
+        "quality_flags": [],
+        "session_is_main": False,
+        "session_is_nap": True,
+    }
+    monkeypatch.setattr(
+        IncrementalSyncPipeline,
+        "_daily_rows_for_date",
+        lambda _self, _root, _metric_date: (legacy_row,),
+    )
+
+    migrated = pipeline._sleep_session_rows_for_date(None, date(2026, 7, 28))
+
+    assert migrated[0]["session_role"] == "NAP"
+    assert migrated[0]["session_role_source"] == "UNCLASSIFIED"
+
+
 def test_sync_advance_reconciles_from_last_successful_civil_cursor() -> None:
     store = InMemoryObjectStore(clock=lambda: NOW)
     health = FakeHealth(values={})
