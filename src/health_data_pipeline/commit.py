@@ -40,6 +40,7 @@ class CommitRequest:
     webhook_cursor: Mapping[str, JsonValue] | None = None
     backfill_cursors: Mapping[str, JsonValue] | None = None
     fitbit_last_sync_time: datetime | None = None
+    preserve_fitbit_last_sync_time: bool = False
     time_zone: str | None = None
     raw_replacements: tuple[JsonValue, ...] = ()
     ingestion_manifests: tuple[ContentReference, ...] = ()
@@ -116,19 +117,25 @@ class CommitCoordinator:
                 year_updates[year] = None
 
         previous_state = parent.state if parent is not None else None
-        next_state = evolve_snapshot_state(
-            previous_state,
-            year_shard_updates=year_updates,
-            data_type_cursors=request.data_type_cursors,
-            webhook_cursor=request.webhook_cursor,
-            backfill_cursors=request.backfill_cursors,
-            fitbit_last_sync_time=(
-                request.fitbit_last_sync_time
-                if request.fitbit_last_sync_time is not None
-                else (previous_state.fitbit_last_sync_time if previous_state is not None else None)
-            ),
-            time_zone=request.time_zone,
-        )
+        if request.preserve_fitbit_last_sync_time:
+            next_state = evolve_snapshot_state(
+                previous_state,
+                year_shard_updates=year_updates,
+                data_type_cursors=request.data_type_cursors,
+                webhook_cursor=request.webhook_cursor,
+                backfill_cursors=request.backfill_cursors,
+                time_zone=request.time_zone,
+            )
+        else:
+            next_state = evolve_snapshot_state(
+                previous_state,
+                year_shard_updates=year_updates,
+                data_type_cursors=request.data_type_cursors,
+                webhook_cursor=request.webhook_cursor,
+                backfill_cursors=request.backfill_cursors,
+                fitbit_last_sync_time=request.fitbit_last_sync_time,
+                time_zone=request.time_zone,
+            )
         changed_years = tuple(
             sorted(
                 int(year)

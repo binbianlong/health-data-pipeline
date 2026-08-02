@@ -10,6 +10,7 @@ import pytest
 from health_data_pipeline.google_health import (
     FetchWindow,
     GoogleHealthClient,
+    GoogleHealthError,
     GoogleHealthWebhookAuthenticator,
     VerifiedWebhookBatch,
     WebhookAuthenticationError,
@@ -101,6 +102,29 @@ def test_sleep_uses_end_time_filter_and_small_page_size() -> None:
     assert transport.requests[0]["params"]["pageSize"] == 25
     assert "sleep.interval.civil_end_time" in transport.requests[0]["params"]["filter"]
     assert transport.requests[1]["params"]["pageToken"] == "next"
+
+
+def test_repeated_data_point_page_token_is_rejected() -> None:
+    transport = FakeTransport(
+        [
+            FakeResponse(200, {"dataPoints": [], "nextPageToken": "repeated"}),
+            FakeResponse(200, {"dataPoints": [], "nextPageToken": "repeated"}),
+        ]
+    )
+    client = GoogleHealthClient(
+        transport=transport,
+        access_token=lambda: "token",
+        sleeper=lambda _: None,
+    )
+
+    with pytest.raises(
+        GoogleHealthError,
+        match="nextPageToken repeated within one query window",
+    ):
+        tuple(client.iter_data_point_pages("sleep", _window(2)))
+
+    assert len(transport.requests) == 2
+    assert transport.requests[1]["params"]["pageToken"] == "repeated"
 
 
 @pytest.mark.parametrize(

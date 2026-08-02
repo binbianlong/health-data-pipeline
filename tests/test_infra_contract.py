@@ -10,7 +10,16 @@ from health_data_pipeline.pipeline import SUPPORTED_DATA_TYPES
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _STORAGE_TERRAFORM = _PROJECT_ROOT / "infra" / "main" / "storage.tf"
 _GITHUB_WIF_TERRAFORM = _PROJECT_ROOT / "infra" / "main" / "github_wif.tf"
-_NORMALIZED_PREFIX = "blobs/normalized/record_kind="
+_FLATTENED_PREFIX = "blobs/flattened/record_kind="
+
+
+def _bucket_resource(terraform: str, name: str, *, next_name: str | None = None) -> str:
+    marker = f'resource "google_storage_bucket" "{name}"'
+    resource = terraform.split(marker, maxsplit=1)[1]
+    if next_name is not None:
+        next_marker = f'resource "google_storage_bucket" "{next_name}"'
+        resource = resource.split(next_marker, maxsplit=1)[0]
+    return resource
 
 
 def _lifecycle_prefixes(terraform: str, *, age: int) -> set[str]:
@@ -24,38 +33,62 @@ def _lifecycle_prefixes(terraform: str, *, age: int) -> set[str]:
     return set(re.findall(r'"([^"]+)"', condition.group("prefixes")))
 
 
-def test_normalized_lifecycle_covers_every_generated_record_kind() -> None:
+def test_health_bucket_keeps_seven_days_of_noncurrent_versions() -> None:
+    terraform = _STORAGE_TERRAFORM.read_text(encoding="utf-8")
+    health_bucket = _bucket_resource(terraform, "health", next_name="cloud_build_source")
+    cloud_build_bucket = _bucket_resource(terraform, "cloud_build_source")
+
+    assert re.search(r"versioning\s*\{\s*enabled\s*=\s*true\s*\}", health_bucket)
+    assert re.search(
+        r"soft_delete_policy\s*\{\s*retention_duration_seconds\s*=\s*0\s*\}",
+        health_bucket,
+    )
+    assert re.search(
+        r'lifecycle_rule\s*\{\s*action\s*\{\s*type\s*=\s*"Delete"\s*\}\s*'
+        r"condition\s*\{\s*days_since_noncurrent_time\s*=\s*7\s*"
+        r'with_state\s*=\s*"ARCHIVED"\s*\}\s*\}',
+        health_bucket,
+    )
+    assert health_bucket.count("days_since_noncurrent_time") == 1
+    assert re.search(r"versioning\s*\{\s*enabled\s*=\s*false\s*\}", cloud_build_bucket)
+
+
+def test_flattened_lifecycle_covers_every_generated_record_kind() -> None:
     terraform = _STORAGE_TERRAFORM.read_text(encoding="utf-8")
     generated_prefixes = {
-        f"{_NORMALIZED_PREFIX}{data_type_spec(data_type).record_kind.upper()}/"
+        f"{_FLATTENED_PREFIX}{data_type_spec(data_type).record_kind.upper()}/"
         for data_type in SUPPORTED_DATA_TYPES
     }
     ninety_day_prefixes = {
         prefix
         for prefix in _lifecycle_prefixes(terraform, age=90)
-        if prefix.startswith(_NORMALIZED_PREFIX)
+        if prefix.startswith(_FLATTENED_PREFIX)
     }
     year_prefixes = {
         prefix
         for prefix in _lifecycle_prefixes(terraform, age=365)
-        if prefix.startswith(_NORMALIZED_PREFIX)
+        if prefix.startswith(_FLATTENED_PREFIX)
     }
 
     assert generated_prefixes == {
-        f"{_NORMALIZED_PREFIX}DAILY/",
-        f"{_NORMALIZED_PREFIX}INTERVAL/",
-        f"{_NORMALIZED_PREFIX}SAMPLE/",
-        f"{_NORMALIZED_PREFIX}SESSION/",
+        f"{_FLATTENED_PREFIX}DAILY/",
+        f"{_FLATTENED_PREFIX}INTERVAL/",
+        f"{_FLATTENED_PREFIX}SAMPLE/",
+        f"{_FLATTENED_PREFIX}SESSION/",
     }
     assert ninety_day_prefixes == {
-        f"{_NORMALIZED_PREFIX}INTERVAL/",
-        f"{_NORMALIZED_PREFIX}SAMPLE/",
+        f"{_FLATTENED_PREFIX}INTERVAL/",
+        f"{_FLATTENED_PREFIX}SAMPLE/",
     }
     assert year_prefixes == {
-        f"{_NORMALIZED_PREFIX}DAILY/",
-        f"{_NORMALIZED_PREFIX}SESSION/",
+        f"{_FLATTENED_PREFIX}DAILY/",
+        f"{_FLATTENED_PREFIX}SESSION/",
     }
     assert generated_prefixes == ninety_day_prefixes | year_prefixes
+    expiring_prefixes = set().union(
+        *(_lifecycle_prefixes(terraform, age=age) for age in (2, 30, 90, 365))
+    )
+    assert "manifests/ingestion/" not in expiring_prefixes
 
 
 def test_sleep_session_canonical_schema_is_typed_and_not_lifecycle_deleted() -> None:

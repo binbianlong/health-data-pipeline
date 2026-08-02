@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
 from health_data_pipeline.commit import CommitCoordinator, CommitRequest
+from health_data_pipeline.metrics import METRIC_DEFINITIONS
 from health_data_pipeline.models import CommitKind
 from health_data_pipeline.notion_adapter import SnapshotViewSource
 from health_data_pipeline.snapshot import SnapshotRepository
@@ -81,7 +83,7 @@ def _daily(generation: int = 7) -> DailyView:
                 status="OK",
                 weekly_average=7500,
                 monthly_average=7200,
-                coverage=1.0,
+                coverage=None,
             ),
         ),
     )
@@ -106,15 +108,7 @@ def test_notion_applies_latest_once_and_uses_month_average() -> None:
     assert store.get("state/notion/pages/year=2026/2026-07-28.json").data
 
 
-def test_notion_renders_requested_metrics_in_fixed_japanese_order() -> None:
-    requested = (
-        ("sleep_minutes", "睡眠時間"),
-        ("sleep_rem_minutes", "REM睡眠"),
-        ("sleep_deep_minutes", "深い睡眠"),
-        ("sleep_light_minutes", "浅い睡眠"),
-        ("sleep_awake_minutes", "覚醒時間"),
-        ("exercise_minutes", "運動時間"),
-    )
+def test_notion_renders_all_registered_metrics_in_stable_catalog_order() -> None:
     view = DailyView(
         metric_date=date(2026, 7, 28),
         source_generation=7,
@@ -123,40 +117,64 @@ def test_notion_renders_requested_metrics_in_fixed_japanese_order() -> None:
         metrics=(
             *(
                 DailyMetric(
-                    metric_name=metric_name,
+                    metric_name=definition.name,
                     statistic="value",
                     value=index,
-                    unit="min",
+                    unit=definition.unit,
                     status="OK",
                 )
-                for index, (metric_name, _) in reversed(tuple(enumerate(requested, start=1)))
-            ),
-            DailyMetric(
-                metric_name="steps",
-                statistic="value",
-                value=8_000,
-                unit="count",
-                status="OK",
+                for index, definition in reversed(tuple(enumerate(METRIC_DEFINITIONS, start=1)))
             ),
         ),
     )
 
     body = render_notion_body(view)
-    positions = [body.index(f"| {label} |") for _, label in requested]
+    positions = [body.index(f"| {definition.notion_label} |") for definition in METRIC_DEFINITIONS]
 
     assert positions == sorted(positions)
-    assert body.index("| 運動時間 |") < body.index("| steps |")
-    for metric_name, label in requested:
-        assert metric_name not in body
-        assert label in body
+    for definition in METRIC_DEFINITIONS:
+        assert f"| {definition.notion_label} |" in body
+        assert f"| {definition.name} |" not in body
 
 
-def test_notion_marks_unavailable_requested_metrics_as_missing() -> None:
+def test_notion_marks_every_absent_registered_metric_as_missing() -> None:
     body = render_notion_body(_daily())
 
-    for label in ("睡眠時間", "REM睡眠", "深い睡眠", "浅い睡眠", "覚醒時間", "運動時間"):
-        assert f"| {label} | 欠損 | min |" in body
-    assert body.count("| MISSING |") == 6
+    absent = tuple(definition for definition in METRIC_DEFINITIONS if definition.name != "steps")
+    for definition in absent:
+        line = next(
+            line for line in body.splitlines() if line.startswith(f"| {definition.notion_label} |")
+        )
+        assert f"| {definition.notion_label} | 欠損 | {definition.unit} | " in line
+        assert "MISSING; NOT_QUERIED" in line
+    assert body.count("MISSING; NOT_QUERIED") == len(absent)
+    assert "| 歩数 | 8000 | count |" in body
+
+
+def test_notion_renders_unknown_daily_coverage_without_fabricating_100_percent() -> None:
+    body = render_notion_body(_daily())
+    steps = next(line for line in body.splitlines() if line.startswith("| 歩数 |"))
+
+    assert steps.endswith("| unknown (UNKNOWN) |")
+    assert "100.0% (UNKNOWN)" not in steps
+
+
+def test_sleep_source_status_distinguishes_empty_from_processing() -> None:
+    base = DailyView(
+        metric_date=date(2026, 7, 28),
+        source_generation=7,
+        data_status="MISSING",
+        fitbit_last_sync_time=datetime(2026, 7, 29, tzinfo=UTC),
+        metrics=(),
+    )
+
+    empty = render_notion_body(replace(base, sleep_source_status="SUCCESS_EMPTY"))
+    processing = render_notion_body(replace(base, sleep_source_status="SOURCE_PROCESSING"))
+
+    assert "主睡眠: 記録なし" in empty
+    assert "昼寝: なし" in empty
+    assert "主睡眠: Fitbit処理中" in processing
+    assert "昼寝: 判定待ち" in processing
 
 
 def test_notion_never_overwrites_a_newer_page() -> None:
@@ -281,7 +299,13 @@ def test_steps_svg_migrates_previous_rendering_at_same_generation() -> None:
     assert "/canonicalization=fhcj-3/" in pointer.svg_uri
 
 
-def _step_rows(value: int) -> list[dict[str, object]]:
+def _step_rows(metric_date: date, value: int) -> list[dict[str, object]]:
+    physical_day_start = datetime(
+        metric_date.year,
+        metric_date.month,
+        metric_date.day,
+        tzinfo=UTC,
+    )
     return [
         {
             "metric_name": "steps",
@@ -289,8 +313,24 @@ def _step_rows(value: int) -> list[dict[str, object]]:
             "period_kind": "DAY",
             "dimension_key": None,
             "value_num": Decimal(value),
+            "value_text": None,
             "unit": "count",
+            "aggregation": "daily_sum",
+            "period_start": metric_date,
+            "period_end": metric_date,
+            "sample_count": 1,
+            "expected_count": 1,
+            "coverage_ratio": Decimal(1),
             "data_status": "CANONICAL_SYNCED",
+            "quality_flags": [],
+            "source_data_types": ["steps"],
+            "fitbit_last_sync_time": physical_day_start,
+            "time_zone": "UTC",
+            "physical_day_start": physical_day_start,
+            "physical_day_end": datetime.fromordinal(metric_date.toordinal() + 1).replace(
+                tzinfo=UTC
+            ),
+            "logic_version": "daily-v1",
         }
     ]
 
@@ -303,10 +343,10 @@ def test_snapshot_source_collects_all_dates_across_generation_gap() -> None:
     first_date = date(2026, 7, 27)
     second_date = date(2026, 7, 28)
     for rows in (
-        {first_date: _step_rows(1_000)},
-        {first_date: _step_rows(2_000)},
-        {second_date: _step_rows(3_000)},
-        {first_date: _step_rows(4_000)},
+        {first_date: _step_rows(first_date, 1_000)},
+        {first_date: _step_rows(first_date, 2_000)},
+        {second_date: _step_rows(second_date, 3_000)},
+        {first_date: _step_rows(first_date, 4_000)},
     ):
         commits.commit(
             CommitRequest(

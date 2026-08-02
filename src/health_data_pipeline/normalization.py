@@ -11,7 +11,8 @@ from itertools import pairwise
 from typing import Any, Literal
 
 from health_data_pipeline.daily import Observation
-from health_data_pipeline.sleep_sessions import select_main_sleep_points
+from health_data_pipeline.metrics import CoverageKind, metric_definition
+from health_data_pipeline.sleep_sessions import SleepResolution, resolve_sleep_data
 
 Reducer = Literal["sum", "mean"]
 
@@ -127,6 +128,7 @@ EXTRACTORS: tuple[MetricExtractor, ...] = (
         "sum",
     ),
 )
+_DATA_FIELDS = tuple(dict.fromkeys(extractor.data_field for extractor in EXTRACTORS))
 
 _SLEEP_STAGE_METRICS: Mapping[str, str] = {
     "REM": "sleep_rem_minutes",
@@ -143,13 +145,16 @@ _SLEEPING_STAGE_METRICS = (
 
 def normalize_daily_observations(
     data_points: Sequence[Mapping[str, Any]],
+    *,
+    sleep_resolution: SleepResolution | None = None,
 ) -> dict[date, list[Observation]]:
     """Extract supported daily metrics while preserving unknown raw fields elsewhere."""
 
+    resolved_sleep = sleep_resolution or resolve_sleep_data(data_points)
     non_sleep_points = tuple(
         point for point in data_points if not isinstance(point.get("sleep"), Mapping)
     )
-    selected_points = (*non_sleep_points, *select_main_sleep_points(data_points))
+    selected_points = (*non_sleep_points, *resolved_sleep.aggregate_points)
 
     values: dict[
         tuple[date, str, str, str, Reducer],
@@ -211,6 +216,17 @@ def normalize_daily_observations(
         value = sum(samples, Decimal(0))
         if reducer == "mean":
             value /= Decimal(len(samples))
+        source_data_types = tuple(sorted(sources[(metric_date, metric_name)]))
+        coverage_kind, expected_count = _coverage_contract(
+            metric_name,
+            aggregation=aggregation,
+            sample_count=len(samples),
+        )
+        quality_flags = (
+            resolved_sleep.quality_flags_by_date.get(metric_date, ())
+            if "sleep" in source_data_types
+            else ()
+        )
         result[metric_date].append(
             Observation(
                 metric_date=metric_date,
@@ -219,8 +235,10 @@ def normalize_daily_observations(
                 unit=unit,
                 aggregation=aggregation,
                 sample_count=len(samples),
-                expected_count=len(samples),
-                source_data_types=tuple(sorted(sources[(metric_date, metric_name)])),
+                expected_count=expected_count,
+                coverage_kind=coverage_kind,
+                quality_flags=quality_flags,
+                source_data_types=source_data_types,
             )
         )
     resolved: dict[date, list[Observation]] = {}
@@ -230,6 +248,35 @@ def normalize_daily_observations(
             omit_sleeping_stages=day in incomplete_sleep_stage_dates,
         )
     return resolved
+
+
+def data_point_metric_date(point: Mapping[str, Any]) -> date | None:
+    """Return a source point's civil partition date without requiring a value."""
+
+    field = next(
+        (name for name in _DATA_FIELDS if isinstance(point.get(name), Mapping)),
+        None,
+    )
+    if field is None:
+        return None
+    payload = point[field]
+    if not isinstance(payload, Mapping):  # pragma: no cover - guarded above
+        return None
+    return _metric_date(field, payload)
+
+
+def _coverage_contract(
+    metric_name: str,
+    *,
+    aggregation: str,
+    sample_count: int,
+) -> tuple[CoverageKind, int | None]:
+    """Describe what the observed-row denominator actually means."""
+
+    definition = metric_definition(metric_name)
+    if aggregation == "daily_value" or definition.coverage_kind == "OBSERVATION_COUNT":
+        return "OBSERVATION_COUNT", sample_count
+    return "UNKNOWN", None
 
 
 def _incomplete_sleep_stage_date(
@@ -287,7 +334,15 @@ def _metric_date(field: str, payload: Mapping[str, Any]) -> date | None:
     sample = _date_from_path(payload, ("sampleTime", "civilTime", "date"))
     if sample is not None:
         return sample
-    return _date_from_path(payload, ("interval", "civilStartTime", "date"))
+    physical_sample = _physical_sample_date(payload)
+    if physical_sample is not None:
+        return physical_sample
+    interval = _date_from_path(payload, ("interval", "civilStartTime", "date"))
+    return interval or _physical_interval_date(
+        payload,
+        time_field="startTime",
+        offset_field="startUtcOffset",
+    )
 
 
 def _date_from_path(payload: Mapping[str, Any], path: tuple[str, ...]) -> date | None:
@@ -314,10 +369,21 @@ def _physical_interval_date(
         return None
 
     offset_seconds = _protobuf_duration_seconds(interval.get(offset_field))
-    if offset_seconds is None or abs(offset_seconds) > Decimal(24 * 60 * 60):
+    if offset_seconds is None or abs(offset_seconds) > Decimal(18 * 60 * 60):
         return None
     utc_timestamp = timestamp.astimezone(UTC)
     return (utc_timestamp + timedelta(seconds=int(offset_seconds))).date()
+
+
+def _physical_sample_date(payload: Mapping[str, Any]) -> date | None:
+    sample_time = payload.get("sampleTime")
+    if not isinstance(sample_time, Mapping):
+        return None
+    timestamp = _rfc3339_datetime(sample_time.get("physicalTime"))
+    offset_seconds = _protobuf_duration_seconds(sample_time.get("utcOffset"))
+    if timestamp is None or offset_seconds is None or abs(offset_seconds) > Decimal(18 * 60 * 60):
+        return None
+    return (timestamp.astimezone(UTC) + timedelta(seconds=int(offset_seconds))).date()
 
 
 def _rfc3339_datetime(value: Any) -> datetime | None:

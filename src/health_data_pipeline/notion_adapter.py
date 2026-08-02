@@ -6,6 +6,7 @@ import json
 import time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from math import isfinite
 from typing import Any, cast
 from zoneinfo import ZoneInfo
@@ -26,6 +27,7 @@ from health_data_pipeline.views import (
 
 NOTION_VERSION = "2026-03-11"
 DATE_PROPERTY = "Date"
+METRIC_DATE_PROPERTY = "Metric date"
 GENERATION_PROPERTY = "Source HEAD generation"
 HASH_PROPERTY = "Content SHA-256"
 STATUS_PROPERTY = "Data status"
@@ -105,6 +107,7 @@ class NotionDataSourceGateway(NotionGateway):
         if title_name != DATE_PROPERTY:
             updates[title_name] = {"name": DATE_PROPERTY}
         desired: dict[str, dict[str, Any]] = {
+            METRIC_DATE_PROPERTY: {"date": {}},
             GENERATION_PROPERTY: {"number": {}},
             HASH_PROPERTY: {"rich_text": {}},
             STATUS_PROPERTY: {
@@ -398,10 +401,10 @@ class SnapshotViewSource:
         revision = shard.daily_revisions.get(metric_date.isoformat())
         if revision is None:
             return ()
-        payload = self._snapshots.read_daily_revision(revision)
+        payload = self._snapshots.read_daily_revision(revision, metric_date=metric_date)
         rows: list[Mapping[str, Any]] = []
         for line in payload.splitlines():
-            value = json.loads(line)
+            value = json.loads(line, parse_float=Decimal)
             if not isinstance(value, Mapping):
                 raise TypeError("daily revision row is not an object")
             rows.append(cast(Mapping[str, Any], value))
@@ -434,6 +437,15 @@ class SnapshotViewSource:
             and row.get("record_kind", "METRIC") == "METRIC"
         }
         session_rows = tuple(row for row in rows if row.get("record_kind") == "SLEEP_SESSION")
+        source_rows = tuple(row for row in rows if row.get("record_kind") == "SOURCE_STATUS")
+        sleep_source_status = next(
+            (
+                _optional_string(row.get("value_text"))
+                for row in source_rows
+                if row.get("dimension_key") == "sleep"
+            ),
+            None,
+        )
         sleep_sessions = tuple(_sleep_session_view(row) for row in session_rows)
         metrics = tuple(
             DailyMetric(
@@ -444,10 +456,30 @@ class SnapshotViewSource:
                 status=str(row.get("data_status", "UNKNOWN")),
                 weekly_average=_optional_number(weekly.get(name, {}).get("value_num")),
                 monthly_average=_optional_number(monthly.get(name, {}).get("value_num")),
-                coverage=_optional_number(row.get("coverage_ratio")),
-                weekly_coverage=_optional_number(weekly.get(name, {}).get("coverage_ratio")),
-                monthly_coverage=_optional_number(monthly.get(name, {}).get("coverage_ratio")),
+                coverage=(
+                    _optional_number(row.get("coverage_ratio")) if "coverage_kind" in row else None
+                ),
+                weekly_coverage=(
+                    _optional_number(weekly.get(name, {}).get("coverage_ratio"))
+                    if "coverage_kind" in weekly.get(name, {})
+                    else None
+                ),
+                monthly_coverage=(
+                    _optional_number(monthly.get(name, {}).get("coverage_ratio"))
+                    if "coverage_kind" in monthly.get(name, {})
+                    else None
+                ),
                 quality_flags=tuple(str(value) for value in row.get("quality_flags", ())),
+                missing_reason=_optional_string(row.get("missing_reason")),
+                coverage_kind=str(row.get("coverage_kind", "UNKNOWN")),
+                weekly_status=_optional_string(weekly.get(name, {}).get("data_status")),
+                monthly_status=_optional_string(monthly.get(name, {}).get("data_status")),
+                weekly_quality_flags=tuple(
+                    str(value) for value in weekly.get(name, {}).get("quality_flags", ())
+                ),
+                monthly_quality_flags=tuple(
+                    str(value) for value in monthly.get(name, {}).get("quality_flags", ())
+                ),
             )
             for name, row in sorted(observed.items())
         )
@@ -456,14 +488,38 @@ class SnapshotViewSource:
         data_status = (
             next(iter(statuses)) if len(statuses) == 1 else ("MISSING" if not statuses else "MIXED")
         )
+        context_row = next(iter(observed.values()), None)
+        if context_row is None:
+            context_row = session_rows[0] if session_rows else (rows[0] if rows else None)
         return DailyView(
             metric_date=metric_date,
             source_generation=root.generation,
             data_status=data_status,
             fitbit_last_sync_time=root.state.fitbit_last_sync_time,
             metrics=metrics,
+            time_zone=(
+                _optional_string(context_row.get("time_zone"))
+                if context_row is not None
+                else root.state.time_zone
+            ),
+            time_zone_source=(
+                _optional_string(context_row.get("time_zone_source"))
+                if context_row is not None
+                else None
+            ),
+            physical_day_start=(
+                _optional_aware_datetime(context_row.get("physical_day_start"))
+                if context_row is not None
+                else None
+            ),
+            physical_day_end=(
+                _optional_aware_datetime(context_row.get("physical_day_end"))
+                if context_row is not None
+                else None
+            ),
             sleep_sessions=sleep_sessions,
             sleep_sessions_available=bool(session_rows),
+            sleep_source_status=sleep_source_status,
         )
 
     def _step_count(self, root: RootSnapshot, metric_date: date) -> int | None:
@@ -491,12 +547,19 @@ def _sleep_session_view(row: Mapping[str, Any]) -> SleepSessionView:
     is_nap = row.get("session_is_nap")
     if not isinstance(is_main, bool) or not isinstance(is_nap, bool):
         raise TypeError("sleep session classification must be boolean")
+    role = _optional_string(row.get("session_role"))
     return SleepSessionView(
         start_time=start.astimezone(timezone(timedelta(seconds=start_offset))),
         end_time=end.astimezone(timezone(timedelta(seconds=end_offset))),
-        is_main=is_main or "MAIN_SLEEP_INFERRED" in row.get("quality_flags", ()),
-        is_nap=is_nap,
+        is_main=(
+            role == "MAIN" or is_main or "MAIN_SLEEP_INFERRED" in row.get("quality_flags", ())
+        ),
+        is_nap=role == "NAP" or is_nap,
         minutes_asleep=_optional_number(row.get("value_num")),
+        role_source=_optional_string(row.get("session_role_source")),
+        processed=_optional_bool(row.get("session_processed")),
+        stages_status=_optional_string(row.get("session_stages_status")),
+        manually_edited=_optional_bool(row.get("session_manually_edited")),
     )
 
 
@@ -515,14 +578,15 @@ def _required_aware_datetime(value: Any, field: str) -> datetime:
 def _required_utc_offset(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError("sleep session UTC offset must be an integer")
-    if abs(value) >= 24 * 60 * 60:
+    if abs(value) > 18 * 60 * 60:
         raise ValueError("sleep session UTC offset is outside the supported range")
     return cast(int, value)
 
 
 def _date_properties(metric_date: date) -> dict[str, Any]:
     return {
-        DATE_PROPERTY: {"title": [{"type": "text", "text": {"content": metric_date.isoformat()}}]}
+        DATE_PROPERTY: {"title": [{"type": "text", "text": {"content": metric_date.isoformat()}}]},
+        METRIC_DATE_PROPERTY: {"date": {"start": metric_date.isoformat()}},
     }
 
 
@@ -544,10 +608,24 @@ def _page_properties(view: DailyView, content_sha256: str) -> dict[str, Any]:
 
 
 def _body_blocks(body: str) -> list[Mapping[str, Any]]:
-    chunks = [
-        body[index : index + MAX_RICH_TEXT_CHARS]
-        for index in range(0, len(body), MAX_RICH_TEXT_CHARS)
-    ]
+    chunks: list[str] = []
+    current = ""
+    for line in body.splitlines(keepends=True):
+        if len(line) > MAX_RICH_TEXT_CHARS:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.extend(
+                line[index : index + MAX_RICH_TEXT_CHARS]
+                for index in range(0, len(line), MAX_RICH_TEXT_CHARS)
+            )
+            continue
+        if current and len(current) + len(line) > MAX_RICH_TEXT_CHARS:
+            chunks.append(current)
+            current = ""
+        current += line
+    if current:
+        chunks.append(current)
     return [
         {
             "object": "block",
@@ -589,6 +667,8 @@ def _rich_text_property(properties: Mapping[str, Any], name: str) -> str:
 
 
 def _optional_number(value: Any) -> int | float | None:
+    if isinstance(value, Decimal):
+        return int(value) if value == value.to_integral_value() else float(value)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return cast(int | float, value)
@@ -596,3 +676,17 @@ def _optional_number(value: Any) -> int | float | None:
 
 def _optional_string(value: Any) -> str | None:
     return value if isinstance(value, str) else None
+
+
+def _optional_bool(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _optional_aware_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None and parsed.utcoffset() is not None else None

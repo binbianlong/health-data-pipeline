@@ -27,9 +27,11 @@ from health_data_pipeline.commit import CommitCoordinator, CommitRequest
 from health_data_pipeline.daily import (
     DayContext,
     Observation,
+    SourceQueryStatus,
     affected_metric_dates,
     build_daily_rows,
     build_sleep_session_rows,
+    build_source_status_rows,
 )
 from health_data_pipeline.google_health import (
     DataPointPage,
@@ -38,9 +40,18 @@ from health_data_pipeline.google_health import (
 )
 from health_data_pipeline.job import SyncOutcome
 from health_data_pipeline.lease import LeaseRepository
+from health_data_pipeline.metrics import METRIC_DEFINITIONS, METRICS_BY_DATA_TYPE, CoverageKind
 from health_data_pipeline.models import CommitKind, ContentReference, RootSnapshot
-from health_data_pipeline.normalization import normalize_daily_observations
-from health_data_pipeline.sleep_sessions import SleepSession, normalize_sleep_sessions
+from health_data_pipeline.normalization import (
+    data_point_metric_date,
+    normalize_daily_observations,
+)
+from health_data_pipeline.sleep_sessions import (
+    SleepSession,
+    normalize_sleep_sessions,
+    reconcile_sleep_points,
+    resolve_sleep_data,
+)
 from health_data_pipeline.snapshot import SnapshotRepository
 from health_data_pipeline.storage import (
     ContentAddressedStore,
@@ -64,28 +75,6 @@ SUPPORTED_DATA_TYPES = (
     "exercise",
 )
 
-_METRICS_BY_DATA_TYPE: Mapping[str, frozenset[str]] = {
-    "steps": frozenset({"steps"}),
-    "distance": frozenset({"distance"}),
-    "active-zone-minutes": frozenset({"active_zone_minutes"}),
-    "heart-rate": frozenset({"heart_rate"}),
-    "daily-resting-heart-rate": frozenset({"resting_heart_rate"}),
-    "heart-rate-variability": frozenset({"hrv_rmssd"}),
-    "daily-heart-rate-variability": frozenset({"hrv_rmssd"}),
-    "oxygen-saturation": frozenset({"spo2"}),
-    "daily-oxygen-saturation": frozenset({"spo2"}),
-    "sleep": frozenset(
-        {
-            "sleep_minutes",
-            "sleep_rem_minutes",
-            "sleep_deep_minutes",
-            "sleep_light_minutes",
-            "sleep_awake_minutes",
-        }
-    ),
-    "respiratory-rate-sleep-summary": frozenset({"sleep_respiratory_rate"}),
-    "exercise": frozenset({"exercise_minutes"}),
-}
 _BACKFILL_BATCH_DAYS = 31
 _LEGACY_BACKFILL_BATCH_DAYS = 14
 _BACKFILL_EARLIEST_DATE = date(2009, 1, 1)
@@ -94,8 +83,8 @@ _RECONCILIATION_MAX_DAYS = 90
 _BACKFILL_TIME_ZONE = ZoneInfo("Asia/Tokyo")
 _BACKFILL_META_KEY = "_schedule"
 _BACKFILL_POLICY_VERSION = 2
-_NORMALIZER_VERSION = "daily-v4"
-_DAILY_SCHEMA_VERSION = 2
+_NORMALIZER_VERSION = "daily-v5"
+_DAILY_SCHEMA_VERSION = 3
 _PRIORITY_BACKFILL_DATA_TYPES = ("sleep", "exercise")
 _HIGH_FREQUENCY_DATA_TYPES = frozenset(
     {
@@ -120,6 +109,7 @@ class IngestedQuery:
     data_points: tuple[Mapping[str, Any], ...]
     manifest: ContentReference
     replacement_scope: Mapping[str, Any]
+    source_status: SourceQueryStatus
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,7 +210,7 @@ class IncrementalSyncPipeline:
             else self._snapshots.load_root_snapshot(base.head.root_snapshot)
         )
         settings = self._health.get_settings()
-        time_zone = _time_zone(settings, self._default_time_zone)
+        time_zone, time_zone_source = _time_zone(settings, self._default_time_zone)
         zone = ZoneInfo(time_zone)
         today = now.astimezone(zone).date()
         fitbit_last_sync = self._health.latest_fitbit_sync_time()
@@ -297,16 +287,24 @@ class IncrementalSyncPipeline:
         )
         changed_sleep_sessions = self._merge_changed_sleep_sessions(ingested)
         changed_dates.update(changed_sleep_sessions)
+        changed_source_statuses = self._merge_changed_source_statuses(root, ingested)
+        changed_dates.update(changed_source_statuses)
         if not changed_dates:
             changed_dates.add(today)
-        current_observations = self._merge_changed_observations(root, ingested)
+        current_observations = self._merge_changed_observations(
+            root,
+            ingested,
+            source_statuses=changed_source_statuses,
+        )
         targets = affected_metric_dates(changed_dates, today=today)
         daily_rows = self._recalculate_rows(
             root,
             targets,
             current_observations,
             changed_sleep_sessions,
+            changed_source_statuses,
             zone=zone,
+            time_zone_source=time_zone_source,
             now=now,
             fitbit_last_sync=fitbit_last_sync,
         )
@@ -337,11 +335,6 @@ class IncrementalSyncPipeline:
             if backfill_chunks
             else (CommitKind.WEBHOOK if pending else CommitKind.SCHEDULED)
         )
-        committed_sync_time = (
-            root.state.fitbit_last_sync_time
-            if backfill_chunks and root is not None
-            else fitbit_last_sync
-        )
         try:
             committed = self._commits.commit(
                 CommitRequest(
@@ -351,7 +344,8 @@ class IncrementalSyncPipeline:
                     data_type_cursors=cursors,
                     webhook_cursor=webhook_cursor,
                     backfill_cursors=backfill_cursors,
-                    fitbit_last_sync_time=committed_sync_time,
+                    fitbit_last_sync_time=fitbit_last_sync,
+                    preserve_fitbit_last_sync_time=bool(backfill_chunks),
                     time_zone=time_zone,
                     raw_replacements=_unique_raw_replacements(
                         item.replacement_scope for item in ingested
@@ -445,12 +439,29 @@ class IncrementalSyncPipeline:
             )
         )
         raw_references = tuple(self._publish_api_page(page) for page in pages)
-        points = tuple(point for page in pages for point in page.data_points)
-        normalized = normalize_daily_observations(points)
-        normalized_sleep_sessions = normalize_sleep_sessions(points) if data_type == "sleep" else {}
+        source_points = tuple(point for page in pages for point in page.data_points)
+        points, duplicate_source_count = _deduplicate_data_points(data_type, source_points)
+        sleep_resolution = resolve_sleep_data(points) if data_type == "sleep" else None
+        normalized = normalize_daily_observations(
+            points,
+            sleep_resolution=sleep_resolution,
+        )
+        normalized_sleep_sessions = (
+            normalize_sleep_sessions(points, resolution=sleep_resolution)
+            if sleep_resolution is not None
+            else {}
+        )
         sleep_session_count = sum(len(sessions) for sessions in normalized_sleep_sessions.values())
         sleep_source_count = sum(1 for point in points if isinstance(point.get("sleep"), Mapping))
-        normalized_reference = self._publish_normalized_source(
+        daily_observation_count = sum(len(values) for values in normalized.values())
+        points_by_date, source_statuses = _partition_ingested_points(
+            data_type,
+            ordered_dates,
+            points,
+            normalized,
+            normalized_sleep_sessions,
+        )
+        flattened_reference = self._publish_flattened_source(
             data_type,
             spec.record_kind,
             points,
@@ -491,7 +502,7 @@ class IncrementalSyncPipeline:
                 "civil_end": civil_end.isoformat(),
             }
         manifest_payload = {
-            "schema_version": 1,
+            "schema_version": 3,
             "data_type": data_type,
             "query_window": {
                 "physical_start": start,
@@ -503,15 +514,28 @@ class IncrementalSyncPipeline:
             "replacement_scope": replacement_scope,
             "page_count": len(pages),
             "api_pages": list(raw_references),
-            "normalized_source": normalized_reference,
-            "source_count": len(points),
-            "normalized_count": sum(len(values) for values in normalized.values()),
-            "deduplicate_count": max(0, sleep_source_count - sleep_session_count),
+            "flattened_source": flattened_reference,
+            "source_stream_row_count": len(source_points),
+            "flattened_source_row_count": len(points),
+            "duplicate_source_row_count": duplicate_source_count,
+            "daily_observation_count": daily_observation_count,
             "schema_version_daily": _DAILY_SCHEMA_VERSION,
             "normalizer_version": _NORMALIZER_VERSION,
-            "sleep_session_count": sleep_session_count,
+            "sleep_session_source_count": sleep_source_count,
+            "sleep_session_materialized_count": sleep_session_count,
+            "sleep_session_unmaterialized_count": max(0, sleep_source_count - sleep_session_count),
+            "source_query_statuses": {
+                metric_date.isoformat(): {
+                    "status": status.status,
+                    "source_count": status.source_count,
+                    "normalized_count": status.normalized_count,
+                }
+                for metric_date, status in sorted(source_statuses.items())
+            },
+            "unassigned_source_row_count": len(points)
+            - sum(len(day_points) for day_points in points_by_date.values()),
             "expected_head_generation": expected_generation,
-            "validation_result": "VALID",
+            "normalization_validation_result": "VALID",
         }
         canonical = canonical_json_bytes(manifest_payload)
         digest = sha256_hex(canonical)
@@ -525,19 +549,6 @@ class IncrementalSyncPipeline:
             canonical,
             logical_content_type="application/json",
         )
-        points_by_date: dict[date, list[Mapping[str, Any]]] = defaultdict(list)
-        if len(ordered_dates) == 1:
-            points_by_date[first_date].extend(points)
-        else:
-            requested_dates = set(ordered_dates)
-            for point in points:
-                point_dates = set(normalize_daily_observations((point,)))
-                if data_type == "sleep":
-                    point_dates.update(normalize_sleep_sessions((point,)))
-                for point_date in point_dates:
-                    if point_date not in requested_dates:
-                        raise ValueError("normalized observation falls outside replacement scope")
-                    points_by_date[point_date].append(point)
         return tuple(
             IngestedQuery(
                 data_type=data_type,
@@ -545,6 +556,7 @@ class IncrementalSyncPipeline:
                 data_points=tuple(points_by_date.get(metric_date, ())),
                 manifest=published.reference,
                 replacement_scope=raw_replacement_scope,
+                source_status=source_statuses[metric_date],
             )
             for metric_date in ordered_dates
         )
@@ -563,7 +575,7 @@ class IncrementalSyncPipeline:
             logical_content_type="application/json",
         ).reference
 
-    def _publish_normalized_source(
+    def _publish_flattened_source(
         self,
         data_type: str,
         record_kind: str,
@@ -574,7 +586,7 @@ class IncrementalSyncPipeline:
         )
         digest = sha256_hex(canonical)
         object_name = content_addressed_object_name(
-            "blobs/normalized",
+            "blobs/flattened",
             digest,
             suffix=".ndjson.gz",
             partitions=(
@@ -585,7 +597,9 @@ class IncrementalSyncPipeline:
         return self._content.publish(
             object_name,
             canonical,
-            logical_content_type=f"application/x-ndjson; data-type={data_type}",
+            logical_content_type=(
+                f"application/x-ndjson; layer=flattened-source; data-type={data_type}"
+            ),
         ).reference
 
     def _pending_webhooks(
@@ -618,6 +632,8 @@ class IncrementalSyncPipeline:
         self,
         root: RootSnapshot | None,
         ingested: Sequence[IngestedQuery],
+        *,
+        source_statuses: Mapping[date, Sequence[SourceQueryStatus]],
     ) -> dict[date, tuple[Observation, ...]]:
         by_date_and_type: dict[tuple[date, str], list[Observation]] = defaultdict(list)
         for item in ingested:
@@ -634,7 +650,7 @@ class IncrementalSyncPipeline:
                 for observation in self._observations_for_date(root, metric_date)
             }
             for item in (query for query in ingested if query.metric_date == metric_date):
-                for metric_name in _METRICS_BY_DATA_TYPE[item.data_type]:
+                for metric_name in METRICS_BY_DATA_TYPE[item.data_type]:
                     current = existing.get(metric_name)
                     if current is not None and item.data_type in current.source_data_types:
                         existing.pop(metric_name)
@@ -650,7 +666,31 @@ class IncrementalSyncPipeline:
                     current
                 ):
                     existing[observation.metric_name] = observation
+            _add_missing_observations(
+                existing,
+                metric_date=metric_date,
+                source_statuses=source_statuses.get(metric_date, ()),
+            )
             result[metric_date] = tuple(existing[name] for name in sorted(existing))
+        return result
+
+    def _merge_changed_source_statuses(
+        self,
+        root: RootSnapshot | None,
+        ingested: Sequence[IngestedQuery],
+    ) -> dict[date, tuple[SourceQueryStatus, ...]]:
+        """Merge durable per-source query outcomes for each explicitly queried day."""
+
+        queried_dates = {item.metric_date for item in ingested}
+        result: dict[date, tuple[SourceQueryStatus, ...]] = {}
+        for metric_date in sorted(queried_dates):
+            statuses = {
+                status.data_type: status
+                for status in self._source_statuses_for_date(root, metric_date)
+            }
+            for item in (query for query in ingested if query.metric_date == metric_date):
+                statuses[item.data_type] = item.source_status
+            result[metric_date] = tuple(statuses[name] for name in sorted(statuses))
         return result
 
     def _merge_changed_sleep_sessions(
@@ -682,8 +722,10 @@ class IncrementalSyncPipeline:
         targets: Sequence[date],
         changed: Mapping[date, Sequence[Observation]],
         changed_sleep_sessions: Mapping[date, Sequence[SleepSession]],
+        changed_source_statuses: Mapping[date, Sequence[SourceQueryStatus]],
         *,
         zone: ZoneInfo,
+        time_zone_source: str,
         now: datetime,
         fitbit_last_sync: datetime | None,
     ) -> dict[date, Sequence[Mapping[str, object]] | None]:
@@ -708,11 +750,15 @@ class IncrementalSyncPipeline:
             observations = tuple(
                 replace(
                     observation,
-                    data_status=_data_status(
-                        metric_date,
-                        zone=zone,
-                        now=now,
-                        fitbit_last_sync=fitbit_last_sync,
+                    data_status=(
+                        observation.data_status
+                        if observation.value is None
+                        else _data_status(
+                            metric_date,
+                            zone=zone,
+                            now=now,
+                            fitbit_last_sync=fitbit_last_sync,
+                        )
                     ),
                 )
                 for observation in history.get(metric_date, ())
@@ -726,10 +772,11 @@ class IncrementalSyncPipeline:
             ).astimezone(UTC)
             context = DayContext(
                 metric_date=metric_date,
-                fitbit_last_sync_time=fitbit_last_sync or datetime(1970, 1, 1, tzinfo=UTC),
+                fitbit_last_sync_time=fitbit_last_sync,
                 time_zone=zone.key,
                 physical_day_start=start,
                 physical_day_end=end,
+                time_zone_source=time_zone_source,
                 logic_version=_NORMALIZER_VERSION,
             )
             metric_rows = build_daily_rows(context, observations, history) if observations else []
@@ -749,7 +796,22 @@ class IncrementalSyncPipeline:
                 )
             else:
                 session_rows = list(self._sleep_session_rows_for_date(root, metric_date))
-            combined_rows = [*metric_rows, *session_rows]
+            source_statuses = (
+                tuple(changed_source_statuses[metric_date])
+                if metric_date in changed_source_statuses
+                else self._source_statuses_for_date(root, metric_date)
+            )
+            source_rows = build_source_status_rows(
+                context,
+                source_statuses,
+                data_status=_data_status(
+                    metric_date,
+                    zone=zone,
+                    now=now,
+                    fitbit_last_sync=fitbit_last_sync,
+                ),
+            )
+            combined_rows = [*metric_rows, *session_rows, *source_rows]
             if combined_rows:
                 rows[metric_date] = combined_rows
             elif metric_date in changed or metric_date in changed_sleep_sessions:
@@ -761,11 +823,82 @@ class IncrementalSyncPipeline:
         root: RootSnapshot | None,
         metric_date: date,
     ) -> tuple[Mapping[str, object], ...]:
-        return tuple(
-            cast(Mapping[str, object], row)
-            for row in self._daily_rows_for_date(root, metric_date)
-            if row.get("record_kind") == "SLEEP_SESSION"
-        )
+        rows: list[Mapping[str, object]] = []
+        for row in self._daily_rows_for_date(root, metric_date):
+            if (
+                row.get("record_kind") == "METRIC"
+                and row.get("period_kind") == "SESSION"
+                and row.get("dimension_key") is not None
+            ):
+                rows.append(cast(Mapping[str, object], row))
+                continue
+            if row.get("record_kind") != "SLEEP_SESSION":
+                continue
+            if "coverage_kind" in row:
+                rows.append(cast(Mapping[str, object], row))
+                continue
+            flags = tuple(str(value) for value in row.get("quality_flags", ()))
+            is_main = row.get("session_is_main") is True
+            is_nap = row.get("session_is_nap") is True
+            inferred = "MAIN_SLEEP_INFERRED" in flags
+            if is_main or inferred:
+                role = "MAIN"
+                role_source = "INFERRED" if inferred else "SOURCE_FLAG"
+            elif is_nap:
+                role = "NAP"
+                # v2 combined an explicit nap flag with REJECTED_NAP inference,
+                # so the original provenance cannot be reconstructed.
+                role_source = "UNCLASSIFIED"
+            else:
+                role = "UNCLASSIFIED"
+                role_source = "UNCLASSIFIED"
+            rows.append(
+                cast(
+                    Mapping[str, object],
+                    {
+                        **row,
+                        "expected_count": None,
+                        "coverage_ratio": None,
+                        "coverage_kind": "NOT_APPLICABLE",
+                        "missing_reason": None,
+                        "time_zone_source": "LEGACY_UNKNOWN",
+                        "session_role": role,
+                        "session_role_source": role_source,
+                        "session_processed": None,
+                        "session_stages_status": None,
+                        "session_manually_edited": None,
+                        "session_sleep_type": None,
+                        "session_create_time": None,
+                        "session_update_time": None,
+                    },
+                )
+            )
+        return tuple(rows)
+
+    def _source_statuses_for_date(
+        self,
+        root: RootSnapshot | None,
+        metric_date: date,
+    ) -> tuple[SourceQueryStatus, ...]:
+        result: list[SourceQueryStatus] = []
+        for row in self._daily_rows_for_date(root, metric_date):
+            if row.get("record_kind") != "SOURCE_STATUS":
+                continue
+            data_type = row.get("dimension_key")
+            status = row.get("value_text")
+            source_count = _nonnegative_int(row.get("value_num"), 0)
+            normalized_count = _nonnegative_int(row.get("sample_count"), 0)
+            if not isinstance(data_type, str) or not isinstance(status, str):
+                raise TypeError("source status row has invalid identity fields")
+            result.append(
+                SourceQueryStatus(
+                    data_type=data_type,
+                    status=status,
+                    source_count=source_count,
+                    normalized_count=normalized_count,
+                )
+            )
+        return tuple(sorted(result, key=lambda item: item.data_type))
 
     def _observations_for_date(
         self,
@@ -791,8 +924,14 @@ class IncrementalSyncPipeline:
                     unit=str(row.get("unit", "")),
                     aggregation=str(row.get("aggregation", "daily_value")),
                     data_status=str(row.get("data_status", "CANONICAL_SYNCED")),
-                    sample_count=_positive_int(row.get("sample_count"), 1),
-                    expected_count=_positive_int(row.get("expected_count"), 1),
+                    sample_count=_nonnegative_int(row.get("sample_count"), 0),
+                    expected_count=_optional_nonnegative_int(row.get("expected_count")),
+                    coverage_kind=_coverage_kind(row.get("coverage_kind")),
+                    missing_reason=(
+                        str(row["missing_reason"])
+                        if row.get("missing_reason") is not None
+                        else None
+                    ),
                     quality_flags=tuple(str(item) for item in row.get("quality_flags", ())),
                     source_data_types=tuple(str(item) for item in row.get("source_data_types", ())),
                 )
@@ -813,10 +952,10 @@ class IncrementalSyncPipeline:
         revision = shard.daily_revisions.get(metric_date.isoformat())
         if revision is None:
             return ()
-        payload = self._snapshots.read_daily_revision(revision)
+        payload = self._snapshots.read_daily_revision(revision, metric_date=metric_date)
         rows: list[Mapping[str, Any]] = []
         for line in payload.splitlines():
-            row = json.loads(line)
+            row = json.loads(line, parse_float=Decimal)
             if not isinstance(row, Mapping):
                 raise TypeError("daily revision row is not an object")
             rows.append(cast(Mapping[str, Any], row))
@@ -1074,7 +1213,7 @@ def _plan_fetch_dates(
 ) -> tuple[dict[str, set[date]], set[str], dict[str, date]]:
     fetch_dates: dict[str, set[date]] = defaultdict(set)
     for event in pending:
-        if event.data_type in _METRICS_BY_DATA_TYPE:
+        if event.data_type in METRICS_BY_DATA_TYPE:
             event_dates = event.dates or (today,)
             for data_type in _webhook_replacement_data_types(event.data_type):
                 fetch_dates[data_type].update(event_dates)
@@ -1112,11 +1251,9 @@ def _webhook_replacement_data_types(data_type: str) -> tuple[str, ...]:
     set for the affected civil dates.
     """
 
-    metrics = _METRICS_BY_DATA_TYPE.get(data_type, frozenset())
+    metrics = METRICS_BY_DATA_TYPE.get(data_type, frozenset())
     return tuple(
-        candidate
-        for candidate in SUPPORTED_DATA_TYPES
-        if metrics & _METRICS_BY_DATA_TYPE[candidate]
+        candidate for candidate in SUPPORTED_DATA_TYPES if metrics & METRICS_BY_DATA_TYPE[candidate]
     )
 
 
@@ -1311,15 +1448,15 @@ def _date_range(start: date | None, end: date | None) -> set[date]:
     return values
 
 
-def _time_zone(settings: Mapping[str, Any], default: str) -> str:
-    value = settings.get("timeZone", default)
+def _time_zone(settings: Mapping[str, Any], default: str) -> tuple[str, str]:
+    value = settings.get("timeZone")
     if not isinstance(value, str):
-        value = default
+        return default, "CONFIG_DEFAULT"
     try:
         ZoneInfo(value)
     except ZoneInfoNotFoundError:
-        return default
-    return value
+        return default, "CONFIG_DEFAULT"
+    return value, "GOOGLE_HEALTH_SETTINGS"
 
 
 def _replacement_kind(record_kind: str) -> str:
@@ -1340,9 +1477,148 @@ def _canonical_safe(value: Mapping[str, Any]) -> Mapping[str, Any]:
     )
 
 
+def _deduplicate_data_points(
+    data_type: str,
+    points: Sequence[Mapping[str, Any]],
+) -> tuple[tuple[Mapping[str, Any], ...], int]:
+    """Remove exact named duplicates and fail on ambiguous pagination overlap."""
+
+    if data_type == "sleep":
+        reconciled = reconcile_sleep_points(points)
+        return reconciled, len(points) - len(reconciled)
+    by_name: dict[str, bytes] = {}
+    anonymous_signatures: set[bytes] = set()
+    selected: list[Mapping[str, Any]] = []
+    duplicate_count = 0
+    for point in points:
+        signature = canonical_json_bytes(_canonical_safe(point))
+        raw_name = point.get("dataPointName")
+        if isinstance(raw_name, str) and raw_name:
+            previous = by_name.get(raw_name)
+            if previous is None:
+                by_name[raw_name] = signature
+                selected.append(point)
+                continue
+            if previous != signature:
+                raise ValueError("reconciled data point identity has conflicting payloads")
+            duplicate_count += 1
+            continue
+        if signature in anonymous_signatures:
+            raise ValueError("anonymous reconciled data point is duplicated across API pages")
+        anonymous_signatures.add(signature)
+        selected.append(point)
+    return tuple(selected), duplicate_count
+
+
 def _observation_priority(value: Observation) -> tuple[int, str]:
     daily = any(source.startswith("daily-") for source in value.source_data_types)
     return (1 if daily else 0, value.metric_name)
+
+
+def _add_missing_observations(
+    observations: dict[str, Observation],
+    *,
+    metric_date: date,
+    source_statuses: Sequence[SourceQueryStatus],
+) -> None:
+    statuses = {status.data_type: status.status for status in source_statuses}
+    for definition in METRIC_DEFINITIONS:
+        if definition.name in observations:
+            continue
+        queried = tuple(source for source in definition.source_data_types if source in statuses)
+        if not queried:
+            continue
+        status_values = {statuses[source] for source in queried}
+        if "SOURCE_PROCESSING" in status_values:
+            missing_reason = "SOURCE_PROCESSING"
+        elif "INVALID_SOURCE" in status_values:
+            missing_reason = "INVALID_SOURCE"
+        elif len(queried) < len(definition.source_data_types):
+            missing_reason = "NOT_QUERIED"
+        else:
+            missing_reason = "NO_SOURCE_VALUE"
+        observations[definition.name] = Observation(
+            metric_date=metric_date,
+            metric_name=definition.name,
+            value=None,
+            unit=definition.unit,
+            aggregation=definition.aggregation,
+            data_status="MISSING",
+            sample_count=0,
+            expected_count=None,
+            coverage_kind="UNKNOWN",
+            missing_reason=missing_reason,
+            quality_flags=(f"MISSING_{missing_reason}",),
+            source_data_types=tuple(sorted(queried)),
+        )
+
+
+def _partition_ingested_points(
+    data_type: str,
+    ordered_dates: Sequence[date],
+    points: Sequence[Mapping[str, Any]],
+    normalized: Mapping[date, Sequence[Observation]],
+    sleep_sessions: Mapping[date, Sequence[SleepSession]],
+) -> tuple[dict[date, list[Mapping[str, Any]]], dict[date, SourceQueryStatus]]:
+    """Bind source rows and query outcomes to the exact replacement days."""
+
+    requested_dates = set(ordered_dates)
+    if (set(normalized) | set(sleep_sessions)).difference(requested_dates):
+        raise ValueError("normalized observation falls outside replacement scope")
+
+    dated_points = tuple((point, data_point_metric_date(point)) for point in points)
+    if {point_date for _, point_date in dated_points if point_date is not None}.difference(
+        requested_dates
+    ):
+        raise ValueError("source data point falls outside replacement scope")
+
+    points_by_date: dict[date, list[Mapping[str, Any]]] = defaultdict(list)
+    if len(ordered_dates) == 1:
+        points_by_date[ordered_dates[0]].extend(points)
+    else:
+        for point, point_date in dated_points:
+            if point_date is not None:
+                points_by_date[point_date].append(point)
+
+    statuses: dict[date, SourceQueryStatus] = {}
+    for metric_date in ordered_dates:
+        day_points = tuple(points_by_date.get(metric_date, ()))
+        normalized_count = len(normalized.get(metric_date, ())) + len(
+            sleep_sessions.get(metric_date, ())
+        )
+        statuses[metric_date] = SourceQueryStatus(
+            data_type=data_type,
+            status=_source_query_result(
+                data_type,
+                day_points,
+                normalized_count=normalized_count,
+            ),
+            source_count=len(day_points),
+            normalized_count=normalized_count,
+        )
+    return points_by_date, statuses
+
+
+def _source_query_result(
+    data_type: str,
+    points: Sequence[Mapping[str, Any]],
+    *,
+    normalized_count: int,
+) -> str:
+    if not points:
+        return "SUCCESS_EMPTY"
+    if data_type == "sleep":
+        processed_values = []
+        for point in points:
+            sleep = point.get("sleep")
+            metadata = sleep.get("metadata") if isinstance(sleep, Mapping) else None
+            if isinstance(metadata, Mapping) and isinstance(metadata.get("processed"), bool):
+                processed_values.append(metadata["processed"])
+        if processed_values and not all(processed_values):
+            return "SOURCE_PROCESSING"
+    if normalized_count == 0:
+        return "INVALID_SOURCE"
+    return "SUCCESS_WITH_DATA"
 
 
 def _data_status(
@@ -1369,10 +1645,32 @@ def _data_status(
     return "CANONICAL_STALE"
 
 
-def _positive_int(value: Any, default: int) -> int:
-    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+def _nonnegative_int(value: Any, default: int) -> int:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         return value
+    if isinstance(value, (float, Decimal)) and value >= 0 and int(value) == value:
+        return int(value)
     return default
+
+
+def _optional_nonnegative_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    result = _nonnegative_int(value, -1)
+    return result if result >= 0 else None
+
+
+def _coverage_kind(value: Any) -> CoverageKind:
+    if value in {
+        "UNKNOWN",
+        "OBSERVATION_COUNT",
+        "CALENDAR_DAYS",
+        "NOT_APPLICABLE",
+    }:
+        return cast(CoverageKind, value)
+    # v1/v2 rows did not carry a denominator basis. Their stored ratio used the
+    # observed/expected counts, so retain that historical interpretation.
+    return "OBSERVATION_COUNT"
 
 
 def _aware_utc(value: datetime) -> datetime:

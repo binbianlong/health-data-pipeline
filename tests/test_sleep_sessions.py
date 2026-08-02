@@ -7,8 +7,12 @@ from typing import Any
 import pytest
 
 from health_data_pipeline.sleep_sessions import (
+    SleepResolutionDiagnosticCode,
+    SleepSessionRole,
+    SleepSessionRoleSource,
     SleepSessionValidationError,
     normalize_sleep_sessions,
+    resolve_sleep_data,
     select_main_sleep_points,
 )
 
@@ -87,6 +91,92 @@ def test_normalizes_times_offsets_identity_and_flags() -> None:
     assert normalized_nap.minutes_asleep == Decimal("25.5")
 
 
+def test_preserves_official_sleep_metadata_and_typed_stage_summaries() -> None:
+    point = _point(
+        "metadata",
+        start="2026-08-01T14:30:00Z",
+        end="2026-08-01T22:00:00Z",
+        main=True,
+        update_time="2026-08-02T01:00:00+09:00",
+    )
+    sleep = point["sleep"]
+    sleep["type"] = "STAGES"
+    sleep["createTime"] = "2026-08-01T13:00:00Z"
+    sleep["metadata"].update(
+        {
+            "processed": True,
+            "stagesStatus": "STAGES_STATUS_COMPLETE",
+            "manuallyEdited": False,
+        }
+    )
+    sleep["summary"].update(
+        {
+            "minutesInSleepPeriod": "450",
+            "minutesAwake": 30,
+            "minutesToFallAsleep": "8",
+            "minutesAfterWakeUp": 4,
+            "stagesSummary": [
+                {"type": "REM", "minutes": "90", "count": "4"},
+                {"type": "SLEEP_STAGE_TYPE_DEEP", "minutes": 60, "count": 3},
+                {"type": "RESTLESS", "minutes": 5, "count": 2},
+                {"type": "FUTURE_STAGE", "minutes": 1, "count": 1},
+            ],
+        }
+    )
+
+    session = normalize_sleep_sessions([point])[date(2026, 8, 2)][0]
+
+    assert session.role is SleepSessionRole.MAIN
+    assert session.role_source is SleepSessionRoleSource.SOURCE_FLAG
+    assert session.processed is True
+    assert session.stages_status == "STAGES_STATUS_COMPLETE"
+    assert session.manually_edited is False
+    assert session.sleep_type == "STAGES"
+    assert session.create_time == datetime(2026, 8, 1, 13, tzinfo=UTC)
+    assert session.update_time == datetime(2026, 8, 1, 16, tzinfo=UTC)
+    assert session.minutes_in_sleep_period == Decimal(450)
+    assert session.minutes_awake == Decimal(30)
+    assert session.minutes_to_fall_asleep == Decimal(8)
+    assert session.minutes_after_wake_up == Decimal(4)
+    assert {item.stage_type: (item.minutes, item.count) for item in session.stage_summaries} == {
+        "DEEP": (Decimal(60), 3),
+        "REM": (Decimal(90), 4),
+        "RESTLESS": (Decimal(5), 2),
+    }
+
+
+def test_defensively_omits_invalid_optional_metadata() -> None:
+    point = _point(
+        "invalid-metadata",
+        start="2026-08-01T14:30:00Z",
+        end="2026-08-01T22:00:00Z",
+        main=True,
+    )
+    sleep = point["sleep"]
+    sleep["createTime"] = "not-a-time"
+    sleep["metadata"].update({"processed": "true", "manuallyEdited": 1})
+    sleep["summary"].update(
+        {
+            "minutesAwake": -1,
+            "minutesAfterWakeUp": "NaN",
+            "stagesSummary": [
+                {"type": "REM", "minutes": 20, "count": 1},
+                {"type": "REM", "minutes": 21, "count": 1},
+                {"type": "AWAKE", "minutes": -1, "count": -1},
+            ],
+        }
+    )
+
+    session = normalize_sleep_sessions([point])[date(2026, 8, 2)][0]
+
+    assert session.processed is None
+    assert session.manually_edited is None
+    assert session.create_time is None
+    assert session.minutes_awake is None
+    assert session.minutes_after_wake_up is None
+    assert session.stage_summaries == ()
+
+
 def test_civil_end_date_wins_over_physical_date_and_offset() -> None:
     point = _point(
         "civil-date",
@@ -151,6 +241,25 @@ def test_revision_with_latest_update_time_wins() -> None:
 
     assert session.end_time == datetime(2026, 8, 1, 22, 0, tzinfo=UTC)
     assert session.minutes_asleep == Decimal(450)
+
+
+def test_identical_payload_keeps_latest_source_update_time() -> None:
+    older = _point(
+        "same-payload",
+        start="2026-08-01T14:00:00Z",
+        end="2026-08-01T22:00:00Z",
+        update_time="2026-08-02T00:00:00Z",
+    )
+    latest = _point(
+        "same-payload",
+        start="2026-08-01T14:00:00Z",
+        end="2026-08-01T22:00:00Z",
+        update_time="2026-08-02T01:00:00Z",
+    )
+
+    session = normalize_sleep_sessions([older, latest])[date(2026, 8, 2)][0]
+
+    assert session.update_time == datetime(2026, 8, 2, 1, tzinfo=UTC)
 
 
 def test_identical_duplicates_do_not_require_update_time() -> None:
@@ -250,6 +359,8 @@ def test_falls_back_to_longest_non_nap_and_marks_inference() -> None:
     inferred = next(session for session in sessions if session.main_inferred)
     assert not inferred.is_main
     assert not inferred.is_nap
+    assert inferred.role is SleepSessionRole.MAIN
+    assert inferred.role_source is SleepSessionRoleSource.INFERRED
 
 
 def test_falls_back_to_longest_when_every_session_is_a_nap() -> None:
@@ -320,6 +431,51 @@ def test_main_selection_accepts_summary_only_points_without_identity_or_start() 
 
     assert select_main_sleep_points([fallback, explicit_main]) == (explicit_main,)
     assert normalize_sleep_sessions([fallback, explicit_main]) == {}
+
+
+def test_materializable_session_controls_aggregate_when_explicit_main_is_incomplete() -> None:
+    incomplete_explicit = {
+        "dataPointName": "incomplete-explicit",
+        "sleep": {
+            "interval": {"civilEndTime": {"date": {"year": 2026, "month": 8, "day": 2}}},
+            "metadata": {"mainSleep": True},
+            "summary": {"minutesAsleep": "500"},
+        },
+    }
+    complete = _point(
+        "complete",
+        start="2026-08-01T15:00:00Z",
+        end="2026-08-01T22:00:00Z",
+        minutes="390",
+        main=False,
+        nap=False,
+    )
+
+    resolution = resolve_sleep_data([incomplete_explicit, complete])
+
+    assert resolution.aggregate_points == (complete,)
+    [session] = resolution.sessions_by_date[date(2026, 8, 2)]
+    assert session.role is SleepSessionRole.MAIN
+    assert session.main_inferred
+    codes = {diagnostic.code for diagnostic in resolution.diagnostics}
+    assert SleepResolutionDiagnosticCode.INCOMPLETE_EXPLICIT_MAIN_IGNORED in codes
+    assert SleepResolutionDiagnosticCode.MAIN_SLEEP_INFERRED in codes
+
+
+def test_legacy_summary_is_used_only_without_materializable_sessions() -> None:
+    legacy = {
+        "sleep": {
+            "interval": {"civilEndTime": {"date": {"year": 2026, "month": 8, "day": 2}}},
+            "metadata": {"mainSleep": True},
+            "summary": {"minutesAsleep": "400"},
+        }
+    }
+
+    resolution = resolve_sleep_data([legacy])
+
+    assert resolution.aggregate_points == (legacy,)
+    assert resolution.sessions_by_date == {}
+    assert resolution.days[0].quality_flags == ("LEGACY_SLEEP_SUMMARY_FALLBACK",)
 
 
 def test_main_selection_uses_physical_end_date_for_minimal_point() -> None:

@@ -3,7 +3,10 @@ from datetime import date
 from decimal import Decimal
 from typing import Any
 
-from health_data_pipeline.normalization import normalize_daily_observations
+from health_data_pipeline.normalization import (
+    data_point_metric_date,
+    normalize_daily_observations,
+)
 
 
 def _civil(day: int) -> dict[str, object]:
@@ -89,6 +92,85 @@ def test_sleep_daily_totals_exclude_a_separate_nap_session() -> None:
     assert {item.metric_name: item.value for item in observations}["sleep_minutes"] == Decimal(400)
 
 
+def test_sleep_aggregate_ignores_unpersistable_explicit_main_and_reports_quality() -> None:
+    incomplete_explicit = {
+        "dataPointName": "incomplete-explicit",
+        "sleep": {
+            "interval": {"civilEndTime": _civil(28)},
+            "metadata": {"mainSleep": True},
+            "summary": {"minutesAsleep": "500"},
+        },
+    }
+    materializable = {
+        "dataPointName": "complete",
+        "sleep": {
+            "interval": {
+                "civilEndTime": _civil(28),
+                "startTime": "2026-07-27T15:00:00Z",
+                "startUtcOffset": "32400s",
+                "endTime": "2026-07-27T22:00:00Z",
+                "endUtcOffset": "32400s",
+            },
+            "metadata": {"mainSleep": False, "nap": False},
+            "summary": {"minutesAsleep": "390"},
+        },
+    }
+
+    observations = normalize_daily_observations([incomplete_explicit, materializable])[
+        date(2026, 7, 28)
+    ]
+    sleep = next(item for item in observations if item.metric_name == "sleep_minutes")
+
+    assert sleep.value == Decimal(390)
+    assert sleep.quality_flags == (
+        "INCOMPLETE_EXPLICIT_MAIN_IGNORED",
+        "MAIN_SLEEP_INFERRED",
+    )
+
+
+def test_observed_coverage_distinguishes_counts_from_unknown_sampling() -> None:
+    points: list[Mapping[str, Any]] = [
+        {
+            "steps": {
+                "interval": {"civilStartTime": _civil(28)},
+                "count": "4000",
+            }
+        },
+        {
+            "steps": {
+                "interval": {"civilStartTime": _civil(28)},
+                "count": "4432",
+            }
+        },
+        {
+            "dailyOxygenSaturation": {
+                "date": {"year": 2026, "month": 7, "day": 28},
+                "averagePercentage": 96.2,
+            }
+        },
+        {
+            "sleep": {
+                "interval": {"civilEndTime": _civil(28)},
+                "summary": {"minutesAsleep": "430"},
+            }
+        },
+    ]
+
+    observations = {
+        item.metric_name: item for item in normalize_daily_observations(points)[date(2026, 7, 28)]
+    }
+
+    assert observations["steps"].sample_count == 2
+    assert observations["steps"].expected_count is None
+    assert observations["steps"].coverage_kind == "UNKNOWN"
+    assert observations["spo2"].sample_count == 1
+    assert observations["spo2"].expected_count == 1
+    assert observations["spo2"].coverage_kind == "OBSERVATION_COUNT"
+    assert observations["sleep_minutes"].sample_count == 1
+    assert observations["sleep_minutes"].expected_count == 1
+    assert observations["sleep_minutes"].coverage_kind == "OBSERVATION_COUNT"
+
+
 def test_sleep_prefers_civil_end_date_over_physical_end_date() -> None:
     point = {
         "sleep": {
@@ -103,6 +185,19 @@ def test_sleep_prefers_civil_end_date_over_physical_end_date() -> None:
     result = normalize_daily_observations([point])
     assert date(2026, 7, 28) in result
     assert date(2026, 7, 29) not in result
+
+
+def test_sample_date_falls_back_to_physical_time_and_offset_without_a_value() -> None:
+    point = {
+        "heartRate": {
+            "sampleTime": {
+                "physicalTime": "2026-07-28T16:30:00Z",
+                "utcOffset": "32400s",
+            }
+        }
+    }
+
+    assert data_point_metric_date(point) == date(2026, 7, 29)
 
 
 def test_sleep_uses_physical_end_time_and_utc_offset_with_stage_summaries() -> None:

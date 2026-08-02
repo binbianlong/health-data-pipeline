@@ -5,7 +5,12 @@ from typing import Any
 
 import pytest
 
-from health_data_pipeline.notion_adapter import NotionApiError, NotionDataSourceGateway
+from health_data_pipeline.notion_adapter import (
+    MAX_RICH_TEXT_CHARS,
+    NotionApiError,
+    NotionDataSourceGateway,
+    _body_blocks,
+)
 from health_data_pipeline.views import DailyView
 
 
@@ -143,7 +148,10 @@ def test_new_page_uses_date_as_recovery_key_before_body_commit() -> None:
     assert page_id == "new-page"
     create_payload = client.calls[0][2]
     assert create_payload is not None
-    assert set(create_payload["properties"]) == {"Date"}
+    assert create_payload["properties"] == {
+        "Date": {"title": [{"type": "text", "text": {"content": "2026-07-28"}}]},
+        "Metric date": {"date": {"start": "2026-07-28"}},
+    }
     assert [call[:2] for call in client.calls][-1] == (
         "PATCH",
         "/v1/pages/new-page",
@@ -165,6 +173,7 @@ def test_configure_schema_renames_title_and_adds_required_properties() -> None:
     assert payload is not None
     properties = payload["properties"]
     assert properties["Name"] == {"name": "Date"}
+    assert properties["Metric date"] == {"date": {}}
     assert properties["Source HEAD generation"] == {"number": {}}
     assert properties["Content SHA-256"] == {"rich_text": {}}
     assert properties["Fitbit last sync time"] == {"date": {}}
@@ -214,3 +223,18 @@ def test_rate_limit_retry_is_bounded_and_error_omits_response_data() -> None:
     assert delays == [2.0, 2.0, 2.0]
     assert "private" not in str(exc_info.value)
     assert "token" not in str(exc_info.value)
+
+
+def test_body_blocks_preserve_complete_line_boundaries_when_they_fit() -> None:
+    first_line = "a" * 1_000 + "\n"
+    second_line = "b" * 1_000 + "\n"
+    final_line = "tail\n"
+    body = first_line + second_line + final_line
+
+    blocks = _body_blocks(body)
+    chunks = [block["code"]["rich_text"][0]["text"]["content"] for block in blocks]
+
+    assert chunks == [first_line, second_line + final_line]
+    assert "".join(chunks) == body
+    assert all(len(chunk) <= MAX_RICH_TEXT_CHARS for chunk in chunks)
+    assert all(chunk.endswith("\n") for chunk in chunks)

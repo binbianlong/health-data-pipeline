@@ -1,0 +1,208 @@
+[
+  {
+    "name": "metric_date",
+    "type": "DATE",
+    "mode": "REQUIRED",
+    "description": "Civil date derived from the GCS metric_date partition."
+  },
+  {
+    "name": "record_kind",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "METRIC, SLEEP_SESSION, or SOURCE_STATUS."
+  },
+  {
+    "name": "metric_name",
+    "type": "STRING",
+    "mode": "REQUIRED"
+  },
+  {
+    "name": "statistic",
+    "type": "STRING",
+    "mode": "REQUIRED"
+  },
+  {
+    "name": "period_kind",
+    "type": "STRING",
+    "mode": "REQUIRED"
+  },
+  {
+    "name": "dimension_key",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "value_num",
+    "type": "BIGNUMERIC",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "value_text",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "unit",
+    "type": "STRING",
+    "mode": "REQUIRED"
+  },
+  {
+    "name": "aggregation",
+    "type": "STRING",
+    "mode": "REQUIRED"
+  },
+  {
+    "name": "period_start",
+    "type": "DATE",
+    "mode": "REQUIRED"
+  },
+  {
+    "name": "period_end",
+    "type": "DATE",
+    "mode": "REQUIRED"
+  },
+  {
+    "name": "sample_count",
+    "type": "INTEGER",
+    "mode": "REQUIRED"
+  },
+  {
+    "name": "expected_count",
+    "type": "INTEGER",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "coverage_ratio",
+    "type": "FLOAT",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "coverage_kind",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "UNKNOWN, OBSERVATION_COUNT, CALENDAR_DAYS, or NOT_APPLICABLE."
+  },
+  {
+    "name": "data_status",
+    "type": "STRING",
+    "mode": "REQUIRED"
+  },
+  {
+    "name": "missing_reason",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "quality_flags",
+    "type": "STRING",
+    "mode": "REPEATED"
+  },
+  {
+    "name": "source_data_types",
+    "type": "STRING",
+    "mode": "REPEATED"
+  },
+  {
+    "name": "fitbit_last_sync_time",
+    "type": "TIMESTAMP",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "time_zone",
+    "type": "STRING",
+    "mode": "REQUIRED"
+  },
+  {
+    "name": "time_zone_source",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "GOOGLE_HEALTH_SETTINGS, CONFIG_DEFAULT, or LEGACY_UNKNOWN."
+  },
+  {
+    "name": "physical_day_start",
+    "type": "TIMESTAMP",
+    "mode": "REQUIRED"
+  },
+  {
+    "name": "physical_day_end",
+    "type": "TIMESTAMP",
+    "mode": "REQUIRED"
+  },
+  {
+    "name": "logic_version",
+    "type": "STRING",
+    "mode": "REQUIRED"
+  },
+  {
+    "name": "session_start_time",
+    "type": "TIMESTAMP",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "session_end_time",
+    "type": "TIMESTAMP",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "session_start_utc_offset_seconds",
+    "type": "INTEGER",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "session_end_utc_offset_seconds",
+    "type": "INTEGER",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "session_is_main",
+    "type": "BOOLEAN",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "session_is_nap",
+    "type": "BOOLEAN",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "session_role",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "MAIN, NAP, or UNCLASSIFIED."
+  },
+  {
+    "name": "session_role_source",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "SOURCE_FLAG, INFERRED, or UNCLASSIFIED."
+  },
+  {
+    "name": "session_processed",
+    "type": "BOOLEAN",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "session_manually_edited",
+    "type": "BOOLEAN",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "session_stages_status",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "session_sleep_type",
+    "type": "STRING",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "session_create_time",
+    "type": "TIMESTAMP",
+    "mode": "NULLABLE"
+  },
+  {
+    "name": "session_update_time",
+    "type": "TIMESTAMP",
+    "mode": "NULLABLE"
+  }
+]

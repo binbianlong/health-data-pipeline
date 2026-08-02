@@ -170,3 +170,121 @@ def test_calendar_month_mean_is_month_to_date() -> None:
     assert monthly["value_num"] == Decimal(20)
     assert monthly["period_start"] == date(2026, 2, 1)
     assert monthly["period_end"] == current_day
+
+
+def test_unknown_daily_coverage_has_no_fabricated_denominator_or_ratio() -> None:
+    current_day = date(2026, 2, 5)
+    observation = Observation(
+        metric_date=current_day,
+        metric_name="steps",
+        value=Decimal(8_000),
+        unit="count",
+        aggregation="daily_sum",
+        sample_count=37,
+        expected_count=None,
+        coverage_kind="UNKNOWN",
+        source_data_types=("steps",),
+    )
+
+    rows = build_daily_rows(_context(current_day), [observation], {})
+    observed = next(row for row in rows if row["period_kind"] == "DAY")
+
+    assert observed["sample_count"] == 37
+    assert observed["expected_count"] is None
+    assert observed["coverage_ratio"] is None
+    assert observed["coverage_kind"] == "UNKNOWN"
+
+
+def test_calendar_aggregates_union_quality_and_sources_with_partial_coverage() -> None:
+    current_day = date(2026, 2, 5)  # Thursday
+
+    def observation(
+        day: date,
+        value: int,
+        *,
+        source: str,
+        flag: str,
+        status: str = "CANONICAL_SYNCED",
+    ) -> Observation:
+        return Observation(
+            metric_date=day,
+            metric_name="hrv_rmssd",
+            value=Decimal(value),
+            unit="ms",
+            aggregation="daily_value",
+            data_status=status,
+            quality_flags=(flag,),
+            source_data_types=(source,),
+        )
+
+    history = {
+        date(2026, 2, 1): [
+            observation(
+                date(2026, 2, 1),
+                10,
+                source="monthly-only-source",
+                flag="MONTH_ONLY",
+            )
+        ],
+        date(2026, 2, 2): [
+            observation(
+                date(2026, 2, 2),
+                20,
+                source="daily-heart-rate-variability",
+                flag="DAILY_SUMMARY",
+            )
+        ],
+        date(2026, 2, 4): [
+            observation(
+                date(2026, 2, 4),
+                40,
+                source="heart-rate-variability",
+                flag="DETAIL_DERIVED",
+                status="CANONICAL_STALE",
+            )
+        ],
+    }
+    current = observation(
+        current_day,
+        50,
+        source="daily-heart-rate-variability",
+        flag="CURRENT_DAY",
+    )
+
+    rows = build_daily_rows(_context(current_day), [current], history)
+    weekly = next(row for row in rows if row["period_kind"] == "CALENDAR_WEEK")
+    monthly = next(row for row in rows if row["period_kind"] == "CALENDAR_MONTH")
+
+    assert weekly["sample_count"] == 3
+    assert weekly["expected_count"] == 4
+    assert weekly["coverage_ratio"] == Decimal("0.75")
+    assert weekly["coverage_kind"] == "CALENDAR_DAYS"
+    assert weekly["data_status"] == "CANONICAL_STALE"
+    assert weekly["quality_flags"] == [
+        "CURRENT_DAY",
+        "DAILY_SUMMARY",
+        "DETAIL_DERIVED",
+        "PARTIAL_COVERAGE",
+    ]
+    assert weekly["source_data_types"] == [
+        "daily-heart-rate-variability",
+        "heart-rate-variability",
+    ]
+
+    assert monthly["sample_count"] == 4
+    assert monthly["expected_count"] == 5
+    assert monthly["coverage_ratio"] == Decimal("0.8")
+    assert monthly["coverage_kind"] == "CALENDAR_DAYS"
+    assert monthly["data_status"] == "CANONICAL_STALE"
+    assert monthly["quality_flags"] == [
+        "CURRENT_DAY",
+        "DAILY_SUMMARY",
+        "DETAIL_DERIVED",
+        "MONTH_ONLY",
+        "PARTIAL_COVERAGE",
+    ]
+    assert monthly["source_data_types"] == [
+        "daily-heart-rate-variability",
+        "heart-rate-variability",
+        "monthly-only-source",
+    ]

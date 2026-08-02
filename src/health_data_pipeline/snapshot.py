@@ -16,6 +16,12 @@ from health_data_pipeline.canonical import (
     snapshot_object_name,
     year_shard_object_name,
 )
+from health_data_pipeline.daily_schema import (
+    DailySchemaValidationError,
+    daily_unique_key_fields,
+    require_supported_daily_schema,
+    validate_daily_rows,
+)
 from health_data_pipeline.models import (
     ChangeSet,
     ContentReference,
@@ -31,14 +37,6 @@ from health_data_pipeline.storage import (
     StorageIntegrityError,
 )
 
-DAILY_UNIQUE_KEY = (
-    "metric_name",
-    "statistic",
-    "period_kind",
-    "dimension_key",
-)
-DAILY_UNIQUE_KEY_V2 = ("record_kind", *DAILY_UNIQUE_KEY)
-DAILY_SCHEMA_V2 = 2
 _FORBIDDEN_DAILY_COMMIT_FIELDS = frozenset(
     {
         "commit_generation",
@@ -52,6 +50,7 @@ _FORBIDDEN_DAILY_COMMIT_FIELDS = frozenset(
     }
 )
 _MAX_YEAR = 9999
+_DAILY_URI_METRIC_DATE_INDEX = 2
 
 
 class SnapshotValidationError(ValueError):
@@ -89,6 +88,12 @@ def build_year_shard(
         if replacement is None:
             revisions.pop(key, None)
             continue
+
+        _validate_daily_reference_uri(
+            metric_date,
+            replacement,
+            error_type=SnapshotValidationError,
+        )
 
         existing = revisions.get(key)
         if existing is not None and existing.canonical_sha256 == replacement.canonical_sha256:
@@ -249,19 +254,29 @@ class SnapshotRepository:
         schema_version: int = 1,
         unique_key_fields: Sequence[str] | None = None,
     ) -> DailyRevisionReference:
-        if unique_key_fields is None:
-            unique_key_fields = (
-                DAILY_UNIQUE_KEY_V2 if schema_version >= DAILY_SCHEMA_V2 else DAILY_UNIQUE_KEY
-            )
+        parsed_metric_date = _parse_metric_date(metric_date)
+        try:
+            expected_unique_key = daily_unique_key_fields(schema_version)
+        except DailySchemaValidationError as exc:
+            raise SnapshotValidationError(str(exc)) from exc
+        if unique_key_fields is not None and tuple(unique_key_fields) != expected_unique_key:
+            msg = f"daily schema v{schema_version} requires its versioned unique key"
+            raise SnapshotValidationError(msg)
+        unique_key_fields = expected_unique_key
         materialized_rows = [_mapping_row(row) for row in rows]
-        _validate_daily_rows(materialized_rows, unique_key_fields)
+        _validate_daily_rows(
+            materialized_rows,
+            unique_key_fields,
+            schema_version=schema_version,
+            metric_date=parsed_metric_date,
+        )
         canonical_content = canonical_ndjson_bytes(
             materialized_rows,
             sort_fields=unique_key_fields,
         )
         canonical_hash = sha256_hex(canonical_content)
         object_name = daily_revision_object_name(
-            metric_date,
+            parsed_metric_date,
             canonical_hash,
             schema_version=schema_version,
         )
@@ -337,7 +352,21 @@ class SnapshotRepository:
             msg = f"invalid Root Snapshot schema: {reference.uri}"
             raise StorageIntegrityError(msg) from exc
 
-    def read_daily_revision(self, reference: DailyRevisionReference) -> bytes:
+    def read_daily_revision(
+        self,
+        reference: DailyRevisionReference,
+        *,
+        metric_date: date | str | None = None,
+    ) -> bytes:
+        uri_metric_date = _metric_date_from_daily_reference_uri(reference)
+        expected_metric_date = (
+            uri_metric_date if metric_date is None else _parse_daily_read_metric_date(metric_date)
+        )
+        _validate_daily_reference_uri(
+            expected_metric_date,
+            reference,
+            error_type=StorageIntegrityError,
+        )
         payload = self._content_store.read(reference)
         row_count = 0 if not payload else payload.count(b"\n")
         if row_count != reference.row_count or (payload and not payload.endswith(b"\n")):
@@ -349,6 +378,9 @@ class SnapshotRepository:
 def _validate_daily_rows(
     rows: Sequence[Mapping[str, object]],
     unique_key_fields: Sequence[str],
+    *,
+    schema_version: int,
+    metric_date: date,
 ) -> None:
     seen_keys: set[bytes] = set()
     for row in rows:
@@ -361,10 +393,62 @@ def _validate_daily_rows(
         except KeyError as exc:
             msg = f"daily row is missing unique key field: {exc.args[0]}"
             raise SnapshotValidationError(msg) from exc
+        try:
+            validate_daily_rows(
+                [row],
+                schema_version=schema_version,
+                metric_date=metric_date,
+            )
+        except DailySchemaValidationError as exc:
+            raise SnapshotValidationError(str(exc)) from exc
         if key in seen_keys:
             msg = "daily rows contain a duplicate unique key"
             raise SnapshotValidationError(msg)
         seen_keys.add(key)
+
+
+def _validate_daily_reference_uri(
+    metric_date: date,
+    reference: DailyRevisionReference,
+    *,
+    error_type: type[SnapshotValidationError] | type[StorageIntegrityError],
+) -> None:
+    try:
+        require_supported_daily_schema(reference.schema_version)
+        expected_name = daily_revision_object_name(
+            metric_date,
+            reference.canonical_sha256,
+            schema_version=reference.schema_version,
+        )
+    except (DailySchemaValidationError, TypeError, ValueError) as exc:
+        raise error_type(f"invalid daily revision reference: {reference.uri}") from exc
+    if reference.uri != expected_name:
+        raise error_type(
+            "daily revision URI does not match its metric date, schema version, or hash: "
+            f"{reference.uri}"
+        )
+
+
+def _metric_date_from_daily_reference_uri(reference: DailyRevisionReference) -> date:
+    components = reference.uri.split("/")
+    if len(components) <= _DAILY_URI_METRIC_DATE_INDEX or not components[
+        _DAILY_URI_METRIC_DATE_INDEX
+    ].startswith("metric_date="):
+        raise StorageIntegrityError(f"not a daily revision URI: {reference.uri}")
+    raw_date = components[_DAILY_URI_METRIC_DATE_INDEX].removeprefix("metric_date=")
+    try:
+        return _parse_metric_date(raw_date)
+    except SnapshotValidationError as exc:
+        raise StorageIntegrityError(f"invalid daily revision metric date: {reference.uri}") from exc
+
+
+def _parse_daily_read_metric_date(value: date | str) -> date:
+    try:
+        return _parse_metric_date(value)
+    except SnapshotValidationError as exc:
+        raise StorageIntegrityError(
+            f"invalid expected daily revision metric date: {value!r}"
+        ) from exc
 
 
 def _mapping_row(row: object) -> Mapping[str, object]:
