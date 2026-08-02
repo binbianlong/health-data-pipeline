@@ -8,11 +8,21 @@ resource "google_storage_bucket" "health" {
   force_destroy               = false
 
   versioning {
-    enabled = false
+    enabled = true
   }
 
   soft_delete_policy {
     retention_duration_seconds = 0
+  }
+
+  lifecycle_rule {
+    action {
+      type = "Delete"
+    }
+    condition {
+      days_since_noncurrent_time = 7
+      with_state                 = "ARCHIVED"
+    }
   }
 
   lifecycle_rule {
@@ -34,6 +44,8 @@ resource "google_storage_bucket" "health" {
       matches_prefix = [
         "blobs/normalized/record_kind=INTERVAL/",
         "blobs/normalized/record_kind=SAMPLE/",
+        "blobs/flattened/record_kind=INTERVAL/",
+        "blobs/flattened/record_kind=SAMPLE/",
         "state/runs/",
       ]
     }
@@ -48,7 +60,8 @@ resource "google_storage_bucket" "health" {
       matches_prefix = [
         "blobs/normalized/record_kind=DAILY/",
         "blobs/normalized/record_kind=SESSION/",
-        "manifests/ingestion/",
+        "blobs/flattened/record_kind=DAILY/",
+        "blobs/flattened/record_kind=SESSION/",
       ]
     }
   }
