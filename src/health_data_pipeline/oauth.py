@@ -18,14 +18,18 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Any, Protocol, cast
+from typing import Any, Final, Protocol, cast
 
 from health_data_pipeline.google_health import identifier_hmac
+from health_data_pipeline.persistence import versioned_state as _versioned_state
 from health_data_pipeline.storage import (
-    ObjectNotFound,
     ObjectStore,
     PreconditionFailed,
 )
+
+VersionedObject = _versioned_state.VersionedObject
+read_state: Final = _versioned_state.read_state
+write_state: Final = _versioned_state.write_state
 
 SETUP_CODE_PATH = "state/oauth/setup-code.json"
 OWNER_PATH = "state/owner.json"
@@ -49,38 +53,6 @@ class InvalidOAuthSession(OAuthStateError):
 
 class OwnerMismatch(OAuthStateError):
     """The OAuth account differs from the pipeline owner."""
-
-
-@dataclass(frozen=True, slots=True)
-class VersionedObject:
-    data: bytes
-    generation: int
-
-
-def read_state(store: ObjectStore, path: str) -> VersionedObject | None:
-    try:
-        stored = store.get(path)
-    except ObjectNotFound:
-        return None
-    return VersionedObject(data=stored.data, generation=stored.generation)
-
-
-def write_state(
-    store: ObjectStore,
-    path: str,
-    data: bytes,
-    *,
-    if_generation_match: int,
-) -> int:
-    stored = store.put(
-        path,
-        data,
-        if_generation_match=if_generation_match,
-        metadata={"schema": "application-state-json"},
-        content_type="application/json",
-        cache_control="no-store",
-    )
-    return stored.generation
 
 
 class SecretCipher(Protocol):
