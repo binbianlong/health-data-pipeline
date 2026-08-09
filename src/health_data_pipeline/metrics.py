@@ -5,6 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Final, Literal
 
+from health_data_pipeline.data_types import METRIC_SOURCE_DATA_TYPES
+from health_data_pipeline.data_types import (
+    METRICS_BY_DATA_TYPE as _CATALOG_METRICS_BY_DATA_TYPE,
+)
+
 CoverageKind = Literal[
     "UNKNOWN",
     "OBSERVATION_COUNT",
@@ -27,25 +32,50 @@ class MetricDefinition:
 
 METRIC_DEFINITIONS: Final[tuple[MetricDefinition, ...]] = (
     MetricDefinition(
-        "sleep_minutes", "min", "daily_sum", ("sleep",), "睡眠時間", "OBSERVATION_COUNT"
+        "sleep_minutes",
+        "min",
+        "daily_sum",
+        METRIC_SOURCE_DATA_TYPES["sleep_minutes"],
+        "睡眠時間",
+        "OBSERVATION_COUNT",
     ),
     MetricDefinition(
-        "sleep_rem_minutes", "min", "daily_sum", ("sleep",), "REM睡眠", "OBSERVATION_COUNT"
+        "sleep_rem_minutes",
+        "min",
+        "daily_sum",
+        METRIC_SOURCE_DATA_TYPES["sleep_rem_minutes"],
+        "REM睡眠",
+        "OBSERVATION_COUNT",
     ),
     MetricDefinition(
-        "sleep_deep_minutes", "min", "daily_sum", ("sleep",), "深い睡眠", "OBSERVATION_COUNT"
+        "sleep_deep_minutes",
+        "min",
+        "daily_sum",
+        METRIC_SOURCE_DATA_TYPES["sleep_deep_minutes"],
+        "深い睡眠",
+        "OBSERVATION_COUNT",
     ),
     MetricDefinition(
-        "sleep_light_minutes", "min", "daily_sum", ("sleep",), "浅い睡眠", "OBSERVATION_COUNT"
+        "sleep_light_minutes",
+        "min",
+        "daily_sum",
+        METRIC_SOURCE_DATA_TYPES["sleep_light_minutes"],
+        "浅い睡眠",
+        "OBSERVATION_COUNT",
     ),
     MetricDefinition(
-        "sleep_awake_minutes", "min", "daily_sum", ("sleep",), "覚醒時間", "OBSERVATION_COUNT"
+        "sleep_awake_minutes",
+        "min",
+        "daily_sum",
+        METRIC_SOURCE_DATA_TYPES["sleep_awake_minutes"],
+        "覚醒時間",
+        "OBSERVATION_COUNT",
     ),
     MetricDefinition(
         "resting_heart_rate",
         "bpm",
         "daily_value",
-        ("daily-resting-heart-rate",),
+        METRIC_SOURCE_DATA_TYPES["resting_heart_rate"],
         "安静時心拍数",
         "OBSERVATION_COUNT",
     ),
@@ -53,48 +83,63 @@ METRIC_DEFINITIONS: Final[tuple[MetricDefinition, ...]] = (
         "hrv_rmssd",
         "ms",
         "daily_value",
-        ("daily-heart-rate-variability", "heart-rate-variability"),
+        METRIC_SOURCE_DATA_TYPES["hrv_rmssd"],
         "HRV (RMSSD)",
     ),
     MetricDefinition(
         "spo2",
         "%",
         "daily_value",
-        ("daily-oxygen-saturation", "oxygen-saturation"),
+        METRIC_SOURCE_DATA_TYPES["spo2"],
         "SpO2",
     ),
     MetricDefinition(
         "sleep_respiratory_rate",
         "breaths/min",
         "daily_value",
-        ("respiratory-rate-sleep-summary",),
+        METRIC_SOURCE_DATA_TYPES["sleep_respiratory_rate"],
         "睡眠時呼吸数",
         "OBSERVATION_COUNT",
     ),
-    MetricDefinition("heart_rate", "bpm", "daily_mean", ("heart-rate",), "平均心拍数"),
-    MetricDefinition("steps", "count", "daily_sum", ("steps",), "歩数"),
-    MetricDefinition("distance", "m", "daily_sum", ("distance",), "距離"),
+    MetricDefinition(
+        "heart_rate",
+        "bpm",
+        "daily_mean",
+        METRIC_SOURCE_DATA_TYPES["heart_rate"],
+        "平均心拍数",
+    ),
+    MetricDefinition(
+        "steps",
+        "count",
+        "daily_sum",
+        METRIC_SOURCE_DATA_TYPES["steps"],
+        "歩数",
+    ),
+    MetricDefinition(
+        "distance",
+        "m",
+        "daily_sum",
+        METRIC_SOURCE_DATA_TYPES["distance"],
+        "距離",
+    ),
     MetricDefinition(
         "active_zone_minutes",
         "min",
         "daily_sum",
-        ("active-zone-minutes",),
+        METRIC_SOURCE_DATA_TYPES["active_zone_minutes"],
         "Active Zone Minutes",
     ),
-    MetricDefinition("exercise_minutes", "min", "daily_sum", ("exercise",), "運動時間"),
+    MetricDefinition(
+        "exercise_minutes",
+        "min",
+        "daily_sum",
+        METRIC_SOURCE_DATA_TYPES["exercise_minutes"],
+        "運動時間",
+    ),
 )
 
 METRICS_BY_NAME: Final = {definition.name: definition for definition in METRIC_DEFINITIONS}
-METRICS_BY_DATA_TYPE: Final = {
-    data_type: frozenset(
-        definition.name
-        for definition in METRIC_DEFINITIONS
-        if data_type in definition.source_data_types
-    )
-    for data_type in {
-        data_type for definition in METRIC_DEFINITIONS for data_type in definition.source_data_types
-    }
-}
+METRICS_BY_DATA_TYPE: Final = _CATALOG_METRICS_BY_DATA_TYPE
 
 
 def metric_definition(metric_name: str) -> MetricDefinition:

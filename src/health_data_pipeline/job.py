@@ -9,16 +9,23 @@ import json
 import os
 import re
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, cast
 
 from google.api_core.exceptions import AlreadyExists
 from google.cloud import tasks_v2
 
+from health_data_pipeline.application.sync import contracts as sync_contracts
 from health_data_pipeline.config import AppConfig
 
 CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+
+# Compatibility exports for existing job-module callers.
+SyncOutcome = sync_contracts.SyncOutcome
+SyncPipeline = sync_contracts.SyncPipeline
+SyncTaskDispatcher = sync_contracts.SyncTaskDispatcher
+TaskEnqueueResult = sync_contracts.TaskEnqueueResult
+ViewTaskDispatcher = sync_contracts.ViewTaskDispatcher
 
 
 class TaskCreationError(RuntimeError):
@@ -27,12 +34,6 @@ class TaskCreationError(RuntimeError):
 
 class CloudTasksClient(Protocol):
     def create_task(self, *, request: Mapping[str, Any]) -> Any: ...
-
-
-@dataclass(frozen=True, slots=True)
-class TaskEnqueueResult:
-    task_name: str
-    created: bool
 
 
 def _safe_task_component(value: str) -> str:
@@ -144,36 +145,6 @@ class CloudTaskDispatcher:
                 },
             },
         )
-
-
-@dataclass(frozen=True, slots=True)
-class SyncOutcome:
-    committed: bool
-    generation: int | None
-    owner_hmac: str
-
-
-class SyncPipeline(Protocol):
-    def run(self) -> SyncOutcome: ...
-
-
-class ViewTaskDispatcher(Protocol):
-    def enqueue_view_update(
-        self,
-        *,
-        owner_hmac: str,
-        generation: int,
-        requested_at: datetime,
-    ) -> TaskEnqueueResult: ...
-
-
-class SyncTaskDispatcher(Protocol):
-    def enqueue_sync_job(
-        self,
-        *,
-        owner_hmac: str,
-        ready_at: datetime,
-    ) -> TaskEnqueueResult: ...
 
 
 class JobRunner:

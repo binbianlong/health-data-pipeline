@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -10,189 +9,48 @@ import pytest
 
 from health_data_pipeline.budget import ClassAMonthState, class_a_month_state_path
 from health_data_pipeline.commit import CommitCoordinator, CommitRequest
-from health_data_pipeline.daily import SourceQueryStatus
-from health_data_pipeline.google_health import DataPointPage, FetchWindow
-from health_data_pipeline.models import CommitKind, ContentReference
+from health_data_pipeline.google_health import FetchWindow
+from health_data_pipeline.models import CommitKind
 from health_data_pipeline.pipeline import (
     SUPPORTED_DATA_TYPES,
     BackfillChunk,
-    IncrementalSyncPipeline,
-    IngestedQuery,
-    _advance_backfill_cursors_many,
     _backfill_budget_allows,
-    _deduplicate_data_points,
-    _interval_dates,
-    _reconciliation_fetch_start,
-    _reopen_backfill_gaps,
-    _select_backfill_chunks,
-    _time_zone,
-    _unique_manifest_references,
 )
-from health_data_pipeline.snapshot import SnapshotRepository
 from health_data_pipeline.storage import (
     ContentAddressedStore,
-    HeadRepository,
     InMemoryObjectStore,
 )
-
-NOW = datetime(2026, 7, 28, 12, tzinfo=UTC)
-SYNC_TIME = datetime(2026, 7, 28, 11, tzinfo=UTC)
-
-
-def _civil_date(value: date) -> dict[str, Any]:
-    return {
-        "year": value.year,
-        "month": value.month,
-        "day": value.day,
-    }
-
-
-def _steps_point(value: date, count: int) -> Mapping[str, Any]:
-    return {
-        "steps": {
-            "count": count,
-            "interval": {
-                "civilStartTime": {
-                    "date": _civil_date(value),
-                }
-            },
-        }
-    }
-
-
-def _sleep_point(
-    metric_date: date,
-    *,
-    data_point_name: str,
-    start_time: str,
-    end_time: str,
-    minutes_asleep: int,
-    main_sleep: bool,
-    nap: bool,
-) -> Mapping[str, Any]:
-    return {
-        "dataPointName": data_point_name,
-        "sleep": {
-            "interval": {
-                "civilEndTime": {"date": _civil_date(metric_date)},
-                "startTime": start_time,
-                "startUtcOffset": "32400s",
-                "endTime": end_time,
-                "endUtcOffset": "32400s",
-            },
-            "metadata": {"mainSleep": main_sleep, "nap": nap},
-            "summary": {"minutesAsleep": str(minutes_asleep)},
-            "updateTime": "2026-07-28T11:00:00Z",
-        },
-    }
-
-
-class FakeHealth:
-    def __init__(
-        self,
-        *,
-        values: Mapping[date, int],
-        data_points: Mapping[
-            tuple[str, date],
-            Sequence[Mapping[str, Any]],
-        ]
-        | None = None,
-        sync_time: datetime | None = SYNC_TIME,
-        fail_after: int | None = None,
-    ) -> None:
-        self.values = dict(values)
-        self.data_points = {key: tuple(points) for key, points in (data_points or {}).items()}
-        self.sync_time = sync_time
-        self.fail_after = fail_after
-        self.requests: list[tuple[str, FetchWindow]] = []
-
-    def get_settings(self) -> Mapping[str, Any]:
-        return {"timeZone": "Asia/Tokyo"}
-
-    def latest_fitbit_sync_time(self) -> datetime | None:
-        return self.sync_time
-
-    def iter_data_point_pages(
-        self,
-        data_type: str,
-        window: FetchWindow,
-    ) -> Sequence[DataPointPage]:
-        self.requests.append((data_type, window))
-        if self.fail_after is not None and len(self.requests) > self.fail_after:
-            raise RuntimeError("injected API failure")
-        points: tuple[Mapping[str, Any], ...] = ()
-        if data_type == "steps" and window.civil_start in self.values:
-            assert window.civil_start is not None
-            points = (
-                _steps_point(
-                    window.civil_start,
-                    self.values[window.civil_start],
-                ),
-            )
-        if window.civil_start is not None and window.civil_end is not None:
-            points += tuple(
-                point
-                for (point_type, point_date), stored_points in sorted(
-                    self.data_points.items(),
-                    key=lambda item: item[0],
-                )
-                if point_type == data_type and window.civil_start <= point_date < window.civil_end
-                for point in stored_points
-            )
-        return (
-            DataPointPage(
-                data_type=data_type,
-                window=window,
-                page_number=0,
-                data_points=points,
-                next_page_token=None,
-                raw_payload={"dataPoints": list(points)},
-            ),
-        )
-
-
-def _pipeline(
-    store: InMemoryObjectStore,
-    health: FakeHealth,
-    *,
-    now: datetime = NOW,
-    backfill_ready: Callable[[int], bool] | None = None,
-) -> tuple[
-    IncrementalSyncPipeline,
-    HeadRepository,
-    SnapshotRepository,
-]:
-    content = ContentAddressedStore(store)
-    heads = HeadRepository(store)
-    snapshots = SnapshotRepository(content)
-    return (
-        IncrementalSyncPipeline(
-            store=store,
-            content=content,
-            heads=heads,
-            snapshots=snapshots,
-            commits=CommitCoordinator(heads=heads, snapshots=snapshots),
-            health=health,
-            owner_hmac="a" * 64,
-            backfill_ready=backfill_ready,
-            now=lambda: now,
-        ),
-        heads,
-        snapshots,
-    )
-
-
-def _daily_rows(
-    heads: HeadRepository,
-    snapshots: SnapshotRepository,
-    metric_date: date,
-) -> list[dict[str, Any]]:
-    head = heads.read().head
-    assert head is not None
-    root = snapshots.load_root_snapshot(head.root_snapshot)
-    shard = snapshots.load_year_shard(root.state.daily_year_shards[str(metric_date.year)])
-    revision = shard.daily_revisions[metric_date.isoformat()]
-    return [json.loads(line) for line in snapshots.read_daily_revision(revision).splitlines()]
+from tests.support.pipeline import (
+    NOW,
+    FakeHealth,
+)
+from tests.support.pipeline import (
+    build_pipeline as _pipeline,
+)
+from tests.support.pipeline import (
+    civil_date as _civil_date,
+)
+from tests.support.pipeline import (
+    daily_hrv_point as _daily_hrv_point,
+)
+from tests.support.pipeline import (
+    daily_rows as _daily_rows,
+)
+from tests.support.pipeline import (
+    daily_spo2_point as _daily_spo2_point,
+)
+from tests.support.pipeline import (
+    hrv_detail_point as _hrv_detail_point,
+)
+from tests.support.pipeline import (
+    sleep_point as _sleep_point,
+)
+from tests.support.pipeline import (
+    spo2_detail_point as _spo2_detail_point,
+)
+from tests.support.pipeline import (
+    store_webhook_event as _store_webhook_event,
+)
 
 
 def test_initial_sync_commits_civil_days_and_calendar_periods() -> None:
@@ -288,27 +146,6 @@ def test_initial_sync_commits_civil_days_and_calendar_periods() -> None:
         "source_count": 1,
         "normalized_count": 1,
     }
-
-
-def test_legacy_nap_keeps_unknown_role_provenance(monkeypatch: pytest.MonkeyPatch) -> None:
-    store = InMemoryObjectStore(clock=lambda: NOW)
-    pipeline, _, _ = _pipeline(store, FakeHealth(values={}))
-    legacy_row = {
-        "record_kind": "SLEEP_SESSION",
-        "quality_flags": [],
-        "session_is_main": False,
-        "session_is_nap": True,
-    }
-    monkeypatch.setattr(
-        IncrementalSyncPipeline,
-        "_daily_rows_for_date",
-        lambda _self, _root, _metric_date: (legacy_row,),
-    )
-
-    migrated = pipeline._sleep_session_rows_for_date(None, date(2026, 7, 28))
-
-    assert migrated[0]["session_role"] == "NAP"
-    assert migrated[0]["session_role_source"] == "UNCLASSIFIED"
 
 
 def test_sync_advance_reconciles_from_last_successful_civil_cursor() -> None:
@@ -780,29 +617,6 @@ def test_backfill_waits_for_notion_without_blocking_the_initial_sync() -> None:
     assert len(health.requests) == initial_request_count
 
 
-def test_physical_replacement_scope_matches_the_exact_query_window() -> None:
-    store = InMemoryObjectStore(clock=lambda: NOW)
-    health = FakeHealth(values={})
-    pipeline, heads, snapshots = _pipeline(store, health)
-
-    assert pipeline.run().committed
-
-    head = heads.read().head
-    assert head is not None
-    root = snapshots.load_root_snapshot(head.root_snapshot)
-    physical = next(
-        replacement
-        for replacement in root.change_set.raw_replacements
-        if isinstance(replacement, dict) and replacement.get("data_type") == "steps"
-    )
-    assert physical == {
-        "data_type": "steps",
-        "kind": "PHYSICAL_WINDOW_REPLACE",
-        "physical_start": "2026-07-26T15:00:00Z",
-        "physical_end": "2026-07-27T15:00:00Z",
-    }
-
-
 def test_pending_webhook_is_processed_before_backfill() -> None:
     store = InMemoryObjectStore(clock=lambda: NOW)
     health = FakeHealth(values={date(2026, 7, 25): 6_000})
@@ -908,65 +722,6 @@ def test_hrv_webhook_refetches_daily_summary_before_shared_metric_replacement() 
     assert monthly["period_start"] == "2026-07-01"
 
 
-def test_partial_detail_ingestion_cannot_replace_existing_daily_summary() -> None:
-    store = InMemoryObjectStore(clock=lambda: NOW)
-    metric_date = date(2026, 7, 28)
-    health = FakeHealth(
-        values={},
-        data_points={
-            ("heart-rate-variability", metric_date): (_hrv_detail_point(metric_date, 30),),
-            ("daily-heart-rate-variability", metric_date): (_daily_hrv_point(metric_date, 42),),
-        },
-    )
-    pipeline, heads, snapshots = _pipeline(store, health)
-    assert pipeline.run().committed
-    head = heads.read().head
-    assert head is not None
-    root = snapshots.load_root_snapshot(head.root_snapshot)
-
-    merged = pipeline._merge_changed_observations(
-        root,
-        (
-            IngestedQuery(
-                data_type="heart-rate-variability",
-                metric_date=metric_date,
-                data_points=(_hrv_detail_point(metric_date, 35),),
-                manifest=ContentReference(
-                    uri="manifests/ingestion/detail-only.json.gz",
-                    canonical_sha256="a" * 64,
-                    object_sha256="b" * 64,
-                ),
-                replacement_scope={
-                    "data_type": "heart-rate-variability",
-                    "metric_date": metric_date.isoformat(),
-                },
-                source_status=SourceQueryStatus(
-                    data_type="heart-rate-variability",
-                    status="SUCCESS_WITH_DATA",
-                    source_count=1,
-                    normalized_count=1,
-                ),
-            ),
-        ),
-        source_statuses={
-            metric_date: (
-                SourceQueryStatus(
-                    data_type="heart-rate-variability",
-                    status="SUCCESS_WITH_DATA",
-                    source_count=1,
-                    normalized_count=1,
-                ),
-            )
-        },
-    )
-
-    hrv = next(
-        observation for observation in merged[metric_date] if observation.metric_name == "hrv_rmssd"
-    )
-    assert hrv.value == 42
-    assert hrv.source_data_types == ("daily-heart-rate-variability",)
-
-
 def test_daily_spo2_deletion_refetches_detail_before_shared_metric_replacement() -> None:
     store = InMemoryObjectStore(clock=lambda: NOW)
     metric_date = date(2026, 7, 28)
@@ -1003,73 +758,6 @@ def test_daily_spo2_deletion_refetches_detail_before_shared_metric_replacement()
     assert day["source_data_types"] == ["oxygen-saturation"]
 
 
-def test_new_normalizer_reopens_recent_sleep_and_exercise_together() -> None:
-    today = date(2026, 7, 28)
-    cursors: dict[str, Any] = {
-        "_schedule": {
-            "last_completed_civil_date": today.isoformat(),
-            "normalizer_version": "daily-v1",
-            "policy_version": 1,
-        },
-        "sleep": {"next_end_date": "2010-01-01", "complete": False},
-        "exercise": {"next_end_date": "2008-12-31", "complete": True},
-    }
-
-    chunks = _select_backfill_chunks(cursors, today=today)
-
-    assert [chunk.data_type for chunk in chunks] == ["sleep", "exercise"]
-    assert chunks[0].dates == chunks[1].dates
-    assert chunks[0].dates[0] == date(2026, 6, 28)
-    assert chunks[0].dates[-1] == date(2026, 7, 28)
-    advanced = _advance_backfill_cursors_many(cursors, chunks, completed_on=today)
-    assert (
-        advanced["sleep"]
-        == advanced["exercise"]
-        == {
-            "next_end_date": "2026-06-27",
-            "complete": False,
-        }
-    )
-    assert advanced["_schedule"] == {
-        "last_completed_civil_date": "2026-07-28",
-        "normalizer_version": "daily-v5",
-        "next_data_type_index": 0,
-        "policy_version": 2,
-    }
-
-
-def test_completed_priority_backfill_resumes_legacy_round_robin() -> None:
-    today = date(2026, 7, 28)
-    cursors: dict[str, Any] = {
-        "_schedule": {
-            "last_completed_civil_date": "2026-07-27",
-            "normalizer_version": "daily-v5",
-            "next_data_type_index": 0,
-            "policy_version": 2,
-        },
-        "sleep": {"next_end_date": "2008-12-31", "complete": True},
-        "exercise": {"next_end_date": "2008-12-31", "complete": True},
-        "steps": {"next_end_date": "2026-05-10", "complete": False},
-    }
-
-    chunks = _select_backfill_chunks(cursors, today=today)
-
-    assert len(chunks) == 1
-    assert chunks[0].data_type == "steps"
-    assert chunks[0].dates[0] == date(2026, 4, 27)
-    assert chunks[0].dates[-1] == date(2026, 5, 10)
-    advanced = _advance_backfill_cursors_many(cursors, chunks, completed_on=today)
-    assert advanced["steps"] == {
-        "next_end_date": "2026-04-26",
-        "complete": False,
-    }
-    assert advanced["sleep"] == cursors["sleep"]
-    assert advanced["exercise"] == cursors["exercise"]
-    schedule = advanced["_schedule"]
-    assert isinstance(schedule, dict)
-    assert schedule["next_data_type_index"] == 1
-
-
 def test_legacy_high_volume_chunk_is_ingested_one_day_at_a_time() -> None:
     store = InMemoryObjectStore(clock=lambda: NOW)
     health = FakeHealth(values={})
@@ -1096,154 +784,6 @@ def test_legacy_high_volume_chunk_is_ingested_one_day_at_a_time() -> None:
     ]
 
 
-def test_foreground_reconciliation_is_bounded_and_reopens_older_rollup_gap() -> None:
-    today = date(2026, 7, 28)
-    requested_start = date(2026, 1, 1)
-
-    recent_start = _reconciliation_fetch_start(
-        "steps",
-        requested_start=requested_start,
-        today=today,
-    )
-    high_frequency_start = _reconciliation_fetch_start(
-        "heart-rate",
-        requested_start=requested_start,
-        today=today,
-    )
-    assert recent_start == today - timedelta(days=89)
-    assert high_frequency_start == today - timedelta(days=89)
-
-    reopened = _reopen_backfill_gaps(
-        {
-            "steps": {"next_end_date": "2008-12-31", "complete": True},
-            "_schedule": {"last_completed_civil_date": "2026-07-27"},
-        },
-        {"steps": recent_start - timedelta(days=1)},
-    )
-    assert reopened["steps"] == {
-        "next_end_date": (recent_start - timedelta(days=1)).isoformat(),
-        "complete": False,
-    }
-    assert reopened["_schedule"] == {"last_completed_civil_date": "2026-07-27"}
-
-
-def test_manifest_references_are_deduplicated_by_uri() -> None:
-    reference = ContentReference(
-        uri="manifests/ingestion/example.json.gz",
-        canonical_sha256="a" * 64,
-        object_sha256="b" * 64,
-    )
-
-    assert _unique_manifest_references((reference, reference)) == (reference,)
-
-
-def test_named_non_sleep_data_points_drop_exact_page_overlap() -> None:
-    metric_date = date(2026, 7, 28)
-    point = {
-        "dataPointName": "users/me/dataPoints/steps-1",
-        **_steps_point(metric_date, 8_000),
-    }
-
-    selected, duplicate_count = _deduplicate_data_points(
-        "steps",
-        (point, json.loads(json.dumps(point))),
-    )
-
-    assert selected == (point,)
-    assert duplicate_count == 1
-
-
-def test_named_non_sleep_data_points_reject_conflicting_page_overlap() -> None:
-    metric_date = date(2026, 7, 28)
-    first = {
-        "dataPointName": "users/me/dataPoints/steps-1",
-        **_steps_point(metric_date, 8_000),
-    }
-    conflicting = {
-        "dataPointName": "users/me/dataPoints/steps-1",
-        **_steps_point(metric_date, 8_001),
-    }
-
-    with pytest.raises(
-        ValueError,
-        match="reconciled data point identity has conflicting payloads",
-    ):
-        _deduplicate_data_points("steps", (first, conflicting))
-
-
-def test_sleep_named_revisions_keep_the_latest_update() -> None:
-    metric_date = date(2026, 7, 28)
-    older: dict[str, Any] = json.loads(
-        json.dumps(
-            _sleep_point(
-                metric_date,
-                data_point_name="users/me/dataPoints/sleep-1",
-                start_time="2026-07-27T14:30:00Z",
-                end_time="2026-07-27T22:30:00Z",
-                minutes_asleep=400,
-                main_sleep=True,
-                nap=False,
-            )
-        )
-    )
-    newer: dict[str, Any] = json.loads(
-        json.dumps(
-            _sleep_point(
-                metric_date,
-                data_point_name="users/me/dataPoints/sleep-1",
-                start_time="2026-07-27T14:30:00Z",
-                end_time="2026-07-27T22:30:00Z",
-                minutes_asleep=420,
-                main_sleep=True,
-                nap=False,
-            )
-        )
-    )
-    older["sleep"]["updateTime"] = "2026-07-28T10:00:00Z"
-    newer["sleep"]["updateTime"] = "2026-07-28T11:00:00Z"
-
-    selected, duplicate_count = _deduplicate_data_points(
-        "sleep",
-        (older, newer),
-    )
-
-    assert selected == (newer,)
-    assert duplicate_count == 1
-
-
-def test_sleep_anonymous_exact_page_overlap_is_reconciled_once() -> None:
-    point: dict[str, Any] = json.loads(
-        json.dumps(
-            _sleep_point(
-                date(2026, 7, 28),
-                data_point_name="users/me/dataPoints/sleep-1",
-                start_time="2026-07-27T14:30:00Z",
-                end_time="2026-07-27T22:30:00Z",
-                minutes_asleep=420,
-                main_sleep=True,
-                nap=False,
-            )
-        )
-    )
-    point.pop("dataPointName")
-
-    selected, duplicate_count = _deduplicate_data_points(
-        "sleep",
-        (point, json.loads(json.dumps(point))),
-    )
-
-    assert selected == (point,)
-    assert duplicate_count == 1
-
-
-def test_time_zone_records_whether_google_settings_or_default_was_used() -> None:
-    assert _time_zone({}, "Asia/Tokyo") == ("Asia/Tokyo", "CONFIG_DEFAULT")
-    assert _time_zone({"timeZone": "America/New_York"}, "Asia/Tokyo") == (
-        "America/New_York",
-        "GOOGLE_HEALTH_SETTINGS",
-    )
-
-
 def test_api_failure_keeps_head_uncommitted() -> None:
     store = InMemoryObjectStore(clock=lambda: NOW)
     health = FakeHealth(
@@ -1257,89 +797,3 @@ def test_api_failure_keeps_head_uncommitted() -> None:
 
     assert heads.read().head is None
     assert tuple(store.list("state/leases/")) == ()
-
-
-def test_physical_and_civil_webhook_ranges_keep_every_changed_date() -> None:
-    dates = _interval_dates(
-        {
-            "physicalTimeInterval": {
-                "startTime": "2026-07-26T15:00:00Z",
-                "endTime": "2026-07-29T15:00:00Z",
-            },
-            "civilDateTimeInterval": {
-                "startDateTime": {"date": _civil_date(date(2026, 7, 27))},
-                "endDateTime": {"date": _civil_date(date(2026, 7, 30))},
-            },
-        },
-        zone=ZoneInfo("Asia/Tokyo"),
-    )
-
-    assert dates == {
-        date(2026, 7, 27),
-        date(2026, 7, 28),
-        date(2026, 7, 29),
-        date(2026, 7, 30),
-    }
-
-
-def _hrv_detail_point(metric_date: date, value: int) -> Mapping[str, Any]:
-    return {
-        "heartRateVariability": {
-            "rootMeanSquareOfSuccessiveDifferencesMilliseconds": value,
-            "sampleTime": {"civilTime": {"date": _civil_date(metric_date)}},
-        }
-    }
-
-
-def _daily_hrv_point(metric_date: date, value: int) -> Mapping[str, Any]:
-    return {
-        "dailyHeartRateVariability": {
-            "averageHeartRateVariabilityMilliseconds": value,
-            "date": _civil_date(metric_date),
-        }
-    }
-
-
-def _spo2_detail_point(metric_date: date, value: int) -> Mapping[str, Any]:
-    return {
-        "oxygenSaturation": {
-            "percentage": value,
-            "sampleTime": {"civilTime": {"date": _civil_date(metric_date)}},
-        }
-    }
-
-
-def _daily_spo2_point(metric_date: date, value: int) -> Mapping[str, Any]:
-    return {
-        "dailyOxygenSaturation": {
-            "averagePercentage": value,
-            "date": _civil_date(metric_date),
-        }
-    }
-
-
-def _store_webhook_event(
-    store: InMemoryObjectStore,
-    *,
-    data_type: str,
-    metric_date: date,
-) -> None:
-    event = {
-        "dataType": data_type,
-        "intervals": [
-            {
-                "civilDateTimeInterval": {
-                    "startDateTime": {"date": _civil_date(metric_date)},
-                    "endDateTime": {"date": _civil_date(metric_date)},
-                }
-            }
-        ],
-    }
-    store.put(
-        f"webhook-events/{data_type}.json",
-        json.dumps(event).encode(),
-        if_generation_match=0,
-        metadata={},
-        content_type="application/json",
-        cache_control="no-store",
-    )

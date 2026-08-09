@@ -20,7 +20,12 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Protocol, cast
 
+from health_data_pipeline.data_types import DataTypeSpec as _DataTypeSpec
+from health_data_pipeline.data_types import data_type_spec as _catalog_data_type_spec
+
 HEALTH_DATA_SOURCE_FAMILY = "google-wearables"
+DataTypeSpec = _DataTypeSpec
+data_type_spec = _catalog_data_type_spec
 
 
 class GoogleHealthError(RuntimeError):
@@ -68,68 +73,6 @@ class HttpTransport(Protocol):
 
 class AccessTokenProvider(Protocol):
     def __call__(self) -> str: ...
-
-
-@dataclass(frozen=True, slots=True)
-class DataTypeSpec:
-    name: str
-    max_window: timedelta
-    page_size: int
-    record_kind: str
-    filter_field: str
-
-
-_SHORT_WINDOW_TYPES = frozenset(
-    {
-        "active-minutes",
-        "calories-in-heart-rate-zone",
-        "heart-rate",
-        "total-calories",
-    }
-)
-_SMALL_PAGE_TYPES = frozenset({"sleep", "exercise"})
-_DAILY_TYPES = frozenset(
-    {
-        "daily-resting-heart-rate",
-        "daily-heart-rate-variability",
-        "daily-oxygen-saturation",
-    }
-)
-_SAMPLE_TYPES = frozenset(
-    {
-        "heart-rate",
-        "heart-rate-variability",
-        "oxygen-saturation",
-        "respiratory-rate-sleep-summary",
-    }
-)
-
-
-def data_type_spec(data_type: str) -> DataTypeSpec:
-    """Return conservative API limits for a Google Health data type."""
-
-    if data_type in _DAILY_TYPES:
-        record_kind = "daily"
-        filter_field = f"{data_type.replace('-', '_')}.date"
-    elif data_type in _SAMPLE_TYPES:
-        record_kind = "sample"
-        filter_field = f"{data_type.replace('-', '_')}.sample_time.physical_time"
-    elif data_type == "sleep":
-        record_kind = "session"
-        filter_field = "sleep.interval.civil_end_time"
-    elif data_type == "exercise":
-        record_kind = "session"
-        filter_field = "exercise.interval.civil_start_time"
-    else:
-        record_kind = "interval"
-        filter_field = f"{data_type.replace('-', '_')}.interval.start_time"
-    return DataTypeSpec(
-        name=data_type,
-        max_window=timedelta(days=14 if data_type in _SHORT_WINDOW_TYPES else 90),
-        page_size=25 if data_type in _SMALL_PAGE_TYPES else 10_000,
-        record_kind=record_kind,
-        filter_field=filter_field,
-    )
 
 
 @dataclass(frozen=True, slots=True)

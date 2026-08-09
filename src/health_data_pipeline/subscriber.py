@@ -10,24 +10,16 @@ import google.auth
 import httpx
 from google.auth.transport.requests import Request as GoogleAuthRequest
 
+from health_data_pipeline.data_types import (
+    WEBHOOK_SUPPORTED_DATA_TYPES as _CATALOG_WEBHOOK_SUPPORTED_DATA_TYPES,
+)
+
 CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 HTTP_SUCCESS_MIN = 200
 HTTP_SUCCESS_MAX_EXCLUSIVE = 300
 ACTIVATION_ATTEMPTS = 6
 ACTIVATION_DELAY_SECONDS = 1.0
-WEBHOOK_SUPPORTED_DATA_TYPES = (
-    "steps",
-    "distance",
-    "active-zone-minutes",
-    "heart-rate",
-    "daily-resting-heart-rate",
-    "heart-rate-variability",
-    "daily-heart-rate-variability",
-    "daily-oxygen-saturation",
-    "sleep",
-    "respiratory-rate-sleep-summary",
-    "exercise",
-)
+WEBHOOK_SUPPORTED_DATA_TYPES = _CATALOG_WEBHOOK_SUPPORTED_DATA_TYPES
 
 
 class SubscriberProvisioningError(RuntimeError):
