@@ -381,6 +381,30 @@ Jobs APIの成功はExecution作成成功であり、HEAD commit成功ではあ�
 実行失敗やCAS競合後もGCSに未処理イベントを残し、次回Taskまたは3時間ごとの回収Jobが
 回収します。
 
+### 障害調査時のmaintenance mode
+
+本番Jobを止める場合は、SchedulerやQueueだけを個別に止めず、GitHub Actionsの
+`SCHEDULER_PAUSED=true`を永続設定としてからdeployします。この設定はSchedulerの
+pause、「Jobの正常完了がない」Alert Policyの無効化、Webhook起動Taskの抑止、既存Taskや
+手動起動からのJob処理skipを同時に適用します。Webhook原本はmaintenance中もGCSへ保存します。
+
+緊急時は先にSchedulerとCloud Tasks Queueをpauseしてよいものの、次のdeployが
+手動pauseを戻さないよう、deploy前に必ず同じGitHub変数も`true`へ変更します。
+停止中に既存Taskが蓄積した場合は、そのままQueueをresumeしません。次の順序で復旧します。
+
+1. SchedulerとQueueがpause済みで、実行中Jobがないことを確認する。
+2. Webhook原本がGCSに残っていることを確認する。Queue内のtargetを確認して古いsync起動
+   Taskだけを削除する。全Taskがsync起動と確認できた場合だけQueueをpurgeし、反映後に空を確認する。
+3. Queueをpauseしたまま、回収Jobを`--update-env-vars=MAINTENANCE_MODE=false --wait`で1回実行する。
+4. ExecutionだけでなくHEAD generationとWebhook cursorの前進を確認する。
+5. `SCHEDULER_PAUSED=false`へ変更し、workflow inputの`allow_scheduler_resume=true`を指定して
+   deployする。Terraform plan JSONのguardが、明示入力なしのScheduler再開を拒否する。
+6. ServiceとJobのmaintenance解除、Scheduler、Alert Policyを確認してからQueueをresumeし、
+   View Taskと残りのsync Taskを処理する。最後にHEAD、未処理event、Notion generationを再確認する。
+
+Queue purgeは全Taskを削除するため、View Taskが混在する場合には使いません。削除済みの明示
+Task名はすぐ再利用できないことがあるため、enqueue結果だけでなくTask実在とHEADを確認します。
+
 ## データと安全性
 
 - `state/data-head.json`のGCS generation付きCAS更新だけがcommit pointです。

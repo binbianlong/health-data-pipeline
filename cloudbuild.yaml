@@ -12,6 +12,7 @@ substitutions:
   _GITHUB_REPOSITORY: ""
   _GITHUB_REPOSITORY_ID: ""
   _SCHEDULER_PAUSED: "true"
+  _ALLOW_SCHEDULER_RESUME: "false"
   _DEPLOY: "false"
 
 steps:
@@ -63,7 +64,7 @@ steps:
     waitFor:
       - trivy-runtime-image
 
-  - id: terraform-plan-and-apply
+  - id: terraform-plan
     name: hashicorp/terraform:1.12.2
     entrypoint: sh
     env:
@@ -95,13 +96,38 @@ steps:
           -var="github_repository_id=${_GITHUB_REPOSITORY_ID}" \
           -var="scheduler_paused=${_SCHEDULER_PAUSED}"
 
+        terraform show -json /workspace/health-data-pipeline.tfplan \
+          > /workspace/health-data-pipeline.tfplan.json
+    waitFor:
+      - push-runtime-image
+
+  - id: scheduler-resume-guard
+    name: python:3.13-slim@sha256:6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91
+    entrypoint: python
+    args:
+      - scripts/check_scheduler_resume.py
+      - /workspace/health-data-pipeline.tfplan.json
+      - ${_SCHEDULER_PAUSED}
+      - ${_ALLOW_SCHEDULER_RESUME}
+    waitFor:
+      - terraform-plan
+
+  - id: terraform-apply
+    name: hashicorp/terraform:1.12.2
+    entrypoint: sh
+    env:
+      - TF_IN_AUTOMATION=1
+    args:
+      - -ceu
+      - |
+        cd infra/main
         if [ "${_DEPLOY}" = "true" ]; then
           terraform apply -input=false -auto-approve /workspace/health-data-pipeline.tfplan
         else
           echo "Terraform apply skipped because _DEPLOY=${_DEPLOY}."
         fi
     waitFor:
-      - push-runtime-image
+      - scheduler-resume-guard
 
 images:
   - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_IMAGE}:${BUILD_ID}

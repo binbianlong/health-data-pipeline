@@ -55,6 +55,7 @@ locals {
     PUBLIC_BASE_URL       = local.public_base_url
     NOTION_DATA_SOURCE_ID = var.notion_data_source_id
     OWNER_TIME_ZONE       = "Asia/Tokyo"
+    MAINTENANCE_MODE      = tostring(var.scheduler_paused)
   }
 
   secret_environment = {

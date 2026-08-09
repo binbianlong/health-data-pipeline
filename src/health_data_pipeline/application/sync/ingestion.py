@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
@@ -76,6 +76,7 @@ class SourceIngestor:
         *,
         zone: ZoneInfo,
         expected_generation: int,
+        heartbeat: Callable[[], None] | None = None,
     ) -> tuple[IngestedQuery, ...]:
         ordered_dates = tuple(sorted(set(dates)))
         if not ordered_dates:
@@ -90,18 +91,21 @@ class SourceIngestor:
         end = datetime.combine(civil_end, time.min, tzinfo=zone).astimezone(UTC)
         if end - start > spec.max_window:
             raise ValueError("ingestion interval exceeds the data type API window")
-        pages = tuple(
-            self._health.iter_data_point_pages(
-                data_type,
-                FetchWindow(
-                    start=start,
-                    end=end,
-                    civil_start=first_date,
-                    civil_end=civil_end,
-                ),
-            )
-        )
-        raw_references = tuple(self._publish_api_page(page) for page in pages)
+        pages: list[DataPointPage] = []
+        raw_references: list[ContentReference] = []
+        for page in self._health.iter_data_point_pages(
+            data_type,
+            FetchWindow(
+                start=start,
+                end=end,
+                civil_start=first_date,
+                civil_end=civil_end,
+            ),
+        ):
+            pages.append(page)
+            raw_references.append(self._publish_api_page(page))
+            if heartbeat is not None:
+                heartbeat()
         source_points = tuple(point for page in pages for point in page.data_points)
         points, duplicate_source_count = deduplicate_data_points(data_type, source_points)
         sleep_resolution = resolve_sleep_data(points) if data_type == "sleep" else None
@@ -146,7 +150,7 @@ class SourceIngestor:
             },
             "replacement_scope": replacement_scope,
             "page_count": len(pages),
-            "api_pages": list(raw_references),
+            "api_pages": raw_references,
             "flattened_source": flattened_reference,
             "source_stream_row_count": len(source_points),
             "flattened_source_row_count": len(points),
@@ -238,33 +242,72 @@ def deduplicate_data_points(
     data_type: str,
     points: Sequence[Mapping[str, Any]],
 ) -> tuple[tuple[Mapping[str, Any], ...], int]:
-    """Remove exact named duplicates and fail on ambiguous pagination overlap."""
+    """Deduplicate source rows without inventing a sample revision order.
+
+    Reconciled sample data can legitimately reuse ``dataPointName`` for
+    distinct observations.  Rows at different sample times are therefore
+    retained, while a named sample at the same time with conflicting payloads
+    remains fail-closed.  Other record kinds retain their strict identity
+    checks so ambiguous anonymous rows cannot be silently dropped or
+    double-counted, while sleep uses its explicit update timestamp to resolve
+    revisions.
+    """
 
     if data_type == "sleep":
         reconciled = reconcile_sleep_points(points)
         return reconciled, len(points) - len(reconciled)
-    by_name: dict[str, bytes] = {}
+    sample_kind = data_type_spec(data_type).record_kind == "sample"
+    sample_signatures: set[bytes] = set()
+    sample_identity_signatures: dict[tuple[str, bytes], bytes] = {}
+    named_signatures: dict[str, bytes] = {}
     anonymous_signatures: set[bytes] = set()
     selected: list[Mapping[str, Any]] = []
     duplicate_count = 0
     for point in points:
         signature = canonical_json_bytes(_canonical_safe(point))
         raw_name = point.get("dataPointName")
-        if isinstance(raw_name, str) and raw_name:
-            previous = by_name.get(raw_name)
-            if previous is None:
-                by_name[raw_name] = signature
-                selected.append(point)
+        if sample_kind:
+            if signature in sample_signatures:
+                duplicate_count += 1
                 continue
-            if previous != signature:
+            sample_signatures.add(signature)
+            sample_name = raw_name if isinstance(raw_name, str) and raw_name else ""
+            identity = (sample_name, _sample_time_signature(point))
+            previous = sample_identity_signatures.get(identity)
+            if previous is not None:
+                raise ValueError("reconciled sample identity has conflicting payloads")
+            sample_identity_signatures[identity] = signature
+        elif isinstance(raw_name, str) and raw_name:
+            previous = named_signatures.get(raw_name)
+            if previous is not None:
+                if previous == signature:
+                    duplicate_count += 1
+                    continue
                 raise ValueError("reconciled data point identity has conflicting payloads")
-            duplicate_count += 1
-            continue
-        if signature in anonymous_signatures:
-            raise ValueError("anonymous reconciled data point is duplicated across API pages")
-        anonymous_signatures.add(signature)
+            named_signatures[raw_name] = signature
+        elif signature in anonymous_signatures:
+            raise ValueError("anonymous reconciled data point has an ambiguous duplicate")
+        else:
+            anonymous_signatures.add(signature)
         selected.append(point)
     return tuple(selected), duplicate_count
+
+
+def _sample_time_signature(point: Mapping[str, Any]) -> bytes:
+    sample_times = [
+        payload["sampleTime"]
+        for key, payload in point.items()
+        if key != "dataPointName"
+        and isinstance(payload, Mapping)
+        and isinstance(payload.get("sampleTime"), Mapping)
+    ]
+    if len(sample_times) != 1:
+        raise ValueError("reconciled sample must contain exactly one sampleTime")
+    sample_time = sample_times[0]
+    physical_time = sample_time.get("physicalTime")
+    if isinstance(physical_time, str) and physical_time:
+        return canonical_json_bytes(physical_time)
+    return canonical_json_bytes(_canonical_safe(sample_time))
 
 
 def partition_ingested_points(

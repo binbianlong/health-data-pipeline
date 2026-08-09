@@ -7,7 +7,7 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any
 
-from health_data_pipeline.application.sync.ingestion import SourceIngestor
+from health_data_pipeline.application.sync.ingestion import HealthPageSource, SourceIngestor
 from health_data_pipeline.application.sync.projection import DailyProjector
 from health_data_pipeline.commit import CommitCoordinator
 from health_data_pipeline.google_health import DataPointPage, FetchWindow
@@ -25,6 +25,13 @@ NOW = datetime(2026, 7, 28, 12, tzinfo=UTC)
 SYNC_TIME = datetime(2026, 7, 28, 11, tzinfo=UTC)
 NORMALIZER_VERSION = "daily-v5"
 DAILY_SCHEMA_VERSION = 3
+
+
+def _constant_clock(value: datetime) -> Callable[[], datetime]:
+    def clock() -> datetime:
+        return value
+
+    return clock
 
 
 def civil_date(value: date) -> dict[str, Any]:
@@ -111,6 +118,27 @@ def daily_spo2_point(metric_date: date, value: int) -> Mapping[str, Any]:
     }
 
 
+def respiratory_rate_point(
+    metric_date: date,
+    *,
+    hour: int,
+    breaths_per_minute: int,
+) -> Mapping[str, Any]:
+    return {
+        "dataPointName": "users/me/dataPoints/respiratory-summary",
+        "respiratoryRateSleepSummary": {
+            "sampleTime": {
+                "physicalTime": f"{metric_date.isoformat()}T{hour:02}:00:00Z",
+                "civilTime": {
+                    "date": civil_date(metric_date),
+                    "time": {"hours": hour},
+                },
+            },
+            "fullSleepStats": {"breathsPerMinute": breaths_per_minute},
+        },
+    }
+
+
 class FakeHealth:
     def __init__(
         self,
@@ -179,7 +207,7 @@ def build_pipeline(
     store: InMemoryObjectStore,
     health: FakeHealth,
     *,
-    now: datetime = NOW,
+    now: datetime | Callable[[], datetime] = NOW,
     backfill_ready: Callable[[int], bool] | None = None,
 ) -> tuple[
     IncrementalSyncPipeline,
@@ -188,6 +216,7 @@ def build_pipeline(
 ]:
     from health_data_pipeline.pipeline import IncrementalSyncPipeline  # noqa: PLC0415
 
+    now_fn = _constant_clock(now) if isinstance(now, datetime) else now
     content = ContentAddressedStore(store)
     heads = HeadRepository(store)
     snapshots = SnapshotRepository(content)
@@ -201,14 +230,14 @@ def build_pipeline(
             health=health,
             owner_hmac="a" * 64,
             backfill_ready=backfill_ready,
-            now=lambda: now,
+            now=now_fn,
         ),
         heads,
         snapshots,
     )
 
 
-def build_ingestor(store: InMemoryObjectStore, health: FakeHealth) -> SourceIngestor:
+def build_ingestor(store: InMemoryObjectStore, health: HealthPageSource) -> SourceIngestor:
     return SourceIngestor(
         health=health,
         content=ContentAddressedStore(store),

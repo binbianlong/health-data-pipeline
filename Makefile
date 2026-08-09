@@ -29,7 +29,7 @@ lint: ## Run Python lint and formatting checks
 	$(UV) run ruff check .
 
 typecheck: ## Run strict static type checks
-	$(UV) run mypy src tests
+	$(UV) run mypy src scripts tests
 
 test: ## Run tests with coverage
 	$(UV) run pytest

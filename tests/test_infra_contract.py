@@ -143,6 +143,7 @@ def test_deploy_identity_and_scheduler_start_are_fail_closed() -> None:
     )
     workload_identity = (_PROJECT_ROOT / "infra/main/github_wif.tf").read_text(encoding="utf-8")
     scheduler = (_PROJECT_ROOT / "infra/main/scheduler.tf").read_text(encoding="utf-8")
+    local_values = (_PROJECT_ROOT / "infra/main/locals.tf").read_text(encoding="utf-8")
 
     assert '"roles/iam.serviceAccountAdmin"' in service_accounts
     assert '"roles/iam.workloadIdentityPoolAdmin"' in service_accounts
@@ -152,6 +153,17 @@ def test_deploy_identity_and_scheduler_start_are_fail_closed() -> None:
     assert 'schedule         = "0 */3 * * *"' in scheduler
     monitoring = (_PROJECT_ROOT / "infra/main/monitoring.tf").read_text(encoding="utf-8")
     assert "enabled      = !var.scheduler_paused" in monitoring
+    assert "MAINTENANCE_MODE      = tostring(var.scheduler_paused)" in local_values
+    deploy = (_PROJECT_ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")
+    assert "allow_scheduler_resume:" in deploy
+    assert "_ALLOW_SCHEDULER_RESUME=${ALLOW_SCHEDULER_RESUME}" in deploy
+    cloud_build = (_PROJECT_ROOT / "cloudbuild.yaml").read_text(encoding="utf-8")
+    assert "terraform show -json /workspace/health-data-pipeline.tfplan" in cloud_build
+    assert "name: python:3.13-slim@sha256:" in cloud_build
+    assert "scripts/check_scheduler_resume.py" in cloud_build
+    assert "- ${_SCHEDULER_PAUSED}" in cloud_build
+    assert "- ${_ALLOW_SCHEDULER_RESUME}" in cloud_build
+    assert cloud_build.index("scheduler-resume-guard") < cloud_build.index("terraform-apply")
     assert 'duration = "25200s"' in monitoring
     assert 'alignment_period   = "10800s"' in monitoring
 
@@ -256,3 +268,6 @@ def test_job_monitoring_distinguishes_success_and_failure() -> None:
     assert 'metric.label.result = \\"succeeded\\"' in monitoring
     assert 'resource "google_monitoring_alert_policy" "job_failed"' in monitoring
     assert 'metric.label.result = \\"failed\\"' in monitoring
+    assert "One or more scheduled or webhook executions failed in 30 minutes" in monitoring
+    assert "threshold_value = 0" in monitoring
+    assert 'alignment_period   = "1800s"' in monitoring
