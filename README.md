@@ -2,7 +2,7 @@
 
 Fitbit Sense 2のGoogle Health APIデータをGCSへ保存し、日次値・月曜始まりの暦週平均・暦月の月初来平均をNotionへ反映する個人用パイプラインです。GitHubプロフィール向けには前日までの直近7日分の歩数SVGだけを1日1回公開します。
 
-BigQueryは使用しません。HEAD、Root Snapshot、年単位Shard、content-addressedな日次revisionにより、将来BigQueryを追加しても取得・日次計算を作り直さない構造です。詳細設計は[DESIGN.md](DESIGN.md)を参照してください。
+BigQueryは使用しません。HEAD、Root Snapshot、年単位Shard、content-addressedな日次revisionにより、将来BigQueryを追加しても取得・日次計算を作り直さない構造です。データとクラウドの詳細設計は[DESIGN.md](DESIGN.md)、Python実装の責務境界は[docs/CODE_ARCHITECTURE.md](docs/CODE_ARCHITECTURE.md)を参照してください。
 
 Notionには歩数、心拍、HRV、SpO2などに加え、主睡眠だけから計算した睡眠時間、REM睡眠、深い睡眠、浅い睡眠、覚醒時間、運動時間を日次long形式で表示します。主睡眠の就寝・起床時刻と昼寝の各sessionは分けて表示します。各項目にはその日の値、月曜始まりの暦週平均、暦月の月初来平均を含めます。取得できなかった値は0ではなく`欠損`とその理由を明示し、実際に0だった日と区別します。
 
