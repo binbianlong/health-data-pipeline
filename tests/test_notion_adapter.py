@@ -5,11 +5,14 @@ from typing import Any
 
 import pytest
 
-from health_data_pipeline.notion_adapter import (
+from health_data_pipeline.adapters.notion.gateway import (
     MAX_RICH_TEXT_CHARS,
     NotionApiError,
     NotionDataSourceGateway,
     _body_blocks,
+)
+from health_data_pipeline.notion_adapter import (
+    NotionDataSourceGateway as LegacyNotionDataSourceGateway,
 )
 from health_data_pipeline.views import DailyView
 
@@ -86,6 +89,10 @@ def _view() -> DailyView:
         fitbit_last_sync_time=datetime(2026, 7, 28, tzinfo=UTC),
         metrics=(),
     )
+
+
+def test_legacy_module_reexports_gateway() -> None:
+    assert LegacyNotionDataSourceGateway is NotionDataSourceGateway
 
 
 def test_existing_page_commits_properties_after_replacing_body() -> None:
