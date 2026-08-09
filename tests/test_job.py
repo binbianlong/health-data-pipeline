@@ -17,6 +17,7 @@ from health_data_pipeline.job import (
     JobRunner,
     SyncOutcome,
     TaskEnqueueResult,
+    main,
 )
 from health_data_pipeline.oauth import write_state
 from health_data_pipeline.storage import InMemoryObjectStore
@@ -28,6 +29,24 @@ from health_data_pipeline.views import (
 )
 
 NOW = datetime(2026, 7, 28, 12, 7, tzinfo=UTC)
+
+
+def test_job_main_skips_factory_during_maintenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MAINTENANCE_MODE", "true")
+    monkeypatch.setenv("HEALTH_PIPELINE_JOB_FACTORY", "missing.module:factory")
+
+    main()
+
+
+def test_job_main_rejects_invalid_maintenance_setting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MAINTENANCE_MODE", "sometimes")
+
+    with pytest.raises(RuntimeError, match="MAINTENANCE_MODE must be true or false"):
+        main()
 
 
 def _config() -> AppConfig:

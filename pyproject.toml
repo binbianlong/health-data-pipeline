@@ -35,7 +35,7 @@ dev = [
   "hypothesis>=6.136,<7",
   "mypy>=1.17,<2",
   "pip-audit>=2.9,<3",
-  "pytest>=8.4,<9",
+  "pytest>=9.0.3,<10",
   "pytest-asyncio>=1.1,<2",
   "pytest-cov>=6.2,<7",
   "ruff>=0.12,<1",
@@ -50,7 +50,7 @@ default-groups = ["dev"]
 [tool.ruff]
 target-version = "py313"
 line-length = 100
-src = ["src", "tests"]
+src = ["src", "scripts", "tests"]
 
 [tool.ruff.lint]
 select = [

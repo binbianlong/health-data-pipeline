@@ -62,7 +62,7 @@ resource "google_monitoring_alert_policy" "job_failed" {
   combiner     = "OR"
 
   conditions {
-    display_name = "A scheduled or webhook execution failed"
+    display_name = "One or more scheduled or webhook executions failed in 30 minutes"
 
     condition_threshold {
       filter = join(" AND ", [
@@ -77,7 +77,7 @@ resource "google_monitoring_alert_policy" "job_failed" {
       duration        = "0s"
 
       aggregations {
-        alignment_period   = "300s"
+        alignment_period   = "1800s"
         per_series_aligner = "ALIGN_SUM"
       }
     }

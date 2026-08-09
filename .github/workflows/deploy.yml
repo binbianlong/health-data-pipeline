@@ -2,6 +2,12 @@ name: Deploy
 
 on:
   workflow_dispatch:
+    inputs:
+      allow_scheduler_resume:
+        description: Allow this deployment to leave maintenance mode
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -40,6 +46,7 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_REPOSITORY_ID: ${{ vars.REPOSITORY_ID }}
           SCHEDULER_PAUSED: ${{ vars.SCHEDULER_PAUSED }}
+          ALLOW_SCHEDULER_RESUME: ${{ inputs.allow_scheduler_resume }}
         run: |
           gcloud builds submit . \
             --project="${GCP_PROJECT_ID}" \
@@ -47,4 +54,4 @@ jobs:
             --config=cloudbuild.yaml \
             --service-account="projects/${GCP_PROJECT_ID}/serviceAccounts/${CLOUD_BUILD_SERVICE_ACCOUNT}" \
             --gcs-source-staging-dir="gs://${GCP_PROJECT_ID}-cloud-build-source/source" \
-            --substitutions="_REGION=${GCP_REGION},_TF_STATE_BUCKET=${TF_STATE_BUCKET},_HEALTH_BUCKET_NAME=${HEALTH_BUCKET_NAME},_NOTIFICATION_EMAIL=${NOTIFICATION_EMAIL},_NOTION_DATA_SOURCE_ID=${NOTION_DATA_SOURCE_ID},_BILLING_ACCOUNT_ID=${BILLING_ACCOUNT_ID},_BILLING_CURRENCY_CODE=${BILLING_CURRENCY_CODE},_MONTHLY_BUDGET_AMOUNT=${MONTHLY_BUDGET_AMOUNT},_GITHUB_REPOSITORY=${GITHUB_REPOSITORY},_GITHUB_REPOSITORY_ID=${GITHUB_REPOSITORY_ID},_SCHEDULER_PAUSED=${SCHEDULER_PAUSED},_DEPLOY=true"
+            --substitutions="_REGION=${GCP_REGION},_TF_STATE_BUCKET=${TF_STATE_BUCKET},_HEALTH_BUCKET_NAME=${HEALTH_BUCKET_NAME},_NOTIFICATION_EMAIL=${NOTIFICATION_EMAIL},_NOTION_DATA_SOURCE_ID=${NOTION_DATA_SOURCE_ID},_BILLING_ACCOUNT_ID=${BILLING_ACCOUNT_ID},_BILLING_CURRENCY_CODE=${BILLING_CURRENCY_CODE},_MONTHLY_BUDGET_AMOUNT=${MONTHLY_BUDGET_AMOUNT},_GITHUB_REPOSITORY=${GITHUB_REPOSITORY},_GITHUB_REPOSITORY_ID=${GITHUB_REPOSITORY_ID},_SCHEDULER_PAUSED=${SCHEDULER_PAUSED},_ALLOW_SCHEDULER_RESUME=${ALLOW_SCHEDULER_RESUME},_DEPLOY=true"

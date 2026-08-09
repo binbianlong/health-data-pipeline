@@ -16,6 +16,10 @@ from health_data_pipeline.storage import (
 )
 
 
+class LeaseOwnershipLostError(RuntimeError):
+    """Raised when an active synchronization no longer owns its lease."""
+
+
 @dataclass(frozen=True, slots=True)
 class LeaseRecord:
     token: str

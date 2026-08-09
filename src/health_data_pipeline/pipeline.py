@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Protocol, cast
 from zoneinfo import ZoneInfo
 
@@ -26,7 +26,7 @@ from health_data_pipeline.daily import (
     affected_metric_dates,
 )
 from health_data_pipeline.google_health import DataPointPage, FetchWindow
-from health_data_pipeline.lease import LeaseRepository
+from health_data_pipeline.lease import LeaseOwnershipLostError, LeaseRepository
 from health_data_pipeline.models import CommitKind, RootSnapshot
 from health_data_pipeline.normalization import normalize_daily_observations
 from health_data_pipeline.snapshot import SnapshotRepository
@@ -38,6 +38,7 @@ from health_data_pipeline.storage import (
 )
 
 _DAILY_SCHEMA_VERSION = 3
+_LEASE_REFRESH_MARGIN = timedelta(minutes=5)
 
 # Compatibility exports for existing callers of the former pipeline helpers.
 SUPPORTED_DATA_TYPES = sync_planning.SUPPORTED_DATA_TYPES
@@ -135,10 +136,26 @@ class IncrementalSyncPipeline:
                 generation=self._current_generation(),
                 owner_hmac=self._owner_hmac,
             )
+
+        current_lease = lease
+
+        def heartbeat() -> None:
+            nonlocal current_lease
+            current_time = _aware_utc(self._now())
+            if current_lease.record.expires_at - current_time > _LEASE_REFRESH_MARGIN:
+                return
+            refreshed = self._leases.refresh(
+                current_lease,
+                now=current_time,
+            )
+            if refreshed is None:
+                raise LeaseOwnershipLostError("sync lease ownership was lost")
+            current_lease = refreshed
+
         try:
-            return self._run_with_lease(now)
+            return self._run_with_lease(now, heartbeat=heartbeat)
         finally:
-            self._leases.release(lease)
+            self._leases.release(current_lease)
 
     def has_pending_webhooks(self) -> bool:
         """Return whether a durable webhook is not represented by current HEAD."""
@@ -156,7 +173,12 @@ class IncrementalSyncPipeline:
                 processed = {value for value in raw_processed if isinstance(value, str)}
         return any(name not in processed for name in self._store.list_names("webhook-events/"))
 
-    def _run_with_lease(self, now: datetime) -> SyncOutcome:
+    def _run_with_lease(
+        self,
+        now: datetime,
+        *,
+        heartbeat: Callable[[], None],
+    ) -> SyncOutcome:
         base = self._heads.read()
         root = (
             None
@@ -216,6 +238,7 @@ class IncrementalSyncPipeline:
             backfill_chunks,
             zone=zone,
             expected_generation=expected_generation,
+            heartbeat=heartbeat,
         )
 
         changed_dates = {query.metric_date for query in ingested}
@@ -274,6 +297,7 @@ class IncrementalSyncPipeline:
             if backfill_chunks
             else (CommitKind.WEBHOOK if pending else CommitKind.SCHEDULED)
         )
+        heartbeat()
         try:
             committed = self._commits.commit(
                 CommitRequest(
@@ -315,6 +339,7 @@ class IncrementalSyncPipeline:
         *,
         zone: ZoneInfo,
         expected_generation: int,
+        heartbeat: Callable[[], None],
     ) -> tuple[IngestedQuery, ...]:
         """Execute either foreground dates or isolated backfill chunks."""
 
@@ -326,20 +351,22 @@ class IncrementalSyncPipeline:
                         chunk,
                         zone=zone,
                         expected_generation=expected_generation,
+                        heartbeat=heartbeat,
                     )
                 )
             return tuple(ingested)
 
         for data_type in SUPPORTED_DATA_TYPES:
             for metric_date in sorted(fetch_dates.get(data_type, ())):
-                ingested.extend(
-                    self._ingestor.ingest_dates(
-                        data_type,
-                        (metric_date,),
-                        zone=zone,
-                        expected_generation=expected_generation,
-                    )
+                unit = self._ingestor.ingest_dates(
+                    data_type,
+                    (metric_date,),
+                    zone=zone,
+                    expected_generation=expected_generation,
+                    heartbeat=heartbeat,
                 )
+                ingested.extend(unit)
+                heartbeat()
         return tuple(ingested)
 
     def _ingest_backfill_chunk(
@@ -348,27 +375,34 @@ class IncrementalSyncPipeline:
         *,
         zone: ZoneInfo,
         expected_generation: int,
+        heartbeat: Callable[[], None] | None = None,
     ) -> tuple[IngestedQuery, ...]:
         """Range-fetch priority sessions; keep legacy high-volume work daily."""
 
         if chunk.next_data_type_index is None:
-            return self._ingestor.ingest_dates(
+            unit = self._ingestor.ingest_dates(
                 chunk.data_type,
                 chunk.dates,
                 zone=zone,
                 expected_generation=expected_generation,
+                heartbeat=heartbeat,
             )
+            if heartbeat is not None:
+                heartbeat()
+            return unit
 
         ingested: list[IngestedQuery] = []
         for metric_date in chunk.dates:
-            ingested.extend(
-                self._ingestor.ingest_dates(
-                    chunk.data_type,
-                    (metric_date,),
-                    zone=zone,
-                    expected_generation=expected_generation,
-                )
+            unit = self._ingestor.ingest_dates(
+                chunk.data_type,
+                (metric_date,),
+                zone=zone,
+                expected_generation=expected_generation,
+                heartbeat=heartbeat,
             )
+            ingested.extend(unit)
+            if heartbeat is not None:
+                heartbeat()
         return tuple(ingested)
 
     def _ingest_dates(
@@ -378,6 +412,7 @@ class IncrementalSyncPipeline:
         *,
         zone: ZoneInfo,
         expected_generation: int,
+        heartbeat: Callable[[], None] | None = None,
     ) -> tuple[IngestedQuery, ...]:
         """Compatibility wrapper for callers migrating to ``SourceIngestor``."""
 
@@ -386,6 +421,7 @@ class IncrementalSyncPipeline:
             dates,
             zone=zone,
             expected_generation=expected_generation,
+            heartbeat=heartbeat,
         )
 
     def _pending_webhooks(

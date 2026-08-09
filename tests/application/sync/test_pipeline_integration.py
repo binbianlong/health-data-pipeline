@@ -10,6 +10,7 @@ import pytest
 from health_data_pipeline.budget import ClassAMonthState, class_a_month_state_path
 from health_data_pipeline.commit import CommitCoordinator, CommitRequest
 from health_data_pipeline.google_health import FetchWindow
+from health_data_pipeline.lease import LeaseHandle, LeaseOwnershipLostError, LeaseRepository
 from health_data_pipeline.models import CommitKind
 from health_data_pipeline.pipeline import (
     SUPPORTED_DATA_TYPES,
@@ -41,6 +42,9 @@ from tests.support.pipeline import (
 )
 from tests.support.pipeline import (
     hrv_detail_point as _hrv_detail_point,
+)
+from tests.support.pipeline import (
+    respiratory_rate_point as _respiratory_rate_point,
 )
 from tests.support.pipeline import (
     sleep_point as _sleep_point,
@@ -146,6 +150,134 @@ def test_initial_sync_commits_civil_days_and_calendar_periods() -> None:
         "source_count": 1,
         "normalized_count": 1,
     }
+
+
+def test_reused_respiratory_name_commits_both_samples_once() -> None:
+    store = InMemoryObjectStore(clock=lambda: NOW)
+    today = date(2026, 7, 28)
+    points = (
+        _respiratory_rate_point(today, hour=1, breaths_per_minute=15),
+        _respiratory_rate_point(today, hour=6, breaths_per_minute=16),
+    )
+    health = FakeHealth(
+        values={},
+        data_points={("respiratory-rate-sleep-summary", today): points},
+    )
+    pipeline, heads, snapshots = _pipeline(store, health)
+
+    outcome = pipeline.run()
+
+    assert outcome.committed
+    assert outcome.generation == 1
+    rows = _daily_rows(heads, snapshots, today)
+    observed = next(
+        row
+        for row in rows
+        if row["record_kind"] == "METRIC"
+        and row["metric_name"] == "sleep_respiratory_rate"
+        and row["period_kind"] == "DAY"
+    )
+    assert observed["value_num"] == 15.5
+    assert observed["sample_count"] == 2
+    head = heads.read().head
+    assert head is not None
+    root = snapshots.load_root_snapshot(head.root_snapshot)
+    assert root.state.data_type_cursors["respiratory-rate-sleep-summary"] == {
+        "reconciled_through_date": today.isoformat(),
+        "reconciled_at": "2026-07-28T12:00:00Z",
+    }
+
+
+def test_active_run_refreshes_lease_past_ttl_and_releases_latest_handle() -> None:
+    store = InMemoryObjectStore(clock=lambda: NOW)
+    contender = LeaseRepository(store, owner_hmac="a" * 64)
+    current = NOW
+    blocked_attempts: list[bool] = []
+    clock_calls = 0
+
+    def advancing_clock() -> datetime:
+        nonlocal clock_calls, current
+        clock_calls += 1
+        if clock_calls > 1:
+            current += timedelta(minutes=5)
+        if current >= NOW + timedelta(minutes=20) and not blocked_attempts:
+            blocked_attempts.append(contender.acquire(now=current) is None)
+        return current
+
+    pipeline, _, _ = _pipeline(
+        store,
+        FakeHealth(values={}),
+        now=advancing_clock,
+    )
+
+    outcome = pipeline.run()
+
+    assert outcome.committed
+    assert current > NOW + timedelta(minutes=15)
+    assert blocked_attempts == [True]
+    acquired_after_release = contender.acquire(now=current)
+    assert acquired_after_release is not None
+    assert contender.release(acquired_after_release) is True
+
+
+def test_fast_run_does_not_write_unneeded_lease_heartbeats(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = InMemoryObjectStore(clock=lambda: NOW)
+    pipeline, _, _ = _pipeline(store, FakeHealth(values={}))
+    refresh_calls = 0
+    refresh = pipeline._leases.refresh
+
+    def record_refresh(*args: Any, **kwargs: Any) -> LeaseHandle | None:
+        nonlocal refresh_calls
+        refresh_calls += 1
+        return refresh(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline._leases, "refresh", record_refresh)
+
+    assert pipeline.run().committed
+    assert refresh_calls == 0
+
+
+def test_lease_loss_before_head_commit_aborts_and_preserves_new_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = InMemoryObjectStore(clock=lambda: NOW)
+    contender = LeaseRepository(store, owner_hmac="a" * 64)
+    current = NOW
+    arm_takeover = False
+    takeover_handles: list[LeaseHandle] = []
+
+    def takeover_clock() -> datetime:
+        nonlocal current
+        if arm_takeover and not takeover_handles:
+            current = NOW + timedelta(minutes=16)
+            acquired = contender.acquire(now=current)
+            assert acquired is not None
+            takeover_handles.append(acquired)
+        return current
+
+    pipeline, heads, _ = _pipeline(
+        store,
+        FakeHealth(values={}),
+        now=takeover_clock,
+    )
+    recalculate = pipeline._projector.recalculate_rows
+
+    def recalculate_and_arm(*args: Any, **kwargs: Any) -> Any:
+        nonlocal arm_takeover
+        result = recalculate(*args, **kwargs)
+        arm_takeover = True
+        return result
+
+    monkeypatch.setattr(pipeline._projector, "recalculate_rows", recalculate_and_arm)
+
+    with pytest.raises(LeaseOwnershipLostError, match="ownership was lost"):
+        pipeline.run()
+
+    assert heads.read().head is None
+    assert len(takeover_handles) == 1
+    assert contender.release(takeover_handles[0]) is True
 
 
 def test_sync_advance_reconciles_from_last_successful_civil_cursor() -> None:

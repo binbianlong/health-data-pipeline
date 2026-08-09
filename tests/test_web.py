@@ -105,7 +105,7 @@ class Steps:
         return b"<svg></svg>", 12
 
 
-def _config() -> AppConfig:
+def _config(*, maintenance_mode: bool = False) -> AppConfig:
     return AppConfig(
         project_id="project",
         region="us-central1",
@@ -118,6 +118,7 @@ def _config() -> AppConfig:
         oauth_client_id="client",
         oauth_redirect_uri="https://service.example/setup/oauth/callback",
         notion_data_source_id="data-source",
+        maintenance_mode=maintenance_mode,
     )
 
 
@@ -128,6 +129,7 @@ def _client(
     event_sink: EventSink | None = None,
     task_dispatcher: Tasks | None = None,
     on_complete: Any | None = None,
+    maintenance_mode: bool = False,
     raise_server_exceptions: bool = True,
 ) -> tuple[TestClient, EventSink, Tasks, OAuth, Views]:
     key = b"owner-key"
@@ -136,7 +138,7 @@ def _client(
     oauth = OAuth()
     views = Views()
     dependencies = WebDependencies(
-        config=_config(),
+        config=_config(maintenance_mode=maintenance_mode),
         webhook_authenticator=GoogleHealthWebhookAuthenticator(
             expected_authorization="Bearer secret",
             signature_verifier=SignatureVerifier(),
@@ -222,6 +224,34 @@ def test_webhook_persists_before_enqueuing_job() -> None:
             datetime(2026, 7, 28, 12, 10, tzinfo=UTC),
         )
     ]
+
+
+def test_webhook_maintenance_mode_persists_without_enqueuing_job() -> None:
+    client, sink, tasks, _, _ = _client(maintenance_mode=True)
+    body = json.dumps(
+        {
+            "data": {
+                "healthUserId": "health-user",
+                "dataType": "steps",
+                "operation": "UPSERT",
+                "intervals": [],
+            }
+        }
+    ).encode()
+
+    response = client.post(
+        "/webhooks/google-health",
+        content=body,
+        headers={
+            "Authorization": "Bearer secret",
+            "Content-Type": "application/json",
+            "GOOGLE-HEALTH-API-SIGNATURE": base64.b64encode(b"valid").decode(),
+        },
+    )
+
+    assert response.status_code == 204
+    assert len(sink.events) == 1
+    assert tasks.syncs == []
 
 
 def test_webhook_batch_persists_each_event_and_enqueues_one_job() -> None:

@@ -47,6 +47,8 @@ async def google_health_webhook(request: Request) -> Response:
     received_at = deps.clock()
     for event in result.events:
         deps.webhook_events.persist(event, received_at=received_at)
+    if deps.config.maintenance_mode:
+        return Response(status_code=204)
     # Bucket from the time at which the durable event is ready. If a write
     # crosses a bucket boundary, using the earlier receipt time could target
     # a task that has already dispatched and is still name-deduplicated.

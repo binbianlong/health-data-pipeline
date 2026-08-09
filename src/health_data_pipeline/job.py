@@ -247,9 +247,18 @@ def _load_factory() -> JobFactory:
     return cast(JobFactory, factory)
 
 
+def _maintenance_mode_enabled() -> bool:
+    value = os.environ.get("MAINTENANCE_MODE", "false").strip().lower()
+    if value not in {"true", "false"}:
+        raise RuntimeError("MAINTENANCE_MODE must be true or false")
+    return value == "true"
+
+
 def main() -> None:
     """Console entry point used by ``python -m health_data_pipeline.job``."""
 
+    if _maintenance_mode_enabled():
+        return
     runner = _load_factory()()
     runner.run()
 

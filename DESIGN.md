@@ -162,9 +162,10 @@ OAuth redirect URI、GitHub SVGへ登録しない。
 5. 各`healthUserId`をHMAC化して所有者と照合し、所有者以外の通知を除外する。
 6. 所有者の変更区間をイベント単位でGCSへ不変保存する。同一batch内の同一イベントは
    canonical JSONのcontent hashで重複排除する。
-7. GCS保存完了後の時刻を10分bucketへ丸め、次のbucket境界を
-   `schedule_time`とするJob起動Taskをbatchにつき1件作成する。
-8. 保存とTask作成成功後に`204`を返す。
+7. maintenance modeでなければ、GCS保存完了後の時刻を10分bucketへ丸め、次のbucket
+   境界を`schedule_time`とするJob起動Taskをbatchにつき1件作成する。
+8. 保存と、通常時はTask作成の成功後に`204`を返す。maintenance中も原本保存は継続し、
+   新しいJob起動Taskだけを抑止する。
 
 GCS保存またはTask作成失敗時は5xxを返し、Google Health APIの再送に委ねる。
 構造不正は一部を保存せずbatch全体を400とする。署名済みでも所有者以外の通知だけなら、
@@ -665,6 +666,13 @@ GCS上のAPI blobとflattened-source `SAMPLE`、`INTERVAL`、`SESSION`、`DAILY`
 - 429と一時5xxは指数backoffする。
 - 永続4xx、scope不足、所有者不一致は無限retryしない。
 - 全page取得完了前はreplacementをcommitしない。
+- `SAMPLE`はcanonical payloadの完全一致だけを重複として除外する。Google Healthが
+  `dataPointName`を複数観測で再利用しても、観測時刻が異なるrowはすべて保持する。同名かつ
+  同じ`sampleTime`の異payloadは、名前なしrowも含めて改訂順を決められないためfail closedとし、
+  二重に平均へ入れない。
+- `INTERVAL`と`DAILY`の同名・異payload、および識別子のない完全一致は加算値の重複か
+  正当な複数recordか判定できないため、黙って選ばずcommit前にfail closedとする。
+- `sleep` revisionは専用の更新時刻規則で解決する。
 
 ### 14.3 取得範囲と置換範囲
 
@@ -955,7 +963,8 @@ leases/<owner-hmac>.json
 ```
 
 - TTL: 15分
-- heartbeat: v1では行わない
+- heartbeat check: API page原本保存後、各取得単位完了後、HEAD commit直前
+- lease更新: 残り5分以下の場合だけGCS CAS更新し、短時間JobのClass A操作を増やさない
 - create: `ifGenerationMatch=0`
 - update/delete: 対象object generationを指定
 - Cloud Run Job timeout: 50分
@@ -966,7 +975,9 @@ leaseはAPI取得とGCS操作の重複を減らす最適化である。
 - lease取得失敗時はJobを正常終了する。
 - leaseなしでもHEADが変わっていなければCASは成功し得る。
 - leaseを持っていてもHEADが変わればCASは失敗する。
-- 15分を超えたJobは後続Jobと重複し得るが、古いJobは最初に読んだHEAD generationへのCASだけを試し、HEADが進んでいれば失敗終了する。
+- heartbeatでleaseを更新できない場合はownership喪失として新しいAPI取得を止め、HEADを
+  更新しない。解放時は最後に取得したlease generationだけを対象とし、新ownerのleaseを
+  削除しない。
 - 整合性は常にHEAD CASが保証する。
 
 ## 18. RetentionとGC
@@ -1410,9 +1421,17 @@ rebuildは手動実行とする。Cloud Billing Budgetも別に設定する。�
 | Notion失敗 | GCS commitを維持しNotionだけretry |
 | SVG生成失敗 | 旧pointerを維持し次回retry |
 | lease取得失敗 | Job正常終了 |
-| lease期限切れ後の並行実行 | 最初に読んだHEADへのCASが失敗した古いJobを終了 |
+| lease heartbeatでownership喪失 | 以後の取得とHEAD更新をせず終了し、新ownerのleaseを維持 |
 | OAuth失効 | 収集停止、メール、setup code再発行 |
 | Webhook長期停止・Fitbit再同期 | 成功済みdata type civil cursorから最大直近90日を再照合し、古い非高頻度区間はbackfillへ戻す |
+
+`scheduler_paused=true`をmaintenanceの単一設定とし、Scheduler停止、正常完了なしAlertの
+無効化、Webhook起動Taskの抑止、古いTaskまたは手動起動によるJobの処理skipを同時に行う。
+Webhook原本の保存は止めない。回収JobだけはExecution overrideでmaintenanceを明示解除する。deployは現在の
+Schedulerが停止中なのに設定だけがfalseならfail closedとし、復旧時だけworkflowの明示的な
+resume入力を要求する。Execution失敗Alertは30分集計で単発失敗も検知しつつ、短い空区間で
+同じ継続障害を閉じて再通知しにくくする。Jobs APIのTask成功はExecution成功として扱わず、
+正常完了なしAlertとHEAD generation／更新時刻を復旧確認に使用する。
 
 ## 28. 運用SLO
 
@@ -1612,6 +1631,7 @@ BigQuery API、dataset、table、IAMは作らない。
 - interval union
 - replacement membership
 - duplicate conflict
+- sampleの同名別観測保持と完全一致重複除外
 - civil time / DST
 - 暦週・暦月再計算
 - schema v1・v2・v3の厳密検証とv3 tagged union
@@ -1626,6 +1646,7 @@ BigQuery API、dataset、table、IAMは作らない。
 - Root完全状態とchange set整合
 - HEAD CAS
 - lease非依存CAS
+- 長時間同期中のlease heartbeatとownership喪失時のcommit拒否
 - OAuth session状態遷移
 - Firebase Hostingでsetup code成功後だけ`__session`を発行する遷移
 - retention参照とaudit参照

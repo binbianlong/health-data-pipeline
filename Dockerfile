@@ -28,6 +28,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 FROM deps AS test
 
 COPY src ./src
+COPY scripts ./scripts
 COPY tests ./tests
 COPY schemas ./schemas
 COPY infra ./infra
@@ -37,7 +38,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --all-groups
 RUN uv run ruff format --check . \
     && uv run ruff check . \
-    && uv run mypy src tests \
+    && uv run mypy src scripts tests \
     && uv run pytest
 
 FROM deps AS runtime-build

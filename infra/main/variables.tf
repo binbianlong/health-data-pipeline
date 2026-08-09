@@ -127,7 +127,7 @@ variable "github_deploy_branch" {
 }
 
 variable "scheduler_paused" {
-  description = "Keep the recovery scheduler paused until owner OAuth setup has completed."
+  description = "Maintenance mode: pause recovery scheduling, suppress its absence alert, and avoid new webhook wake-up tasks."
   type        = bool
   default     = true
 }

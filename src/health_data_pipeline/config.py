@@ -45,6 +45,15 @@ def _positive_int(env: Mapping[str, str], name: str, default: int) -> int:
     return value
 
 
+def _boolean(env: Mapping[str, str], name: str, default: bool) -> bool:
+    raw = env.get(name, str(default)).strip().lower()
+    if raw == "true":
+        return True
+    if raw == "false":
+        return False
+    raise ConfigurationError(f"{name} must be true or false")
+
+
 @dataclass(frozen=True, slots=True)
 class AppConfig:
     """Non-secret settings shared by the service and the job."""
@@ -66,6 +75,7 @@ class AppConfig:
     webhook_max_body_bytes: int = 1_048_576
     setup_session_ttl_seconds: int = 600
     task_bucket_minutes: int = 10
+    maintenance_mode: bool = False
 
     @property
     def jobs_run_url(self) -> str:
@@ -131,4 +141,5 @@ class AppConfig:
             webhook_max_body_bytes=_positive_int(source, "WEBHOOK_MAX_BODY_BYTES", 1_048_576),
             setup_session_ttl_seconds=_positive_int(source, "SETUP_SESSION_TTL_SECONDS", 600),
             task_bucket_minutes=_positive_int(source, "TASK_BUCKET_MINUTES", 10),
+            maintenance_mode=_boolean(source, "MAINTENANCE_MODE", False),
         )
