@@ -213,7 +213,7 @@ def test_steps_svg_pointer_is_content_addressed_and_monotonic() -> None:
     assert b"7" in svg
     assert b"health" not in svg.lower()
     assert b"Steps over the last 7 days" in svg
-    assert b"#f0f6fc" in svg
+    assert b"#8b949e" in svg
     assert b"#84e17a" in svg
     assert b"BlinkMacSystemFont" in svg
     assert b'width="40"' in svg

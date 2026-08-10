@@ -83,7 +83,7 @@ def render_steps_svg(samples: Sequence[StepSample]) -> bytes:
         ),
         "<style>"
         'text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",'
-        "Helvetica,Arial,sans-serif;fill:#f0f6fc}"
+        "Helvetica,Arial,sans-serif;fill:#8b949e}"
         ".bar{fill:#84e17a}.missing{fill:#656d76}"
         "</style>",
     ]
