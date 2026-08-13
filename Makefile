@@ -57,10 +57,10 @@ terraform-validate: terraform-fmt ## Initialize without a backend and validate b
 	$(TF) -chdir=infra/main validate
 
 setup-code: ## Generate a one-time setup code through the application CLI
-	$(UV) run python -m health_data_pipeline.cli setup-code
+	$(UV) run python -m health_data_pipeline.runtime.cli setup-code
 
 subscriber-upsert: ## Create or update the automatic Google Health webhook subscriber
-	$(UV) run python -m health_data_pipeline.cli subscriber-upsert
+	$(UV) run python -m health_data_pipeline.runtime.cli subscriber-upsert
 
 notion-configure: ## Create or repair the required Notion data source properties
-	$(UV) run python -m health_data_pipeline.cli notion-configure
+	$(UV) run python -m health_data_pipeline.runtime.cli notion-configure

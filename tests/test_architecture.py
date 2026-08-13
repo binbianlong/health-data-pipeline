@@ -4,20 +4,6 @@ import ast
 from pathlib import Path
 
 PACKAGE = Path(__file__).parents[1] / "src" / "health_data_pipeline"
-NEW_PACKAGES = (
-    PACKAGE / "application",
-    PACKAGE / "presentation",
-    PACKAGE / "adapters",
-    PACKAGE / "persistence",
-)
-LEGACY_ENTRYPOINTS = {
-    "health_data_pipeline.job",
-    "health_data_pipeline.notion_adapter",
-    "health_data_pipeline.pipeline",
-    "health_data_pipeline.runtime",
-    "health_data_pipeline.views",
-    "health_data_pipeline.web",
-}
 
 
 def _imports(path: Path) -> set[str]:
@@ -31,26 +17,69 @@ def _imports(path: Path) -> set[str]:
     return imported
 
 
-def test_new_modules_do_not_depend_on_legacy_entrypoints() -> None:
+def _assert_packages_do_not_import(
+    packages: tuple[str, ...],
+    forbidden: tuple[str, ...],
+) -> None:
     violations: list[str] = []
-    for package in NEW_PACKAGES:
-        for path in package.rglob("*.py"):
+    for package_name in packages:
+        for path in (PACKAGE / package_name).rglob("*.py"):
             violations.extend(
                 f"{path.relative_to(PACKAGE)} imports {imported}"
                 for imported in _imports(path)
                 if any(
-                    imported == legacy or imported.startswith(f"{legacy}.")
-                    for legacy in LEGACY_ENTRYPOINTS
+                    imported == prefix or imported.startswith(f"{prefix}.") for prefix in forbidden
                 )
             )
 
     assert violations == []
 
 
-def test_shared_metric_catalog_does_not_depend_on_adapters() -> None:
-    for path in (PACKAGE / "data_types.py", PACKAGE / "metrics.py"):
-        assert not any(
-            imported == "health_data_pipeline.adapters"
-            or imported.startswith("health_data_pipeline.adapters.")
-            for imported in _imports(path)
-        )
+def test_health_semantics_are_independent_of_workflows_and_adapters() -> None:
+    _assert_packages_do_not_import(
+        ("health",),
+        (
+            "health_data_pipeline.integrations",
+            "health_data_pipeline.ops",
+            "health_data_pipeline.runtime",
+            "health_data_pipeline.setup",
+            "health_data_pipeline.state",
+            "health_data_pipeline.sync",
+            "health_data_pipeline.views",
+        ),
+    )
+
+
+def test_state_does_not_depend_on_runtime_or_external_adapters() -> None:
+    _assert_packages_do_not_import(
+        ("state",),
+        (
+            "health_data_pipeline.integrations",
+            "health_data_pipeline.ops",
+            "health_data_pipeline.runtime",
+            "health_data_pipeline.setup",
+            "health_data_pipeline.sync",
+            "health_data_pipeline.views",
+        ),
+    )
+
+
+def test_inner_features_do_not_depend_on_runtime_or_external_adapters() -> None:
+    _assert_packages_do_not_import(
+        ("ops", "setup", "sync", "views"),
+        (
+            "health_data_pipeline.integrations",
+            "health_data_pipeline.runtime",
+        ),
+    )
+
+
+def test_runtime_is_not_imported_outside_runtime() -> None:
+    _assert_packages_do_not_import(
+        ("health", "integrations", "ops", "setup", "state", "sync", "views"),
+        ("health_data_pipeline.runtime",),
+    )
+
+
+def test_package_root_contains_no_feature_facades() -> None:
+    assert {path.name for path in PACKAGE.glob("*.py")} == {"__init__.py"}

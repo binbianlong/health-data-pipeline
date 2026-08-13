@@ -942,7 +942,7 @@ record_kind
 
 ```text
 schemas/
-  daily_metrics/
+  daily_canonical/
     v1.schema.json
     v1.bigquery.json
     v2.schema.json
