@@ -7,19 +7,16 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any
 
-from health_data_pipeline.application.sync.ingestion import HealthPageSource, SourceIngestor
-from health_data_pipeline.application.sync.projection import DailyProjector
-from health_data_pipeline.commit import CommitCoordinator
-from health_data_pipeline.google_health import DataPointPage, FetchWindow
-from health_data_pipeline.snapshot import SnapshotRepository
-from health_data_pipeline.storage import (
-    ContentAddressedStore,
-    HeadRepository,
-    InMemoryObjectStore,
-)
+from health_data_pipeline.state.commit import CommitCoordinator
+from health_data_pipeline.state.head import HeadRepository
+from health_data_pipeline.state.objects import ContentAddressedStore, InMemoryObjectStore
+from health_data_pipeline.state.snapshots import SnapshotRepository
+from health_data_pipeline.sync.contracts import DataPointPage, FetchWindow
+from health_data_pipeline.sync.ingestion import HealthPageSource, SourceIngestor
+from health_data_pipeline.sync.projection import DailyProjector
 
 if TYPE_CHECKING:
-    from health_data_pipeline.pipeline import IncrementalSyncPipeline
+    from health_data_pipeline.sync.service import IncrementalSyncPipeline
 
 NOW = datetime(2026, 7, 28, 12, tzinfo=UTC)
 SYNC_TIME = datetime(2026, 7, 28, 11, tzinfo=UTC)
@@ -214,7 +211,7 @@ def build_pipeline(
     HeadRepository,
     SnapshotRepository,
 ]:
-    from health_data_pipeline.pipeline import IncrementalSyncPipeline  # noqa: PLC0415
+    from health_data_pipeline.sync.service import IncrementalSyncPipeline  # noqa: PLC0415
 
     now_fn = _constant_clock(now) if isinstance(now, datetime) else now
     content = ContentAddressedStore(store)

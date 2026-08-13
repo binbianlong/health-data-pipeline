@@ -4,13 +4,26 @@ import json
 import re
 from pathlib import Path
 
-from health_data_pipeline.google_health import data_type_spec
-from health_data_pipeline.pipeline import SUPPORTED_DATA_TYPES
+from health_data_pipeline.health.sources import data_type_spec
+from health_data_pipeline.sync.planning import SUPPORTED_DATA_TYPES
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _STORAGE_TERRAFORM = _PROJECT_ROOT / "infra" / "main" / "storage.tf"
 _GITHUB_WIF_TERRAFORM = _PROJECT_ROOT / "infra" / "main" / "github_wif.tf"
 _FLATTENED_PREFIX = "blobs/flattened/record_kind="
+
+
+def test_console_commands_keep_the_cloud_run_contract() -> None:
+    pyproject = (_PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    cloud_run = (_PROJECT_ROOT / "infra/main/cloud_run.tf").read_text(encoding="utf-8")
+
+    assert (
+        'health-data-pipeline-service = "health_data_pipeline.runtime.service:run_service"'
+        in pyproject
+    )
+    assert 'health-data-pipeline-job = "health_data_pipeline.runtime.job:main"' in pyproject
+    assert 'command = ["health-data-pipeline-service"]' in cloud_run
+    assert 'command = ["health-data-pipeline-job"]' in cloud_run
 
 
 def _bucket_resource(terraform: str, name: str, *, next_name: str | None = None) -> str:
@@ -96,7 +109,7 @@ def test_sleep_session_canonical_schema_is_typed_and_not_lifecycle_deleted() -> 
     assert '"daily-canonical/' not in terraform
     assert '"manifests/snapshot-shards/' not in terraform
     schema = json.loads(
-        (_PROJECT_ROOT / "schemas/daily_metrics/v2.schema.json").read_text(encoding="utf-8")
+        (_PROJECT_ROOT / "schemas/daily_canonical/v2.schema.json").read_text(encoding="utf-8")
     )
     assert schema["properties"]["record_kind"]["enum"] == ["METRIC", "SLEEP_SESSION"]
     for field in (

@@ -1,0 +1,382 @@
+from __future__ import annotations
+
+import json
+from dataclasses import replace
+from datetime import UTC, date, datetime
+from decimal import Decimal
+
+from health_data_pipeline.health.metrics import METRIC_DEFINITIONS
+from health_data_pipeline.state.commit import CommitCoordinator, CommitRequest
+from health_data_pipeline.state.head import HeadRepository
+from health_data_pipeline.state.models import CommitKind
+from health_data_pipeline.state.objects import ContentAddressedStore, InMemoryObjectStore
+from health_data_pipeline.state.snapshots import SnapshotRepository
+from health_data_pipeline.views import (
+    DailyMetric,
+    DailyView,
+    NotionPage,
+    NotionViewService,
+    StepSample,
+)
+from health_data_pipeline.views.notion import DefaultNotionRenderer, render_notion_body
+from health_data_pipeline.views.snapshot_source import SnapshotViewSource
+from health_data_pipeline.views.steps import StepsPointer, StepsSvgService
+
+
+class FakeSource:
+    def __init__(self, generation: int, views: list[DailyView]) -> None:
+        self.generation = generation
+        self.views = views
+
+    def latest_generation(self) -> int:
+        return self.generation
+
+    def views_between(
+        self,
+        *,
+        after_generation: int,
+        through_generation: int,
+    ) -> list[DailyView]:
+        assert after_generation < through_generation
+        assert through_generation == self.generation
+        return self.views
+
+
+class FakeNotion:
+    def __init__(self) -> None:
+        self.pages: dict[date, NotionPage] = {}
+        self.writes: list[tuple[DailyView, str]] = []
+
+    def find_daily_page(self, metric_date: date) -> NotionPage | None:
+        return self.pages.get(metric_date)
+
+    def upsert_daily_page(
+        self,
+        *,
+        existing_page_id: str | None,
+        view: DailyView,
+        body: str,
+        content_sha256: str,
+    ) -> str:
+        page_id = existing_page_id or f"page-{view.metric_date}"
+        self.pages[view.metric_date] = NotionPage(
+            page_id=page_id,
+            source_generation=view.source_generation,
+            content_sha256=content_sha256,
+        )
+        self.writes.append((view, body))
+        return page_id
+
+
+def _daily(generation: int = 7) -> DailyView:
+    return DailyView(
+        metric_date=date(2026, 7, 28),
+        source_generation=generation,
+        data_status="CANONICAL_SYNCED",
+        fitbit_last_sync_time=datetime(2026, 7, 29, tzinfo=UTC),
+        metrics=(
+            DailyMetric(
+                metric_name="steps",
+                statistic="value",
+                value=8000,
+                unit="count",
+                status="OK",
+                weekly_average=7500,
+                monthly_average=7200,
+                coverage=None,
+            ),
+        ),
+    )
+
+
+def test_notion_applies_latest_once_and_uses_month_average() -> None:
+    store = InMemoryObjectStore()
+    notion = FakeNotion()
+    service = NotionViewService(
+        store=store,
+        source=FakeSource(7, [_daily()]),
+        notion=notion,
+        renderer=DefaultNotionRenderer(),
+    )
+
+    assert service.apply_latest(requested_generation=3) == 7
+    assert service.apply_latest(requested_generation=7) == 7
+
+    assert len(notion.writes) == 1
+    assert "Calendar month avg" in notion.writes[0][1]
+    assert "Calendar week avg (Mon-date; final Sun)" in notion.writes[0][1]
+    assert "7200" in render_notion_body(_daily())
+    assert store.get("state/notion/pages/year=2026/2026-07-28.json").data
+
+
+def test_notion_renders_all_registered_metrics_in_stable_catalog_order() -> None:
+    view = DailyView(
+        metric_date=date(2026, 7, 28),
+        source_generation=7,
+        data_status="CANONICAL_SYNCED",
+        fitbit_last_sync_time=datetime(2026, 7, 29, tzinfo=UTC),
+        metrics=(
+            *(
+                DailyMetric(
+                    metric_name=definition.name,
+                    statistic="value",
+                    value=index,
+                    unit=definition.unit,
+                    status="OK",
+                )
+                for index, definition in reversed(tuple(enumerate(METRIC_DEFINITIONS, start=1)))
+            ),
+        ),
+    )
+
+    body = render_notion_body(view)
+    positions = [body.index(f"| {definition.notion_label} |") for definition in METRIC_DEFINITIONS]
+
+    assert positions == sorted(positions)
+    for definition in METRIC_DEFINITIONS:
+        assert f"| {definition.notion_label} |" in body
+        assert f"| {definition.name} |" not in body
+
+
+def test_notion_marks_every_absent_registered_metric_as_missing() -> None:
+    body = render_notion_body(_daily())
+
+    absent = tuple(definition for definition in METRIC_DEFINITIONS if definition.name != "steps")
+    for definition in absent:
+        line = next(
+            line for line in body.splitlines() if line.startswith(f"| {definition.notion_label} |")
+        )
+        assert f"| {definition.notion_label} | 欠損 | {definition.unit} | " in line
+        assert "MISSING; NOT_QUERIED" in line
+    assert body.count("MISSING; NOT_QUERIED") == len(absent)
+    assert "| 歩数 | 8000 | count |" in body
+
+
+def test_notion_renders_unknown_daily_coverage_without_fabricating_100_percent() -> None:
+    body = render_notion_body(_daily())
+    steps = next(line for line in body.splitlines() if line.startswith("| 歩数 |"))
+
+    assert steps.endswith("| unknown (UNKNOWN) |")
+    assert "100.0% (UNKNOWN)" not in steps
+
+
+def test_sleep_source_status_distinguishes_empty_from_processing() -> None:
+    base = DailyView(
+        metric_date=date(2026, 7, 28),
+        source_generation=7,
+        data_status="MISSING",
+        fitbit_last_sync_time=datetime(2026, 7, 29, tzinfo=UTC),
+        metrics=(),
+    )
+
+    empty = render_notion_body(replace(base, sleep_source_status="SUCCESS_EMPTY"))
+    processing = render_notion_body(replace(base, sleep_source_status="SOURCE_PROCESSING"))
+
+    assert "主睡眠: 記録なし" in empty
+    assert "昼寝: なし" in empty
+    assert "主睡眠: Fitbit処理中" in processing
+    assert "昼寝: 判定待ち" in processing
+
+
+def test_notion_never_overwrites_a_newer_page() -> None:
+    store = InMemoryObjectStore()
+    notion = FakeNotion()
+    notion.pages[date(2026, 7, 28)] = NotionPage(
+        page_id="newer", source_generation=8, content_sha256="new"
+    )
+    service = NotionViewService(
+        store=store,
+        source=FakeSource(7, [_daily()]),
+        notion=notion,
+        renderer=DefaultNotionRenderer(),
+    )
+
+    service.apply_latest(7)
+
+    assert notion.writes == []
+    assert notion.pages[date(2026, 7, 28)].source_generation == 8
+
+
+def test_steps_svg_pointer_is_content_addressed_and_monotonic() -> None:
+    store = InMemoryObjectStore()
+    service = StepsSvgService(store)
+    samples = [StepSample(date(2026, 7, day), day * 1000) for day in range(22, 29)]
+
+    assert service.publish(generation=9, samples=samples)
+    assert not service.publish(generation=8, samples=samples)
+    svg, generation = service.read_current()
+
+    pointer = StepsPointer.from_bytes(store.get("state/views/steps-head.json").data)
+    assert generation == 9
+    assert pointer.generation == 9
+    assert pointer.through_date == "2026-07-28"
+    assert pointer.content_sha256 in pointer.svg_uri
+    assert "/canonicalization=fhcj-3/" in pointer.svg_uri
+    assert b"7" in svg
+    assert b"health" not in svg.lower()
+    assert b"Steps over the last 7 days" in svg
+    assert b"#8b949e" in svg
+    assert b"#45A12B" in svg
+    assert b"BlinkMacSystemFont" in svg
+    assert b'width="40"' in svg
+    assert b'rx="' not in svg
+    assert b'fill="#fff"' not in svg
+    assert "直近7日間の歩数".encode() not in svg
+
+
+def test_steps_svg_publishes_only_once_per_completed_date() -> None:
+    store = InMemoryObjectStore()
+    service = StepsSvgService(store)
+    first = [StepSample(date(2026, 7, day), day * 1000) for day in range(22, 29)]
+    corrected = [StepSample(sample.metric_date, (sample.steps or 0) + 1) for sample in first]
+    following = [StepSample(date(2026, 7, day), day * 1000) for day in range(23, 30)]
+
+    assert service.publish(generation=9, samples=first)
+    assert not service.publish(generation=10, samples=corrected)
+    assert len(tuple(store.list("public/steps/"))) == 1
+    assert service.publish(generation=11, samples=following)
+    assert len(tuple(store.list("public/steps/"))) == 2
+
+    pointer = StepsPointer.from_bytes(store.get("state/views/steps-head.json").data)
+    assert pointer.generation == 11
+    assert pointer.through_date == "2026-07-29"
+
+
+def test_steps_svg_migrates_legacy_pointer_at_same_generation() -> None:
+    store = InMemoryObjectStore()
+    store.put(
+        "state/views/steps-head.json",
+        json.dumps(
+            {
+                "generation": 9,
+                "svg_uri": "public/steps/legacy.svg",
+                "content_sha256": "legacy",
+                "updated_at": "2026-07-29T15:00:00Z",
+            }
+        ).encode(),
+        if_generation_match=0,
+        metadata={},
+        content_type="application/json",
+        cache_control="no-store",
+    )
+    service = StepsSvgService(store)
+    samples = [StepSample(date(2026, 7, day), day * 1000) for day in range(22, 29)]
+
+    assert service.publish(generation=9, samples=samples)
+    assert not service.publish(generation=9, samples=samples)
+
+    pointer = StepsPointer.from_bytes(store.get("state/views/steps-head.json").data)
+    assert pointer.generation == 9
+    assert pointer.through_date == "2026-07-28"
+
+
+def test_steps_svg_migrates_previous_rendering_at_same_generation() -> None:
+    store = InMemoryObjectStore()
+    store.put(
+        "state/views/steps-head.json",
+        json.dumps(
+            {
+                "generation": 9,
+                "svg_uri": "public/steps/canonicalization=fhcj-2/sha256/old.svg",
+                "content_sha256": "old",
+                "updated_at": "2026-07-29T15:00:00Z",
+                "through_date": "2026-07-28",
+            }
+        ).encode(),
+        if_generation_match=0,
+        metadata={},
+        content_type="application/json",
+        cache_control="no-store",
+    )
+    service = StepsSvgService(store)
+    samples = [StepSample(date(2026, 7, day), day * 1000) for day in range(22, 29)]
+
+    assert not service.publish(generation=8, samples=samples)
+    assert service.publish(generation=9, samples=samples)
+    assert not service.publish(generation=9, samples=samples)
+
+    pointer = StepsPointer.from_bytes(store.get("state/views/steps-head.json").data)
+    assert pointer.generation == 9
+    assert pointer.through_date == "2026-07-28"
+    assert "/canonicalization=fhcj-3/" in pointer.svg_uri
+
+
+def _step_rows(metric_date: date, value: int) -> list[dict[str, object]]:
+    physical_day_start = datetime(
+        metric_date.year,
+        metric_date.month,
+        metric_date.day,
+        tzinfo=UTC,
+    )
+    return [
+        {
+            "metric_name": "steps",
+            "statistic": "observed",
+            "period_kind": "DAY",
+            "dimension_key": None,
+            "value_num": Decimal(value),
+            "value_text": None,
+            "unit": "count",
+            "aggregation": "daily_sum",
+            "period_start": metric_date,
+            "period_end": metric_date,
+            "sample_count": 1,
+            "expected_count": 1,
+            "coverage_ratio": Decimal(1),
+            "data_status": "CANONICAL_SYNCED",
+            "quality_flags": [],
+            "source_data_types": ["steps"],
+            "fitbit_last_sync_time": physical_day_start,
+            "time_zone": "UTC",
+            "physical_day_start": physical_day_start,
+            "physical_day_end": datetime.fromordinal(metric_date.toordinal() + 1).replace(
+                tzinfo=UTC
+            ),
+            "logic_version": "daily-v1",
+        }
+    ]
+
+
+def test_snapshot_source_collects_all_dates_across_generation_gap() -> None:
+    store = InMemoryObjectStore()
+    heads = HeadRepository(store)
+    snapshots = SnapshotRepository(ContentAddressedStore(store))
+    commits = CommitCoordinator(heads=heads, snapshots=snapshots)
+    first_date = date(2026, 7, 27)
+    second_date = date(2026, 7, 28)
+    for rows in (
+        {first_date: _step_rows(first_date, 1_000)},
+        {first_date: _step_rows(first_date, 2_000)},
+        {second_date: _step_rows(second_date, 3_000)},
+        {first_date: _step_rows(first_date, 4_000)},
+    ):
+        commits.commit(
+            CommitRequest(
+                daily_rows=rows,
+                commit_kind=CommitKind.SCHEDULED,
+                created_at=datetime(2026, 7, 28, tzinfo=UTC),
+                time_zone="Asia/Tokyo",
+            ),
+            expected_base=heads.read(),
+        )
+
+    source = SnapshotViewSource(heads=heads, snapshots=snapshots)
+    views = source.views_between(
+        after_generation=1,
+        through_generation=4,
+    )
+
+    assert [view.metric_date for view in views] == [first_date, second_date]
+    assert {view.source_generation for view in views} == {4}
+    first_steps = next(
+        metric.value
+        for view in views
+        if view.metric_date == first_date
+        for metric in view.metrics
+        if metric.metric_name == "steps"
+    )
+    assert first_steps == 4_000
+
+    samples = source.for_generation(4)
+    assert samples[-1] == StepSample(metric_date=first_date, steps=4_000)
+    assert samples[0].metric_date == date(2026, 7, 21)

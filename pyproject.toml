@@ -26,9 +26,9 @@ dependencies = [
 ]
 
 [project.scripts]
-health-data-pipeline = "health_data_pipeline.cli:main"
-health-data-pipeline-service = "health_data_pipeline.web:run_service"
-health-data-pipeline-job = "health_data_pipeline.job:main"
+health-data-pipeline = "health_data_pipeline.runtime.cli:main"
+health-data-pipeline-service = "health_data_pipeline.runtime.service:run_service"
+health-data-pipeline-job = "health_data_pipeline.runtime.job:main"
 
 [dependency-groups]
 dev = [
@@ -125,8 +125,8 @@ testpaths = ["tests"]
 branch = true
 source = ["health_data_pipeline"]
 omit = [
-  "src/health_data_pipeline/cli.py",
-  "src/health_data_pipeline/runtime.py",
+  "src/health_data_pipeline/runtime/cli.py",
+  "src/health_data_pipeline/runtime/composition.py",
 ]
 
 [tool.coverage.report]
