@@ -20,7 +20,7 @@ dependencies = [
   "google-crc32c>=1.7,<2",
   "httpx>=0.28,<1",
   "pydantic>=2.11,<3",
-  "structlog>=25.4,<26",
+  "structlog>=25.4,<27",
   "tink>=1.13,<2",
   "uvicorn[standard]>=0.35,<1",
 ]
